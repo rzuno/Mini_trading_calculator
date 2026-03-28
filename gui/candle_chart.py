@@ -1,7 +1,7 @@
 import tkinter as tk
 from core.calc import STOCK_NAMES, LOAD_GEARS, fmt_price
 
-# ── Fonts (1.5× scale for QHD) ──────────────────────────────────────────────
+# ── Fonts (kept at 1.5× — user says graph fonts are fine) ───────────────────
 _F_TITLE = ('Segoe UI', 17, 'bold')
 _F_STAT  = ('Segoe UI', 14)
 _F_DAY   = ('Segoe UI', 12)
@@ -14,7 +14,8 @@ class CandleChartWindow:
 
     def __init__(self, parent, ticker, ohlc_data, currency,
                  mode=None, load_gear=None,
-                 avg_cost=0, buy_pct=5, sell_tiers=None):
+                 avg_cost=0, buy_pct=5, sell_tiers=None,
+                 current_price=None):
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
         suffix = '  (KR)' if ticker.endswith('.KS') else ''
@@ -27,6 +28,7 @@ class CandleChartWindow:
         self.avg_cost = avg_cost
         self.buy_pct = buy_pct
         self.sell_tiers = sell_tiers or []
+        self.current_price = current_price
 
         if not ohlc_data:
             tk.Label(self.win, text="No data available",
@@ -88,7 +90,7 @@ class CandleChartWindow:
 
         has_refs = self.mode in ('empty', 'deployed')
         left_pad = 80
-        right_pad = 120 if has_refs else 50
+        right_pad = 130 if has_refs else 50
         top_pad = 20
         bottom_pad = 30
 
@@ -96,6 +98,9 @@ class CandleChartWindow:
         all_prices = []
         for d in ohlc:
             all_prices.extend([d['high'], d['low']])
+
+        if self.current_price and self.current_price > 0:
+            all_prices.append(self.current_price)
 
         if self.mode == 'empty' and self.load_gear:
             max_h = max(d['high'] for d in ohlc)
@@ -143,6 +148,16 @@ class CandleChartWindow:
             self._draw_empty_refs(c, left_pad, chart_w, w, y_of)
         elif self.mode == 'deployed' and self.avg_cost > 0:
             self._draw_deployed_refs(c, left_pad, chart_w, w, y_of)
+
+        # ── Current price line ───────────────────────────────────────────────
+        if self.current_price and self.current_price > 0:
+            label_x = left_pad + chart_w + 5
+            y_cur = y_of(self.current_price)
+            c.create_line(left_pad, y_cur, left_pad + chart_w, y_cur,
+                          fill='#333333', width=1.5)
+            c.create_text(label_x, y_cur,
+                          text=f'Now: {fmt_price(self.current_price, self.ccy)}',
+                          anchor='w', font=_F_REF, fill='#333333')
 
         # ── Candles ──────────────────────────────────────────────────────────
         for i, d in enumerate(ohlc):

@@ -2,29 +2,33 @@ import tkinter as tk
 import threading
 from datetime import datetime
 
+from core.calc import stock_sort_key
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from core.data_feed import fetch_all
 from gui.deployed_row import DeployedRow
 from gui.empty_row import EmptyRow
 from gui.candle_chart import CandleChartWindow
 
-# ── Fonts (1.5× scale for QHD) ──────────────────────────────────────────────
-_F_SECTION = ('Segoe UI', 18, 'bold')
-_F_HDR     = ('Segoe UI', 15)
-_F_HDR_B   = ('Segoe UI', 15, 'bold')
-_F_BTN     = ('Segoe UI', 15, 'bold')
-_F_SM      = ('Segoe UI', 12)
+# ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
+_F_SECTION = ('Segoe UI', 16, 'bold')
+_F_HDR     = ('Segoe UI', 13)
+_F_HDR_B   = ('Segoe UI', 13, 'bold')
+_F_BTN     = ('Segoe UI', 13, 'bold')
+_F_SM      = ('Segoe UI', 10)
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI Seesaw Mini-Calculator")
-        self.root.geometry('1800x950')
-        self.root.minsize(1400, 700)
+        self.root.geometry('1800x1200')
+        self.root.minsize(1400, 800)
 
         self.config    = load_config()
         self.positions = load_positions()
+
+        # Sort positions in fixed order on load
+        self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
 
         self._fx_rate        = None
         self._current_prices = {}
@@ -40,6 +44,8 @@ class App:
         self.fx_var           = tk.StringVar(value='--')
         self.last_refresh_var = tk.StringVar(value='--')
         self.status_var       = tk.StringVar(value='Initializing...')
+        self.deploy_total_var = tk.StringVar(value='--')
+        self.deploy_ratio_var = tk.StringVar(value='--')
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -126,11 +132,13 @@ class App:
             tk.Label(f, textvariable=var, font=_F_HDR_B,
                      anchor='w', **kw).grid(row=0, column=c, padx=2); c += 1
 
-        _lbl('Total Units:');   _entry(self.N_var, 4)
-        _lbl('1 Unit (KRW):');  _entry(self.unit_krw_var, 12)
-        _lbl('1 Unit (USD):');  _val(self.unit_usd_var, width=8, fg='#555')
-        _lbl('FX Rate:');       _val(self.fx_var, width=9)
-        _lbl('Last Refresh:');  _val(self.last_refresh_var, width=18)
+        _lbl('Total Units:');    _entry(self.N_var, 4)
+        _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
+        _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
+        _lbl('FX Rate:');        _val(self.fx_var, width=9)
+        _lbl('Last Refresh:');   _val(self.last_refresh_var, width=18)
+        _lbl('Deployed:');       _val(self.deploy_total_var, width=14)
+        _lbl('Ratio:');          _val(self.deploy_ratio_var, width=16)
 
     # ── Rebuild ──────────────────────────────────────────────────────────────
 
@@ -141,7 +149,9 @@ class App:
         self.deployed_rows = []
         self.empty_rows    = []
 
-        # No sorting — use position list order (manual ordering)
+        # Sort positions in fixed order
+        self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
+
         deployed = [p for p in self.positions if p.get('is_deployed')]
         empty    = [p for p in self.positions if not p.get('is_deployed')]
 
@@ -163,17 +173,14 @@ class App:
         box.pack(fill='x', padx=2)
 
         if not deployed:
-            tk.Label(box, text='(no deployed positions \u2014 click Deploy below)',
+            tk.Label(box, text='(no deployed positions \u2014 fill Avg Cost & Shares below, then Save)',
                      fg='gray', font=_F_SM, pady=10).pack()
             return
 
         for i, pos in enumerate(deployed):
             row = DeployedRow(
                 parent=box, row_num=i + 1, pos=pos,
-                on_move_up=lambda t: self._on_move(t, -1, True),
-                on_move_down=lambda t: self._on_move(t, 1, True),
                 on_graph=self._on_graph,
-                on_undeploy=self._on_undeploy,
                 on_compute=self._on_row_compute)
             self.deployed_rows.append(row)
 
@@ -198,9 +205,6 @@ class App:
             row = EmptyRow(
                 parent=box, row_num=i + 1, pos=pos,
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
-                on_deploy=self._on_deploy,
-                on_move_up=lambda t: self._on_move(t, -1, False),
-                on_move_down=lambda t: self._on_move(t, 1, False),
                 on_graph=self._on_graph)
             self.empty_rows.append(row)
             row.compute()
@@ -215,54 +219,13 @@ class App:
         tk.Label(f, textvariable=self.status_var, font=_F_SM,
                  anchor='w').pack(side='left', padx=16)
 
-    # ── Deploy / Undeploy / Move ─────────────────────────────────────────────
-
-    def _on_deploy(self, ticker):
-        self._collect()
-        self._find_pos(ticker)['is_deployed'] = True
-        self._rebuild_sections()
-        self._reapply()
-
-    def _on_undeploy(self, ticker):
-        """Move a deployed stock back to empty (Remove button)."""
-        self._collect()
-        pos = self._find_pos(ticker)
-        pos['is_deployed'] = False
-        pos['shares'] = 0
-        pos['avg_cost'] = 0.0
-        pos['cost_basis'] = 0.0
-        self._rebuild_sections()
-        self._reapply()
-
-    def _on_move(self, ticker, direction, is_deployed):
-        """Move a stock up (direction=-1) or down (+1) within its section."""
-        self._collect()
-        section_indices = [i for i, p in enumerate(self.positions)
-                           if p.get('is_deployed') == is_deployed]
-        # Find this ticker in the section
-        ticker_idx = None
-        section_pos = None
-        for sp, idx in enumerate(section_indices):
-            if self.positions[idx]['ticker'] == ticker:
-                ticker_idx = idx
-                section_pos = sp
-                break
-        if section_pos is None:
-            return
-        target_sp = section_pos + direction
-        if target_sp < 0 or target_sp >= len(section_indices):
-            return
-        target_idx = section_indices[target_sp]
-        # Swap in positions list
-        self.positions[ticker_idx], self.positions[target_idx] = \
-            self.positions[target_idx], self.positions[ticker_idx]
-        self._rebuild_sections()
-        self._reapply()
+    # ── Graph ────────────────────────────────────────────────────────────────
 
     def _on_graph(self, ticker):
         """Open chart popup with mode-specific reference lines."""
         ohlc = self._ohlc_data.get(ticker, [])
         ccy  = 'KRW' if ticker.endswith('.KS') else 'USD'
+        current_price = self._current_prices.get(ticker)
 
         pos = self._find_pos(ticker)
         if pos.get('is_deployed'):
@@ -275,7 +238,8 @@ class App:
                         avg_cost=state['avg_cost'],
                         buy_pct=state['buy_pct'],
                         sell_tiers=[(state[f't{i+1}_active'], state[f't{i+1}_pct'])
-                                    for i in range(3)])
+                                    for i in range(3)],
+                        current_price=current_price)
                     return
         else:
             for row in self.empty_rows:
@@ -283,11 +247,13 @@ class App:
                     CandleChartWindow(
                         self.root, ticker, ohlc, ccy,
                         mode='empty',
-                        load_gear=row._get_gear_key())
+                        load_gear=row._get_gear_key(),
+                        current_price=current_price)
                     return
 
-        # Fallback (no mode-specific data)
-        CandleChartWindow(self.root, ticker, ohlc, ccy)
+        # Fallback
+        CandleChartWindow(self.root, ticker, ohlc, ccy,
+                          current_price=current_price)
 
     def _on_row_compute(self):
         """Called when any deployed row recomputes — update army% across all."""
@@ -297,18 +263,26 @@ class App:
     # ── Save & Refresh (the single main button) ─────────────────────────────
 
     def _on_save_refresh(self):
-        """Collect inputs, auto-reset shares=0, save, fetch prices, recompute."""
+        """Collect inputs, auto-promote/demote, save, fetch prices, recompute."""
         self._collect()
 
-        # Auto-reset: if any deployed stock has shares=0, move to empty
         changed = False
         for pos in self.positions:
+            # Auto-demote: deployed with shares=0 → empty
             if pos.get('is_deployed') and pos.get('shares', 0) <= 0:
                 pos['is_deployed'] = False
                 pos['shares'] = 0
                 pos['avg_cost'] = 0.0
                 pos['cost_basis'] = 0.0
                 changed = True
+            # Auto-promote: empty with shares>0 and avg_cost>0 → deployed
+            elif (not pos.get('is_deployed')
+                  and pos.get('shares', 0) > 0
+                  and pos.get('avg_cost', 0) > 0):
+                pos['is_deployed'] = True
+                pos['cost_basis'] = pos['shares'] * pos['avg_cost']
+                changed = True
+
         if changed:
             self._rebuild_sections()
             self._reapply()
@@ -399,6 +373,20 @@ class App:
                 r.set_army_pct(None); continue
             krw = cb * fx_rate if (r.currency == 'USD' and fx_rate) else cb
             r.set_army_pct(krw / total * 100.0)
+
+        # Update header deployed info
+        self.deploy_total_var.set(f"\u20a9{total:,.0f}" if total > 0 else '--')
+        try:
+            n = int(self.N_var.get())
+            unit_krw = float(self.unit_krw_var.get().replace(',', ''))
+            if unit_krw > 0 and n > 0:
+                units = total / unit_krw
+                pct = units / n * 100
+                self.deploy_ratio_var.set(f"{units:.1f}/{n} ({pct:.1f}%)")
+            else:
+                self.deploy_ratio_var.set('--')
+        except (ValueError, ZeroDivisionError):
+            self.deploy_ratio_var.set('--')
 
     # ── Save ─────────────────────────────────────────────────────────────────
 

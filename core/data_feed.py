@@ -4,21 +4,21 @@ import yfinance as yf
 
 
 def _fetch_ticker_data(ticker: str) -> dict:
-    """Fetch price, 5-day closes, and OHLC for a single ticker in one call."""
+    """Fetch price, 5-day closes, and OHLC for a single ticker.
+
+    Uses period='1mo' and takes the last 5 trading days to avoid
+    timezone-related data gaps on Asian markets (.KS etc.).
+    """
     result = {'price': None, '5d_high': None, '5d_closes': [], '5d_ohlc': []}
     try:
         t = yf.Ticker(ticker)
-        try:
-            price = t.fast_info.last_price
-            if price is not None and float(price) > 0:
-                result['price'] = float(price)
-        except Exception:
-            pass
 
-        hist = t.history(period='5d')
+        # Fetch a full month and take the last 5 trading days
+        hist = t.history(period='1mo')
         if not hist.empty:
-            if result['price'] is None:
-                result['price'] = float(hist['Close'].iloc[-1])
+            hist = hist.tail(5)
+
+            result['price'] = float(hist['Close'].iloc[-1])
             result['5d_high'] = float(hist['High'].max())
             result['5d_closes'] = [float(c) for c in hist['Close'].tolist()]
             for idx, row in hist.iterrows():
@@ -29,6 +29,14 @@ def _fetch_ticker_data(ticker: str) -> dict:
                     'low':  float(row['Low']),
                     'close': float(row['Close']),
                 })
+
+        # Try real-time price (more current during market hours)
+        try:
+            price = t.fast_info.last_price
+            if price is not None and float(price) > 0:
+                result['price'] = float(price)
+        except Exception:
+            pass
     except Exception:
         pass
     return result

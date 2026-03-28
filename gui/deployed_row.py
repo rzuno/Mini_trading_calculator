@@ -6,22 +6,21 @@ from core.calc import (
     calc_sell_tiers, calc_gap_rate,
 )
 
-# ── Fonts (1.5× scale for QHD) ──────────────────────────────────────────────
-_F_NAME = ('Segoe UI', 15, 'bold')
-_F_LBL  = ('Segoe UI', 14)
-_F_VAL  = ('Segoe UI', 14)
-_F_OUT  = ('Segoe UI', 15, 'bold')
-_F_SM   = ('Segoe UI', 12)
-_F_ARR  = ('Segoe UI', 11)
+# ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
+_F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
+_F_NAME_MINOR = ('Segoe UI', 13)
+_F_LBL  = ('Segoe UI', 12)
+_F_VAL  = ('Segoe UI', 12)
+_F_OUT  = ('Segoe UI', 13, 'bold')
+_F_SM   = ('Segoe UI', 10)
 
 
 class DeployedRow:
-    """Card frame for one deployed stock. Reactive traces recompute on input
-    change; compute() is also called externally on Save & Refresh."""
+    """Card frame for one deployed stock. Reactive traces recompute on
+    input change; compute() is also called externally on Save & Refresh."""
 
     def __init__(self, parent, row_num: int, pos: dict,
-                 on_move_up, on_move_down, on_graph,
-                 on_undeploy=None, on_compute=None):
+                 on_graph, on_compute=None):
         self.ticker         = pos['ticker']
         self.tier           = pos['tier']
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
@@ -65,12 +64,13 @@ class DeployedRow:
         r0 = tk.Frame(self.frame)
         r0.pack(fill='x', pady=(0, 3))
 
-        # Name — fixed width for alignment across rows
+        # Name — fixed width for alignment, bold for Major, normal for Minor
         name = STOCK_NAMES.get(self.ticker, self.ticker)
         if self.ticker.endswith('.KS'):
             name += '  (KR)'
+        name_font = _F_NAME_MAJOR if self.tier == 'Major' else _F_NAME_MINOR
         tk.Label(r0, text=f"{row_num}. {name}",
-                 font=_F_NAME, anchor='w', width=28).pack(side='left')
+                 font=name_font, anchor='w', width=28).pack(side='left')
 
         # Avg cost
         tk.Label(r0, text='Avg Cost:', font=_F_LBL).pack(side='left')
@@ -104,19 +104,12 @@ class DeployedRow:
             self._spn.append(spn)
             self._color_spn(spn, self.t_pct[i].get())
 
-        # Right side — arrows, graph, remove, army%
+        # Right side — Graph, army%
         btn_frame = tk.Frame(r0)
         btn_frame.pack(side='right', padx=4)
 
-        tk.Button(btn_frame, text='\u25b2', font=_F_ARR, width=2,
-                  command=lambda: on_move_up(self.ticker)).pack(side='left')
-        tk.Button(btn_frame, text='\u25bc', font=_F_ARR, width=2,
-                  command=lambda: on_move_down(self.ticker)).pack(side='left')
         tk.Button(btn_frame, text='Graph', font=_F_SM, width=6,
                   command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 0))
-        if on_undeploy:
-            tk.Button(btn_frame, text='Remove', font=_F_SM, width=7,
-                      command=lambda: on_undeploy(self.ticker)).pack(side='left', padx=(4, 0))
 
         tk.Label(r0, textvariable=self.army_pct_var,
                  font=_F_OUT, width=7, anchor='e').pack(side='right', padx=(0, 4))
@@ -138,8 +131,12 @@ class DeployedRow:
         _out('Current:', self.current_var)
         self.gap_lbl = _out('Gap:', self.gap_var, width=9)
         _out('Buy Trigger:', self.buy_info_var)
+
+        # Visual separator between buy and sell
+        tk.Label(r1, text='  \u2502  ', fg='#CCC', font=_F_SM).pack(side='left')
+
         self.t_info_lbl = [
-            _out(f'Sell Tier {i+1}:', self.t_info_var[i]) for i in range(3)]
+            _out(f'Sell T{i+1}:', self.t_info_var[i]) for i in range(3)]
 
         # ── Reactive traces (added after all widgets are built) ──────────────
         self.shares_var.trace_add('write', lambda *_: self._on_input_change())
@@ -179,7 +176,7 @@ class DeployedRow:
     def _update_buy_color(self):
         pct = self._get_buy_pct()
         c = buy_pct_color(pct)
-        fg = 'white' if pct >= 5 else 'black'
+        fg = 'white' if pct >= 6 else 'black'
         self.buy_om.config(bg=c, fg=fg, activebackground=c, activeforeground=fg)
 
     def _on_buy_change(self, _=None):
