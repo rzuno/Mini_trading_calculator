@@ -11,6 +11,7 @@ from gui.candle_chart import CandleChartWindow
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
 _F_SECTION = ('Segoe UI', 16, 'bold')
+_F_SEC_INFO = ('Segoe UI', 13)
 _F_HDR     = ('Segoe UI', 13)
 _F_HDR_B   = ('Segoe UI', 13, 'bold')
 _F_BTN     = ('Segoe UI', 13, 'bold')
@@ -21,8 +22,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI Seesaw Mini-Calculator")
-        self.root.geometry('1800x1200')
-        self.root.minsize(1400, 800)
+        self.root.geometry('1600x1200')
+        self.root.minsize(1300, 800)
 
         self.config    = load_config()
         self.positions = load_positions()
@@ -44,8 +45,7 @@ class App:
         self.fx_var           = tk.StringVar(value='--')
         self.last_refresh_var = tk.StringVar(value='--')
         self.status_var       = tk.StringVar(value='Initializing...')
-        self.deploy_total_var = tk.StringVar(value='--')
-        self.deploy_ratio_var = tk.StringVar(value='--')
+        self.deploy_info_var  = tk.StringVar(value='')
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -136,9 +136,6 @@ class App:
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
         _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
         _lbl('FX Rate:');        _val(self.fx_var, width=9)
-        _lbl('Last Refresh:');   _val(self.last_refresh_var, width=18)
-        _lbl('Deployed:');       _val(self.deploy_total_var, width=14)
-        _lbl('Ratio:');          _val(self.deploy_ratio_var, width=16)
 
     # ── Rebuild ──────────────────────────────────────────────────────────────
 
@@ -168,6 +165,9 @@ class App:
         hdr.pack(fill='x', pady=(4, 2))
         tk.Label(hdr, text='DEPLOYED STOCKS',
                  font=_F_SECTION).pack(side='left', padx=4)
+        self._deploy_info_lbl = tk.Label(hdr, textvariable=self.deploy_info_var,
+                                         font=_F_SEC_INFO, fg='#555')
+        self._deploy_info_lbl.pack(side='left', padx=(12, 0))
 
         box = tk.Frame(sec, bd=1, relief='sunken', padx=4, pady=4)
         box.pack(fill='x', padx=2)
@@ -216,8 +216,12 @@ class App:
         f.pack(fill='x', padx=5, pady=(2, 5), side='bottom')
         tk.Button(f, text='Save & Refresh', command=self._on_save_refresh,
                   width=16, font=_F_BTN).pack(side='left', padx=4)
+        tk.Label(f, text='Last Refresh:', font=_F_SM,
+                 fg='#888').pack(side='left', padx=(16, 2))
+        tk.Label(f, textvariable=self.last_refresh_var, font=_F_SM
+                 ).pack(side='left', padx=(0, 16))
         tk.Label(f, textvariable=self.status_var, font=_F_SM,
-                 anchor='w').pack(side='left', padx=16)
+                 anchor='w').pack(side='left', padx=4)
 
     # ── Graph ────────────────────────────────────────────────────────────────
 
@@ -374,19 +378,20 @@ class App:
             krw = cb * fx_rate if (r.currency == 'USD' and fx_rate) else cb
             r.set_army_pct(krw / total * 100.0)
 
-        # Update header deployed info
-        self.deploy_total_var.set(f"\u20a9{total:,.0f}" if total > 0 else '--')
+        # Update section header deployed info
         try:
             n = int(self.N_var.get())
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
-            if unit_krw > 0 and n > 0:
+            if total > 0 and unit_krw > 0 and n > 0:
                 units = total / unit_krw
                 pct = units / n * 100
-                self.deploy_ratio_var.set(f"{units:.1f}/{n} ({pct:.1f}%)")
+                self.deploy_info_var.set(
+                    f"(Deployed: \u20a9{total:,.0f}    "
+                    f"Ratio: {units:.1f}/{n} = {pct:.1f}%)")
             else:
-                self.deploy_ratio_var.set('--')
+                self.deploy_info_var.set('')
         except (ValueError, ZeroDivisionError):
-            self.deploy_ratio_var.set('--')
+            self.deploy_info_var.set('')
 
     # ── Save ─────────────────────────────────────────────────────────────────
 

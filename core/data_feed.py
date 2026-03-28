@@ -6,17 +6,44 @@ import yfinance as yf
 def _fetch_ticker_data(ticker: str) -> dict:
     """Fetch price, 5-day closes, and OHLC for a single ticker.
 
-    Uses period='1mo' and takes the last 5 trading days to avoid
-    timezone-related data gaps on Asian markets (.KS etc.).
+    Uses period='1mo' and takes the last 5 trading days to ensure
+    complete data.  For Korean (.KS) stocks the most recent bar's
+    close can be stale in yfinance history(); we patch it with the
+    live regularMarketPrice from ticker.info.
     """
     result = {'price': None, '5d_high': None, '5d_closes': [], '5d_ohlc': []}
     try:
         t = yf.Ticker(ticker)
 
-        # Fetch a full month and take the last 5 trading days
+        # ── Live price from info (most accurate) ────────────────────────────
+        live_price = None
+        try:
+            info = t.info
+            live_price = info.get('regularMarketPrice') or info.get('currentPrice')
+            if live_price is not None:
+                live_price = float(live_price)
+                if live_price <= 0:
+                    live_price = None
+        except Exception:
+            pass
+
+        # Fallback: fast_info
+        if live_price is None:
+            try:
+                p = t.fast_info.last_price
+                if p is not None and float(p) > 0:
+                    live_price = float(p)
+            except Exception:
+                pass
+
+        # ── Historical OHLC ─────────────────────────────────────────────────
         hist = t.history(period='1mo')
         if not hist.empty:
             hist = hist.tail(5)
+
+            # Patch the last bar's close with live price if available
+            if live_price is not None and len(hist) > 0:
+                hist.iloc[-1, hist.columns.get_loc('Close')] = live_price
 
             result['price'] = float(hist['Close'].iloc[-1])
             result['5d_high'] = float(hist['High'].max())
@@ -30,13 +57,8 @@ def _fetch_ticker_data(ticker: str) -> dict:
                     'close': float(row['Close']),
                 })
 
-        # Try real-time price (more current during market hours)
-        try:
-            price = t.fast_info.last_price
-            if price is not None and float(price) > 0:
-                result['price'] = float(price)
-        except Exception:
-            pass
+        if live_price is not None:
+            result['price'] = live_price
     except Exception:
         pass
     return result

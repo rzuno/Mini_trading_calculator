@@ -30,7 +30,7 @@ _PORTFOLIO = [
     ('GOOGL', 'Major'),
     ('MU',    'Minor'),
     ('MSFT',  'Minor'),
-    ('WDC',   'Minor'),
+    ('SNDK',  'Minor'),
     ('AMD',   'Minor'),
     ('TSM',   'Minor'),
     ('AVGO',  'Minor'),

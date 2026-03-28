@@ -108,7 +108,7 @@ class DeployedRow:
         btn_frame = tk.Frame(r0)
         btn_frame.pack(side='right', padx=4)
 
-        tk.Button(btn_frame, text='Graph', font=_F_SM, width=6,
+        tk.Button(btn_frame, text='Graph', font=_F_LBL, width=7,
                   command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 0))
 
         tk.Label(r0, textvariable=self.army_pct_var,

@@ -77,7 +77,7 @@ class EmptyRow:
                  font=_F_OUT).pack(side='left', padx=(2, 8))
 
         # Right side — Graph only
-        tk.Button(r0, text='Graph', font=_F_SM, width=6,
+        tk.Button(r0, text='Graph', font=_F_LBL, width=7,
                   command=lambda: on_graph(self.ticker)).pack(side='right', padx=(4, 2))
 
         # ── Row 2: avg cost / shares for auto-deploy ─────────────────────────

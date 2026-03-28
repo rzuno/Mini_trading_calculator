@@ -149,13 +149,12 @@ class CandleChartWindow:
         elif self.mode == 'deployed' and self.avg_cost > 0:
             self._draw_deployed_refs(c, left_pad, chart_w, w, y_of)
 
-        # ── Current price line ───────────────────────────────────────────────
+        # ── Current price line (label on left) ──────────────────────────────
         if self.current_price and self.current_price > 0:
-            label_x = left_pad + chart_w + 5
             y_cur = y_of(self.current_price)
             c.create_line(left_pad, y_cur, left_pad + chart_w, y_cur,
                           fill='#333333', width=1.5)
-            c.create_text(label_x, y_cur,
+            c.create_text(left_pad + 4, y_cur - 8,
                           text=f'Now: {fmt_price(self.current_price, self.ccy)}',
                           anchor='w', font=_F_REF, fill='#333333')
 

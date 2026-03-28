@@ -8,7 +8,7 @@ STOCK_NAMES = {
     'GOOGL': 'Alphabet',
     'MU':    'Micron',
     'MSFT':  'Microsoft',
-    'WDC':   'Western Digital',
+    'SNDK':  'SanDisk',
     'AMD':   'AMD',
     'TSM':   'TSMC',
     'AVGO':  'Broadcom',
