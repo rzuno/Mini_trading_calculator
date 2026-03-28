@@ -146,11 +146,15 @@ class App:
         self.deployed_rows = []
         self.empty_rows    = []
 
-        # Sort positions in fixed order
+        # Sort positions
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
 
         deployed = [p for p in self.positions if p.get('is_deployed')]
         empty    = [p for p in self.positions if not p.get('is_deployed')]
+
+        # Deployed: biggest army (cost_basis) first
+        deployed.sort(key=lambda p: p.get('shares', 0) * p.get('avg_cost', 0),
+                      reverse=True)
 
         self._build_deployed(deployed)
         self._build_empty(empty)

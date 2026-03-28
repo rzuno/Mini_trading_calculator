@@ -154,9 +154,9 @@ class CandleChartWindow:
             y_cur = y_of(self.current_price)
             c.create_line(left_pad, y_cur, left_pad + chart_w, y_cur,
                           fill='#333333', width=1.5)
-            c.create_text(left_pad + 4, y_cur - 8,
-                          text=f'Now: {fmt_price(self.current_price, self.ccy)}',
-                          anchor='w', font=_F_REF, fill='#333333')
+            c.create_text(left_pad - 2, y_cur,
+                          text=f'{fmt_price(self.current_price, self.ccy)}',
+                          anchor='e', font=_F_REF, fill='#333333')
 
         # ── Candles ──────────────────────────────────────────────────────────
         for i, d in enumerate(ohlc):
