@@ -375,12 +375,21 @@ class App:
         for r in self.deployed_rows:
             cb = _cb(r)
             total += cb * fx_rate if (r.currency == 'USD' and fx_rate) else cb
+
+        # Denominator = full army (deployed + reserved), not just deployed
+        try:
+            n = int(self.N_var.get())
+            unit_krw = float(self.unit_krw_var.get().replace(',', ''))
+            full_army = n * unit_krw
+        except (ValueError, ZeroDivisionError):
+            full_army = 0.0
+
         for r in self.deployed_rows:
             cb = _cb(r)
-            if total <= 0:
+            if full_army <= 0:
                 r.set_army_pct(None); continue
             krw = cb * fx_rate if (r.currency == 'USD' and fx_rate) else cb
-            r.set_army_pct(krw / total * 100.0)
+            r.set_army_pct(krw / full_army * 100.0)
 
         # Update section header deployed info
         try:
