@@ -140,15 +140,15 @@ def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives:
 
     elif n == 2:
         i1, i2 = active_idx
-        q1 = round_half_up(shares * 0.5)
+        q1 = math.floor(shares * 0.5)
         q2 = shares - q1
         result[i1] = {'price': sell_price(i1), 'qty': q1}
         result[i2] = {'price': sell_price(i2), 'qty': q2}
 
     else:  # n == 3
         i1, i2, i3 = active_idx
-        q1 = round_half_up(shares * 0.5)
-        q2 = round_half_up((shares - q1) * 0.5)
+        q1 = math.floor(shares * 0.5)
+        q2 = math.floor((shares - q1) * 0.5)
         q3 = shares - q1 - q2
         result[i1] = {'price': sell_price(i1), 'qty': q1}
         result[i2] = {'price': sell_price(i2), 'qty': q2}
