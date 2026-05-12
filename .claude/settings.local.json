@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(python -c \":*)",
-      "Bash(python -c \"from core.calc import LOAD_GEARS; import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); print\\(repr\\(LOAD_GEARS['L6']\\)\\); print\\(repr\\(LOAD_GEARS['L7']\\)\\)\")"
+      "Bash(python -c \"from core.calc import LOAD_GEARS; import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); print\\(repr\\(LOAD_GEARS['L6']\\)\\); print\\(repr\\(LOAD_GEARS['L7']\\)\\)\")",
+      "Bash(findstr /i \"config.json positions.csv\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
