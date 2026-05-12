@@ -16,6 +16,7 @@ STOCK_NAMES = {
     'AAPL':  'Apple',
     'AMZN':  'Amazon',
     'STX':   'Seagate',
+    'INTC':  'Intel',
 }
 
 TIER_MULTIPLIER = {'Major': 1.0, 'Minor': 0.5}
@@ -30,14 +31,15 @@ def stock_sort_key(ticker):
     name = STOCK_NAMES.get(ticker, ticker)
     return (1, name.lower())
 
-# ── Load gear (light blue → dark blue, 6 levels) ────────────────────────────
+# ── Load gear (light blue → dark blue, 7 levels) ────────────────────────────
 LOAD_GEARS = {
     'L1': {'drop': 0.04, 'label': 'L1 (\u22124%)',  'color': '#B0C4DE'},
     'L2': {'drop': 0.05, 'label': 'L2 (\u22125%)',  'color': '#88AAC8'},
     'L3': {'drop': 0.06, 'label': 'L3 (\u22126%)',  'color': '#6690B2'},
     'L4': {'drop': 0.08, 'label': 'L4 (\u22128%)',  'color': '#44769C'},
     'L5': {'drop': 0.10, 'label': 'L5 (\u221210%)', 'color': '#2E5C86'},
-    'L6': {'drop': 0.15, 'label': 'L6 (\u221215%)', 'color': '#1A3366'},
+    'L6': {'drop': 0.12, 'label': 'L6 (\u221212%)', 'color': '#224773'},
+    'L7': {'drop': 0.15, 'label': 'L7 (\u221215%)', 'color': '#1A3366'},
 }
 LOAD_GEAR_KEYS   = list(LOAD_GEARS.keys())
 LOAD_GEAR_LABELS = [v['label'] for v in LOAD_GEARS.values()]

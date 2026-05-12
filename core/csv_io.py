@@ -38,6 +38,7 @@ _PORTFOLIO = [
     ('AAPL',  'Minor'),
     ('AMZN',  'Minor'),
     ('STX',   'Minor'),
+    ('INTC',  'Minor'),
 ]
 
 
