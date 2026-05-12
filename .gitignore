@@ -6,6 +6,7 @@ __pycache__/
 
 # Data files (user-specific positions)
 data/*.csv
+/config.json
 
 # Docs for main calculator (separate project)
 docs_main_calculator/
