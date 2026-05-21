@@ -3,6 +3,8 @@ import json
 import os
 from datetime import date
 
+from core.calc import normalize_load_pct
+
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH    = os.path.join(_HERE, 'config.json')
 POSITIONS_PATH = os.path.join(_HERE, 'data', 'positions.csv')
@@ -50,7 +52,7 @@ def _blank(ticker: str, tier: str) -> dict:
         'shares':      0,
         'avg_cost':    0.0,
         'cost_basis':  0.0,
-        'load_gear':   'L2',
+        'load_gear':   5,
         'buy_pct':     5,
         't1_pct':      4.0,
         't2_pct':      6.0,
@@ -106,7 +108,7 @@ def _parse_row(row: dict) -> dict:
         'shares':      shares,
         'avg_cost':    f('avg_cost', 0.0),
         'cost_basis':  f('cost_basis', 0.0),
-        'load_gear':   row.get('load_gear', 'L2'),
+        'load_gear':   normalize_load_pct(row.get('load_gear', 5)),
         'buy_pct':     buy_pct,
         't1_pct':      f('t1_pct', t1d),
         't2_pct':      f('t2_pct', t2d),
@@ -161,7 +163,7 @@ def save_positions(positions: list) -> None:
                 'shares':       pos.get('shares', 0),
                 'avg_cost':     pos.get('avg_cost', 0.0),
                 'cost_basis':   pos.get('cost_basis', 0.0),
-                'load_gear':    pos.get('load_gear', 'L2'),
+                'load_gear':    pos.get('load_gear', 5),
                 'buy_pct':      pos.get('buy_pct', 5),
                 't1_pct':       pos.get('t1_pct', 4.0),
                 't2_pct':       pos.get('t2_pct', 6.0),

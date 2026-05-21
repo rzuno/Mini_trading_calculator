@@ -2,7 +2,7 @@ import tkinter as tk
 import threading
 from datetime import datetime
 
-from core.calc import stock_sort_key, LOAD_GEAR_KEYS
+from core.calc import stock_sort_key
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from core.data_feed import fetch_all
 from gui.deployed_row import DeployedRow
@@ -156,11 +156,10 @@ class App:
         deployed.sort(key=lambda p: p.get('shares', 0) * p.get('avg_cost', 0),
                       reverse=True)
 
-        # Empty: lowest load gear first, Major before Minor within same gear
-        _GEAR_ORDER = {k: i for i, k in enumerate(LOAD_GEAR_KEYS)}
+        # Empty: shallowest load gear first, Major before Minor within same gear
         _TIER_ORDER = {'Major': 0, 'Minor': 1}
         empty.sort(key=lambda p: (
-            _GEAR_ORDER.get(p.get('load_gear', 'L2'), 1),
+            p.get('load_gear', 5),
             _TIER_ORDER.get(p.get('tier', 'Minor'), 1),
         ))
 
@@ -263,7 +262,7 @@ class App:
                     CandleChartWindow(
                         self.root, ticker, ohlc, ccy,
                         mode='empty',
-                        load_gear=row._get_gear_key(),
+                        load_pct=row._get_load_pct(),
                         current_price=current_price)
                     return
 

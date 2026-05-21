@@ -1,9 +1,10 @@
 import tkinter as tk
 from core.calc import (
-    STOCK_NAMES, LOAD_GEARS, LOAD_GEAR_LABELS, LOAD_LABEL_TO_KEY,
-    load_gear_color, fmt_price,
+    STOCK_NAMES, LOAD_PCT_MIN, LOAD_PCT_MAX,
+    normalize_load_pct, load_pct_color, fmt_price,
     calc_load_price, calc_load_shares,
 )
+from gui.stepper import Stepper
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
 _F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
@@ -12,6 +13,7 @@ _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
+_F_BTN  = ('Segoe UI', 11, 'bold')
 
 
 class EmptyRow:
@@ -32,8 +34,9 @@ class EmptyRow:
         self.frame.pack(fill='x')
 
         # ── Variables ────────────────────────────────────────────────────────
-        init_label = LOAD_GEARS[pos.get('load_gear', 'L2')]['label']
-        self.load_label_var = tk.StringVar(value=init_label)
+        # Load gear held as a negative drop percent (e.g. -8 shown as -8%).
+        init_pct = normalize_load_pct(pos.get('load_gear', 5))
+        self.load_pct_var   = tk.IntVar(value=-init_pct)
         self.peak_var       = tk.StringVar(value='--')
         self.current_var    = tk.StringVar(value='--')
         self.load_info_var  = tk.StringVar(value='--')
@@ -64,12 +67,13 @@ class EmptyRow:
                                     font=_F_VAL, width=10, anchor='e')
         self.current_lbl.pack(side='left', padx=(2, 8))
 
-        # Load gear dropdown
-        self.gear_om = tk.OptionMenu(r0, self.load_label_var,
-                                     *LOAD_GEAR_LABELS,
-                                     command=self._on_gear_change)
-        self.gear_om.config(font=_F_SM, width=13, relief='raised')
-        self.gear_om.pack(side='left', padx=4)
+        # Load gear stepper — click ▼ / ▲ to step 1% (-4% ... -15%)
+        tk.Label(r0, text='Load Gear:', font=_F_SM, fg='#888').pack(side='left')
+        self.gear_step = Stepper(
+            r0, self.load_pct_var, -LOAD_PCT_MAX, -LOAD_PCT_MIN,
+            entry_width=4, value_font=_F_VAL, btn_font=_F_BTN)
+        self.gear_step.pack(side='left', padx=(2, 0))
+        tk.Label(r0, text='%', font=_F_SM, fg='#888').pack(side='left', padx=(0, 6))
         self._update_gear_color()
 
         tk.Label(r0, text='Load Target:', font=_F_SM, fg='#888').pack(side='left')
@@ -100,7 +104,7 @@ class EmptyRow:
                  fg='#AAA').pack(side='left', padx=(4, 0))
 
         # Trace for load gear (reactive)
-        self.load_label_var.trace_add('write', lambda *_: self.compute())
+        self.load_pct_var.trace_add('write', lambda *_: self.compute())
 
     # ── Formatting ───────────────────────────────────────────────────────────
 
@@ -119,17 +123,19 @@ class EmptyRow:
 
     # ── Gear helpers ─────────────────────────────────────────────────────────
 
-    def _get_gear_key(self) -> str:
-        return LOAD_LABEL_TO_KEY.get(self.load_label_var.get(), 'L2')
+    def _get_load_pct(self) -> int:
+        """Current load gear as a positive drop percent, clamped to range."""
+        try:
+            v = abs(self.load_pct_var.get())
+        except tk.TclError:
+            v = 5
+        return max(LOAD_PCT_MIN, min(LOAD_PCT_MAX, v))
 
     def _update_gear_color(self):
-        key = self._get_gear_key()
-        c   = load_gear_color(key)
-        fg  = 'black' if key in ('L1', 'L2') else 'white'
-        self.gear_om.config(bg=c, fg=fg, activebackground=c, activeforeground=fg)
-
-    def _on_gear_change(self, _=None):
-        self._update_gear_color()
+        pct = self._get_load_pct()
+        c   = load_pct_color(pct)
+        fg  = 'black' if pct <= 5 else 'white'
+        self.gear_step.set_value_color(c, fg)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -140,12 +146,13 @@ class EmptyRow:
     def compute(self):
         ccy = self.currency
         load_price = None
+        self._update_gear_color()
 
         if self.peak_5d and self.peak_5d > 0:
-            gear = self._get_gear_key()
+            pct = self._get_load_pct()
             self.peak_var.set(fmt_price(self.peak_5d, ccy))
-            load_price = calc_load_price(self.peak_5d, gear)
-            n  = calc_load_shares(self.peak_5d, gear, self.tier,
+            load_price = calc_load_price(self.peak_5d, pct)
+            n  = calc_load_shares(self.peak_5d, pct, self.tier,
                                   self.get_unit_cash())
             self.load_info_var.set(f"{fmt_price(load_price, ccy)} \u00d7 {n}")
         else:
@@ -175,7 +182,7 @@ class EmptyRow:
             'shares':     shares,
             'avg_cost':   avg_cost,
             'cost_basis': shares * avg_cost,
-            'load_gear':  self._get_gear_key(),
+            'load_gear':  self._get_load_pct(),
             'buy_pct':    5,
             't1_pct':     4.0,  't2_pct': 6.0,  't3_pct': 8.0,
             't1_active':  True, 't2_active': True, 't3_active': True,

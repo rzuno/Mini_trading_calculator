@@ -1,5 +1,5 @@
 import tkinter as tk
-from core.calc import STOCK_NAMES, LOAD_GEARS, fmt_price
+from core.calc import STOCK_NAMES, fmt_price
 
 # ── Fonts (kept at 1.5× — user says graph fonts are fine) ───────────────────
 _F_TITLE = ('Segoe UI', 17, 'bold')
@@ -13,7 +13,7 @@ class CandleChartWindow:
     """Popup window showing 5-day candle chart with reference lines."""
 
     def __init__(self, parent, ticker, ohlc_data, currency,
-                 mode=None, load_gear=None,
+                 mode=None, load_pct=None,
                  avg_cost=0, buy_pct=5, sell_tiers=None,
                  current_price=None):
         self.win = tk.Toplevel(parent)
@@ -24,7 +24,7 @@ class CandleChartWindow:
         self.win.resizable(True, True)
         self.ccy = currency
         self.mode = mode
-        self.load_gear = load_gear
+        self.load_pct = load_pct
         self.avg_cost = avg_cost
         self.buy_pct = buy_pct
         self.sell_tiers = sell_tiers or []
@@ -102,9 +102,9 @@ class CandleChartWindow:
         if self.current_price and self.current_price > 0:
             all_prices.append(self.current_price)
 
-        if self.mode == 'empty' and self.load_gear:
+        if self.mode == 'empty' and self.load_pct:
             max_h = max(d['high'] for d in ohlc)
-            drop = LOAD_GEARS[self.load_gear]['drop']
+            drop = self.load_pct / 100.0
             all_prices.append(max_h * (1 - drop))
         elif self.mode == 'deployed' and self.avg_cost > 0:
             all_prices.append(self.avg_cost)
@@ -144,7 +144,7 @@ class CandleChartWindow:
                           anchor='e', font=_F_AXIS, fill='#888')
 
         # ── Reference lines (drawn behind candles) ───────────────────────────
-        if self.mode == 'empty' and self.load_gear:
+        if self.mode == 'empty' and self.load_pct:
             self._draw_empty_refs(c, left_pad, chart_w, w, y_of)
         elif self.mode == 'deployed' and self.avg_cost > 0:
             self._draw_deployed_refs(c, left_pad, chart_w, w, y_of)
@@ -187,7 +187,7 @@ class CandleChartWindow:
     def _draw_empty_refs(self, c, left_pad, chart_w, w, y_of):
         max_high = max(d['high'] for d in self.ohlc)
         min_low  = min(d['low']  for d in self.ohlc)
-        drop = LOAD_GEARS[self.load_gear]['drop']
+        drop = self.load_pct / 100.0
         load_price = max_high * (1 - drop)
 
         label_x = left_pad + chart_w + 5

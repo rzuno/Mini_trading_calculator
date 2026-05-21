@@ -31,19 +31,51 @@ def stock_sort_key(ticker):
     name = STOCK_NAMES.get(ticker, ticker)
     return (1, name.lower())
 
-# ── Load gear (light blue → dark blue, 7 levels) ────────────────────────────
-LOAD_GEARS = {
-    'L1': {'drop': 0.04, 'label': 'L1 (\u22124%)',  'color': '#B0C4DE'},
-    'L2': {'drop': 0.05, 'label': 'L2 (\u22125%)',  'color': '#88AAC8'},
-    'L3': {'drop': 0.06, 'label': 'L3 (\u22126%)',  'color': '#6690B2'},
-    'L4': {'drop': 0.08, 'label': 'L4 (\u22128%)',  'color': '#44769C'},
-    'L5': {'drop': 0.10, 'label': 'L5 (\u221210%)', 'color': '#2E5C86'},
-    'L6': {'drop': 0.12, 'label': 'L6 (\u221212%)', 'color': '#224773'},
-    'L7': {'drop': 0.15, 'label': 'L7 (\u221215%)', 'color': '#1A3366'},
+# ── Load gear (continuous -4% ... -15% drop, 1% steps) ──────────────────────
+LOAD_PCT_MIN = 4
+LOAD_PCT_MAX = 15
+
+# Blue gradient: light (-4%) -> dark (-15%). The -4/-5/-6% entries match the
+# buy-gear colors for cross-tool consistency; the rest fill the 1% gaps.
+LOAD_PCT_COLORS = {
+    4:  '#B0C4DE',
+    5:  '#88AAC8',
+    6:  '#6690B2',
+    7:  '#5583A7',
+    8:  '#44769C',
+    9:  '#396991',
+    10: '#2E5C86',
+    11: '#28517C',
+    12: '#224773',
+    13: '#1F406B',
+    14: '#1C3A6A',
+    15: '#1A3366',
 }
-LOAD_GEAR_KEYS   = list(LOAD_GEARS.keys())
-LOAD_GEAR_LABELS = [v['label'] for v in LOAD_GEARS.values()]
-LOAD_LABEL_TO_KEY = {v['label']: k for k, v in LOAD_GEARS.items()}
+
+# Legacy gear keys (L1-L7) -> drop percent, for reading old CSV/config files.
+LEGACY_LOAD_GEARS = {'L1': 4, 'L2': 5, 'L3': 6, 'L4': 8,
+                     'L5': 10, 'L6': 12, 'L7': 15}
+
+
+def clamp_load_pct(pct) -> int:
+    return max(LOAD_PCT_MIN, min(LOAD_PCT_MAX, int(pct)))
+
+
+def normalize_load_pct(value) -> int:
+    """Accept a legacy gear key ('L1'-'L7'), an int, or a numeric string and
+    return a drop percent clamped to LOAD_PCT_MIN..LOAD_PCT_MAX."""
+    if isinstance(value, str):
+        v = value.strip()
+        if v in LEGACY_LOAD_GEARS:
+            return LEGACY_LOAD_GEARS[v]
+        try:
+            value = float(v)
+        except ValueError:
+            return 5
+    try:
+        return clamp_load_pct(value)
+    except (ValueError, TypeError):
+        return 5
 
 # ── Buy gear (matching load gear blue tones for −4/−5/−6%) ──────────────────
 BUY_GEAR_PCTS = [4, 5, 6]
@@ -61,8 +93,8 @@ def buy_pct_color(pct: int) -> str:
     return BUY_GEAR_INFO.get(pct, {}).get('color', '#FFFFFF')
 
 
-def load_gear_color(gear: str) -> str:
-    return LOAD_GEARS.get(gear, {}).get('color', '#FFFFFF')
+def load_pct_color(pct) -> str:
+    return LOAD_PCT_COLORS.get(clamp_load_pct(pct), '#FFFFFF')
 
 
 def sell_pct_color(pct: float) -> str:
@@ -110,14 +142,14 @@ def calc_buy_shares(shares: int, buy_pct: int) -> int:
 
 
 # ── Load (empty stock entry) calculations ────────────────────────────────────
-def calc_load_price(peak_5d: float, load_gear: str) -> float:
-    return peak_5d * (1.0 - LOAD_GEARS[load_gear]['drop'])
+def calc_load_price(peak_5d: float, load_pct: int) -> float:
+    return peak_5d * (1.0 - load_pct / 100.0)
 
 
-def calc_load_shares(peak_5d: float, load_gear: str, tier: str, unit_cash: float) -> int:
+def calc_load_shares(peak_5d: float, load_pct: int, tier: str, unit_cash: float) -> int:
     if peak_5d <= 0 or unit_cash <= 0:
         return 0
-    load_price = calc_load_price(peak_5d, load_gear)
+    load_price = calc_load_price(peak_5d, load_pct)
     if load_price <= 0:
         return 0
     target_cash = TIER_MULTIPLIER[tier] * unit_cash

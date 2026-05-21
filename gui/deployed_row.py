@@ -5,6 +5,7 @@ from core.calc import (
     calc_buy_trigger, calc_buy_shares,
     calc_sell_tiers, calc_gap_rate,
 )
+from gui.stepper import Stepper
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
 _F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
@@ -13,6 +14,7 @@ _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
+_F_BTN  = ('Segoe UI', 11, 'bold')
 
 
 class DeployedRow:
@@ -93,16 +95,16 @@ class DeployedRow:
         self.buy_om.pack(side='left', padx=(2, 10))
         self._update_buy_color()
 
-        # Sell tier selectors (T1 T2 T3)
-        self._spn = []
+        # Sell tier selectors (T1 T2 T3) — click ▼ / ▲ to step 1%
+        self._steppers = []
         for i in range(3):
             tk.Label(r0, text=f'T{i+1}:', font=_F_LBL).pack(side='left', padx=(4, 0))
             tk.Checkbutton(r0, variable=self.t_active[i]).pack(side='left')
-            spn = tk.Spinbox(r0, textvariable=self.t_pct[i], from_=1, to=20,
-                             width=3, font=_F_VAL, justify='right')
-            spn.pack(side='left', padx=(0, 2))
-            self._spn.append(spn)
-            self._color_spn(spn, self.t_pct[i].get())
+            step = Stepper(r0, self.t_pct[i], 1, 20,
+                           entry_width=3, value_font=_F_VAL, btn_font=_F_BTN)
+            step.pack(side='left', padx=(0, 2))
+            self._steppers.append(step)
+            self._color_spn(step, self.t_pct[i].get())
 
         # Right side — Graph, army%
         btn_frame = tk.Frame(r0)
@@ -183,10 +185,10 @@ class DeployedRow:
         self._update_buy_color()
         self._on_input_change()
 
-    def _color_spn(self, spn, pct):
+    def _color_spn(self, stepper, pct):
         c = sell_pct_color(float(pct))
         fg = 'white' if float(pct) >= 5 else 'black'
-        spn.config(bg=c, fg=fg)
+        stepper.set_value_color(c, fg)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -211,7 +213,7 @@ class DeployedRow:
         # Enforce T1 < T2 < T3
         self._enforce_order()
         for i in range(3):
-            self._color_spn(self._spn[i], self.t_pct[i].get())
+            self._color_spn(self._steppers[i], self.t_pct[i].get())
 
         try:
             shares   = int(self.shares_var.get().replace(',', ''))
