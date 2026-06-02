@@ -31,6 +31,16 @@ def stock_sort_key(ticker):
     name = STOCK_NAMES.get(ticker, ticker)
     return (1, name.lower())
 
+
+def display_name(ticker: str) -> str:
+    """Short display name for the compact cards: collapse a long multi-word
+    name to its first word (e.g. 'Samsung Electronics' -> 'Samsung'); short
+    names pass through unchanged."""
+    name = STOCK_NAMES.get(ticker, ticker)
+    if len(name) > 12 and ' ' in name:
+        name = name.split(' ', 1)[0]
+    return name
+
 # ── Load gear (continuous -4% ... -15% drop, 1% steps) ──────────────────────
 LOAD_PCT_MIN = 4
 LOAD_PCT_MAX = 15

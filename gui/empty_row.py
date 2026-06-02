@@ -1,6 +1,6 @@
 import tkinter as tk
 from core.calc import (
-    STOCK_NAMES, LOAD_PCT_MIN, LOAD_PCT_MAX,
+    display_name, LOAD_PCT_MIN, LOAD_PCT_MAX,
     normalize_load_pct, load_pct_color, fmt_price,
     calc_load_price, calc_load_shares,
 )
@@ -29,9 +29,8 @@ class EmptyRow:
         self.current_price = None
         self.peak_5d       = None
 
-        # ── Frame ────────────────────────────────────────────────────────────
-        self.frame = tk.Frame(parent, padx=8, pady=5)
-        self.frame.pack(fill='x')
+        # ── Card frame (parent grids this; the row does not self-place) ───────
+        self.frame = tk.Frame(parent, bd=1, relief='groove', padx=6, pady=3)
 
         # ── Variables ────────────────────────────────────────────────────────
         # Load gear held as a negative drop percent (e.g. -8 shown as -8%).
@@ -47,58 +46,55 @@ class EmptyRow:
         self.shares_var = tk.StringVar(
             value=str(pos.get('shares', 0)) if pos.get('shares', 0) > 0 else '')
 
-        # ── Row 1: main info ─────────────────────────────────────────────────
+        # ── Row 0: name, Graph, live load monitoring ─────────────────────────
         r0 = tk.Frame(self.frame)
         r0.pack(fill='x')
 
-        name = STOCK_NAMES.get(self.ticker, self.ticker)
+        name = display_name(self.ticker)
         if self.ticker.endswith('.KS'):
-            name += '  (KR)'
+            name += ' (KR)'
         name_font = _F_NAME_MAJOR if self.tier == 'Major' else _F_NAME_MINOR
         tk.Label(r0, text=f"{row_num}. {name}",
-                 font=name_font, width=28, anchor='w').pack(side='left')
+                 font=name_font, anchor='w').pack(side='left')
+        tk.Button(r0, text='Graph', font=_F_SM, width=6,
+                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 10))
 
         tk.Label(r0, text='5D High:', font=_F_SM, fg='#888').pack(side='left')
         tk.Label(r0, textvariable=self.peak_var,
-                 font=_F_VAL, width=10, anchor='e').pack(side='left', padx=(2, 8))
+                 font=_F_VAL, width=9, anchor='e').pack(side='left', padx=(2, 8))
 
         tk.Label(r0, text='Current:', font=_F_SM, fg='#888').pack(side='left')
         self.current_lbl = tk.Label(r0, textvariable=self.current_var,
-                                    font=_F_VAL, width=10, anchor='e')
+                                    font=_F_VAL, width=9, anchor='e')
         self.current_lbl.pack(side='left', padx=(2, 8))
 
-        # Load gear stepper — click ▼ / ▲ to step 1% (-4% ... -15%)
+        # Load gear stepper — click the arrows to step 1% (-4% ... -15%)
         tk.Label(r0, text='Load Gear:', font=_F_SM, fg='#888').pack(side='left')
         self.gear_step = Stepper(
             r0, self.load_pct_var, -LOAD_PCT_MAX, -LOAD_PCT_MIN,
             entry_width=4, value_font=_F_VAL, btn_font=_F_BTN)
         self.gear_step.pack(side='left', padx=(2, 0))
-        tk.Label(r0, text='%', font=_F_SM, fg='#888').pack(side='left', padx=(0, 6))
+        tk.Label(r0, text='%', font=_F_SM, fg='#888').pack(side='left')
         self._update_gear_color()
 
-        tk.Label(r0, text='Load Target:', font=_F_SM, fg='#888').pack(side='left')
-        tk.Label(r0, textvariable=self.load_info_var,
-                 font=_F_OUT).pack(side='left', padx=(2, 8))
-
-        # Right side — Graph only
-        tk.Button(r0, text='Graph', font=_F_LBL, width=7,
-                  command=lambda: on_graph(self.ticker)).pack(side='right', padx=(4, 2))
-
-        # ── Row 2: avg cost / shares for auto-deploy ─────────────────────────
+        # ── Row 1: load target + avg cost / shares for auto-deploy ───────────
         r1 = tk.Frame(self.frame)
         r1.pack(fill='x', pady=(2, 0))
-        tk.Label(r1, text='', width=28).pack(side='left')  # spacer
+
+        tk.Label(r1, text='Load Target:', font=_F_SM, fg='#888').pack(side='left')
+        tk.Label(r1, textvariable=self.load_info_var,
+                 font=_F_OUT).pack(side='left', padx=(2, 14))
 
         tk.Label(r1, text='Avg Cost:', font=_F_SM, fg='#888').pack(side='left')
         self.avg_entry = tk.Entry(r1, textvariable=self.avg_cost_var,
-                                  width=11, justify='right', font=_F_VAL)
-        self.avg_entry.pack(side='left', padx=(2, 10))
+                                  width=10, justify='right', font=_F_VAL)
+        self.avg_entry.pack(side='left', padx=(2, 8))
         self.avg_entry.bind('<FocusOut>', lambda e: self._format_avg())
 
         tk.Label(r1, text='Shares:', font=_F_SM, fg='#888').pack(side='left')
         tk.Entry(r1, textvariable=self.shares_var,
                  width=6, justify='right', font=_F_VAL
-                 ).pack(side='left', padx=(2, 10))
+                 ).pack(side='left', padx=(2, 8))
 
         tk.Label(r1, text='(fill & Save to deploy)', font=_F_SM,
                  fg='#AAA').pack(side='left', padx=(4, 0))

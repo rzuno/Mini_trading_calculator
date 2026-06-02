@@ -22,8 +22,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI Seesaw Mini-Calculator")
-        self.root.geometry('1600x1200')
-        self.root.minsize(1300, 800)
+        self.root.minsize(1340, 700)
+        self._center_window(1700, 1320)
 
         self.config    = load_config()
         self.positions = load_positions()
@@ -63,10 +63,16 @@ class App:
         vbar.config(command=self._canvas.yview)
 
         self.content_frame = tk.Frame(self._canvas)
-        self._canvas.create_window((0, 0), window=self.content_frame, anchor='nw')
+        self._content_win = self._canvas.create_window(
+            (0, 0), window=self.content_frame, anchor='nw')
         self.content_frame.bind(
             '<Configure>',
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox('all')))
+        # Stretch the content to the canvas width so the 2-column card grids
+        # divide the full width evenly instead of sitting at natural width.
+        self._canvas.bind(
+            '<Configure>',
+            lambda e: self._canvas.itemconfig(self._content_win, width=e.width))
 
         self._canvas.bind('<Enter>',
             lambda e: self._canvas.bind_all('<MouseWheel>', self._mwheel))
@@ -84,6 +90,17 @@ class App:
 
     def _mwheel(self, event):
         self._canvas.yview_scroll(-1 * (event.delta // 120), 'units')
+
+    def _center_window(self, w, h):
+        """Size the window (clamped to the screen) and center it on launch so
+        nothing is clipped off-screen."""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w  = min(w, sw - 40)
+        h  = min(h, sh - 80)
+        x  = max(0, (sw - w) // 2)
+        y  = max(0, (sh - h) // 2 - 20)
+        self.root.geometry(f'{w}x{h}+{x}+{y}')
 
     # ── Unit cash ────────────────────────────────────────────────────────────
 
@@ -188,11 +205,15 @@ class App:
                      fg='gray', font=_F_SM, pady=10).pack()
             return
 
+        box.grid_columnconfigure(0, weight=1, uniform='dcol')
+        box.grid_columnconfigure(1, weight=1, uniform='dcol')
         for i, pos in enumerate(deployed):
             row = DeployedRow(
                 parent=box, row_num=i + 1, pos=pos,
                 on_graph=self._on_graph,
                 on_compute=self._on_row_compute)
+            r, c = divmod(i, 2)
+            row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=2)
             self.deployed_rows.append(row)
 
     # ── Empty section ────────────────────────────────────────────────────────
@@ -209,14 +230,16 @@ class App:
         box = tk.Frame(sec, bd=1, relief='sunken', padx=4, pady=2)
         box.pack(fill='x', padx=2)
 
+        box.grid_columnconfigure(0, weight=1, uniform='ecol')
+        box.grid_columnconfigure(1, weight=1, uniform='ecol')
         for i, pos in enumerate(empty):
-            if i > 0:
-                tk.Frame(box, height=1, bg='#D0D0D0').pack(fill='x', pady=1)
             ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
             row = EmptyRow(
                 parent=box, row_num=i + 1, pos=pos,
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph)
+            r, c = divmod(i, 2)
+            row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             self.empty_rows.append(row)
             row.compute()
 

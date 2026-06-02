@@ -9,7 +9,16 @@
       "Bash(git commit -m ' *)",
       "Bash(python -c ' *)",
       "Bash(python -m py_compile core/calc.py gui/deployed_row.py gui/candle_chart.py gui/main_window.py)",
-      "Bash(python -c \"import gui.deployed_row, gui.candle_chart, gui.main_window; print\\('imports OK'\\)\")"
+      "Bash(python -c \"import gui.deployed_row, gui.candle_chart, gui.main_window; print\\('imports OK'\\)\")",
+      "Bash(python -m py_compile core/calc.py gui/stepper.py gui/deployed_row.py gui/empty_row.py gui/candle_chart.py gui/main_window.py)",
+      "Bash(python -c \"import gui.main_window, gui.deployed_row, gui.empty_row, gui.candle_chart, gui.stepper; from core.calc import display_name; print\\('display_name samples:', display_name\\('005930.KS'\\), '|', display_name\\('NVDA'\\), '|', display_name\\('000660.KS'\\)\\); print\\('imports OK'\\)\")",
+      "Bash(python -c \"import PIL; from PIL import ImageGrab; print\\('Pillow OK', PIL.__version__\\)\")",
+      "Bash(python _shot.py)",
+      "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); c=im.crop\\(\\(10,145,1015,510\\)\\); c.save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\); print\\('ok', c.size\\)\")",
+      "Bash(python -m py_compile core/calc.py gui/stepper.py gui/deployed_row.py gui/empty_row.py gui/main_window.py)",
+      "Bash(python -c \"import gui.main_window; print\\('imports OK'\\)\")",
+      "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); im.crop\\(\\(10,145,1015,470\\)\\).save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\); print\\(im.size\\)\")",
+      "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); im.crop\\(\\(10,145,1015,460\\)\\).save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\)\")"
     ]
   }
 }

@@ -1,27 +1,31 @@
 import tkinter as tk
 from core.calc import (
-    STOCK_NAMES, BUY_GEAR_PCTS, BUY_GEAR_INFO, BUY_GEAR_LABELS, BUY_LABEL_TO_PCT,
-    buy_pct_color, sell_pct_color, gap_color, fmt_price,
+    display_name, BUY_GEAR_INFO,
+    sell_pct_color, gap_color, fmt_price,
     calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
 )
+from gui.stepper import Stepper
 
 # Readable blue for buy-trigger values (matches the chart's rescue lines)
 _BUY_FG = '#3366CC'
-from gui.stepper import Stepper
+# Readable, gear-differentiated blues for the selected buy-gear radio text
+_BUY_SEL = {4: '#3A6EA5', 5: '#2C5C95', 6: '#1F4A85'}
 
-# ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
+# -- Fonts (1.3x scale for QHD) ----------------------------------------------
 _F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
 _F_NAME_MINOR = ('Segoe UI', 13)
 _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
+_F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
 
 
 class DeployedRow:
     """Card frame for one deployed stock. Reactive traces recompute on
-    input change; compute() is also called externally on Save & Refresh."""
+    input change; compute() is also called externally on Save & Refresh.
+    The parent grids self.frame (2-column card layout)."""
 
     def __init__(self, parent, row_num: int, pos: dict,
                  on_graph, on_compute=None):
@@ -33,19 +37,19 @@ class DeployedRow:
         self._on_compute_cb = on_compute
         self._computing     = False
 
-        # ── Card frame ───────────────────────────────────────────────────────
-        self.frame = tk.Frame(parent, bd=1, relief='groove', padx=8, pady=5)
-        self.frame.pack(fill='x', padx=2, pady=3)
+        # -- Card frame (parent grids this; the row does not self-place) -------
+        self.frame = tk.Frame(parent, bd=1, relief='groove', padx=8, pady=3)
 
-        # ── Variables — inputs ───────────────────────────────────────────────
+        # -- Variables - inputs ------------------------------------------------
         self.shares_var    = tk.StringVar(
             value=str(pos['shares']) if pos['shares'] > 0 else '')
         self.avg_cost_var  = tk.StringVar(
             value=self._fmt_init(pos['avg_cost']))
 
         pct_init = pos.get('buy_pct', 5)
-        self.buy_label_var = tk.StringVar(
-            value=BUY_GEAR_INFO.get(pct_init, BUY_GEAR_INFO[5])['label'])
+        if pct_init not in (4, 5, 6):
+            pct_init = 5
+        self.buy_pct_var = tk.IntVar(value=pct_init)
 
         self.t_active = [
             tk.BooleanVar(value=bool(pos.get(f't{i+1}_active', True)))
@@ -54,97 +58,111 @@ class DeployedRow:
             tk.IntVar(value=int(pos.get(f't{i+1}_pct', [4, 6, 8][i])))
             for i in range(3)]
 
-        # ── Variables — outputs ──────────────────────────────────────────────
+        # -- Variables - outputs -----------------------------------------------
         self.current_var   = tk.StringVar(value='--')
         self.gap_var       = tk.StringVar(value='--')
         self.cost_var      = tk.StringVar(value='--')
         self.buy_info_var  = [tk.StringVar(value='--') for _ in range(3)]
         self.t_info_var    = [tk.StringVar(value='--') for _ in range(3)]
-        self.army_pct_var  = tk.StringVar(value='--')
+        self.army_pct_var  = tk.StringVar(value='')
 
-        # ═════════════════════════════════════════════════════════════════════
-        # ROW 0 — inputs
-        # ═════════════════════════════════════════════════════════════════════
+        # -- ROW 0: title (+ army%), Graph, Avg Cost, Shares -------------------
         r0 = tk.Frame(self.frame)
-        r0.pack(fill='x', pady=(0, 3))
+        r0.pack(fill='x', pady=(0, 2))
 
-        # Name — fixed width for alignment, bold for Major, normal for Minor
-        name = STOCK_NAMES.get(self.ticker, self.ticker)
+        name = display_name(self.ticker)
         if self.ticker.endswith('.KS'):
-            name += '  (KR)'
+            name += ' (KR)'
         name_font = _F_NAME_MAJOR if self.tier == 'Major' else _F_NAME_MINOR
         tk.Label(r0, text=f"{row_num}. {name}",
-                 font=name_font, anchor='w', width=28).pack(side='left')
+                 font=name_font, anchor='w').pack(side='left')
+        tk.Label(r0, textvariable=self.army_pct_var,
+                 font=_F_SM, fg='#888').pack(side='left', padx=(3, 6))
+        tk.Button(r0, text='Graph', font=_F_SM, width=6,
+                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(0, 12))
 
-        # Avg cost
         tk.Label(r0, text='Avg Cost:', font=_F_LBL).pack(side='left')
         self.avg_entry = tk.Entry(r0, textvariable=self.avg_cost_var,
-                                  width=11, justify='right', font=_F_VAL)
-        self.avg_entry.pack(side='left', padx=(2, 10))
+                                  width=10, justify='right', font=_F_VAL)
+        self.avg_entry.pack(side='left', padx=(2, 8))
         self.avg_entry.bind('<FocusOut>', lambda e: self._format_avg())
 
-        # Shares
         tk.Label(r0, text='Shares:', font=_F_LBL).pack(side='left')
         tk.Entry(r0, textvariable=self.shares_var,
                  width=6, justify='right', font=_F_VAL
-                 ).pack(side='left', padx=(2, 10))
+                 ).pack(side='left', padx=(2, 8))
 
-        # Buy gear
-        tk.Label(r0, text='Buy Gear:', font=_F_LBL).pack(side='left')
-        self.buy_om = tk.OptionMenu(r0, self.buy_label_var, *BUY_GEAR_LABELS,
-                                    command=self._on_buy_change)
-        self.buy_om.config(font=_F_SM, width=14, relief='raised')
-        self.buy_om.pack(side='left', padx=(2, 10))
+        # -- BODY: left computed ladder | right unified gear box ---------------
+        body = tk.Frame(self.frame)
+        body.pack(fill='x')
+
+        # Right: gear box. Buy radios (one selectable) | Sell tiers (toggle +
+        # stepper). Higher level on top: -4% over -6%, T3 over T1.
+        gear = tk.Frame(body)
+
+        tk.Label(gear, text='Buy Gear', font=_F_SM, fg='#888'
+                 ).grid(row=0, column=0, sticky='w', pady=0)
+        tk.Label(gear, text='Sell Gear', font=_F_SM, fg='#888'
+                 ).grid(row=0, column=2, columnspan=3, sticky='w', padx=(10, 0), pady=0)
+
+        self._buy_radios = {}
+        for disp, pct in enumerate([4, 5, 6]):
+            ratio = BUY_GEAR_INFO[pct]['ratio']
+            rb = tk.Radiobutton(
+                gear, text=f"-{pct}%  ×{ratio}", value=pct,
+                variable=self.buy_pct_var, font=_F_SM, anchor='w',
+                takefocus=0, bd=0, pady=0, selectcolor='white',
+                command=self._on_buy_change)
+            rb.grid(row=disp + 1, column=0, sticky='w', pady=0)
+            self._buy_radios[pct] = rb
+
+        tk.Frame(gear, width=1, bg='#D0D0D0'
+                 ).grid(row=1, column=1, rowspan=3, sticky='ns', padx=6)
+
+        self._steppers = [None, None, None]
+        for disp, ti in enumerate([2, 1, 0]):   # T3 top ... T1 bottom
+            grow = disp + 1
+            tk.Label(gear, text=f'T{ti+1}', font=_F_SM
+                     ).grid(row=grow, column=2, sticky='e', padx=(10, 1), pady=0)
+            tk.Checkbutton(gear, variable=self.t_active[ti], takefocus=0,
+                           bd=0, pady=0
+                           ).grid(row=grow, column=3, pady=0)
+            step = Stepper(gear, self.t_pct[ti], 1, 20,
+                           entry_width=3, value_font=_F_SM, btn_font=_F_SM)
+            step.grid(row=grow, column=4, sticky='w', pady=0)
+            self._steppers[ti] = step
+            self._color_spn(step, self.t_pct[ti].get())
+
         self._update_buy_color()
 
-        # Sell tier selectors (T1 T2 T3) — click ▼ / ▲ to step 1%
-        self._steppers = []
-        for i in range(3):
-            tk.Label(r0, text=f'T{i+1}:', font=_F_LBL).pack(side='left', padx=(4, 0))
-            tk.Checkbutton(r0, variable=self.t_active[i]).pack(side='left')
-            step = Stepper(r0, self.t_pct[i], 1, 20,
-                           entry_width=3, value_font=_F_VAL, btn_font=_F_BTN)
-            step.pack(side='left', padx=(0, 2))
-            self._steppers.append(step)
-            self._color_spn(step, self.t_pct[i].get())
+        # Left: summary stats + buy/sell ladder. Packed before the gear box so
+        # the gear sits just to its right (small gap) instead of far-right.
+        left = tk.Frame(body)
+        left.pack(side='left')
+        gear.pack(side='left', anchor='n', padx=(20, 0))
 
-        # Right side — Graph, army%
-        btn_frame = tk.Frame(r0)
-        btn_frame.pack(side='right', padx=4)
-
-        tk.Button(btn_frame, text='Graph', font=_F_LBL, width=7,
-                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 0))
-
-        tk.Label(r0, textvariable=self.army_pct_var,
-                 font=_F_OUT, width=7, anchor='e').pack(side='right', padx=(0, 4))
-        tk.Label(r0, text='Army:', font=_F_SM, fg='#888').pack(side='right')
-
-        # ═════════════════════════════════════════════════════════════════════
-        # ROW 1 — computed outputs
-        # ═════════════════════════════════════════════════════════════════════
-        r1 = tk.Frame(self.frame)
-        r1.pack(fill='x')
-
-        def _out(label, var, **kw):
-            tk.Label(r1, text=label, fg='#888', font=_F_SM).pack(side='left')
-            lbl = tk.Label(r1, textvariable=var, font=_F_OUT, **kw)
+        def _out(parent, label, var, **kw):
+            tk.Label(parent, text=label, fg='#888', font=_F_SM).pack(side='left')
+            lbl = tk.Label(parent, textvariable=var, font=_F_OUT, **kw)
             lbl.pack(side='left', padx=(2, 12))
             return lbl
 
-        _out('Total Cost:', self.cost_var)
-        _out('Current:', self.current_var)
-        self.gap_lbl = _out('Gap:', self.gap_var, width=9)
+        stats = tk.Frame(left)
+        stats.pack(fill='x')
+        _out(stats, 'Total Cost:', self.cost_var)
+        _out(stats, 'Current:', self.current_var)
+        self.gap_lbl = _out(stats, 'Gap:', self.gap_var, width=9)
 
-        # \u2500\u2500 Buy/sell ladder: cascading buy triggers on top, the matching sell
-        # tier directly beneath each, aligned in 3 columns \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        ladder = tk.Frame(self.frame)
+        # Buy/sell ladder: cascading buy triggers on top, the matching sell
+        # tier directly beneath each, aligned in 3 columns.
+        ladder = tk.Frame(left)
         ladder.pack(fill='x', pady=(2, 0))
 
         self.buy_info_lbl = []
         self.t_info_lbl   = []
         for col in range(3):
             cell = tk.Frame(ladder)
-            cell.grid(row=0, column=col, sticky='w', padx=(0, 20))
+            cell.grid(row=0, column=col, sticky='w', padx=(0, 16))
 
             bf = tk.Frame(cell)
             bf.pack(anchor='w')
@@ -163,14 +181,14 @@ class DeployedRow:
             slbl.pack(side='left')
             self.t_info_lbl.append(slbl)
 
-        # ── Reactive traces (added after all widgets are built) ──────────────
+        # -- Reactive traces (added after all widgets are built) ---------------
         self.shares_var.trace_add('write', lambda *_: self._on_input_change())
         self.avg_cost_var.trace_add('write', lambda *_: self._on_input_change())
         for i in range(3):
             self.t_active[i].trace_add('write', lambda *_: self._on_input_change())
             self.t_pct[i].trace_add('write', lambda *_: self._on_input_change())
 
-    # ── Input change handler ─────────────────────────────────────────────────
+    # -- Input change handler --------------------------------------------------
 
     def _on_input_change(self):
         if not self._computing:
@@ -178,7 +196,7 @@ class DeployedRow:
             if self._on_compute_cb:
                 self._on_compute_cb()
 
-    # ── Formatting ───────────────────────────────────────────────────────────
+    # -- Formatting ------------------------------------------------------------
 
     def _fmt_init(self, avg):
         if avg <= 0:
@@ -193,16 +211,23 @@ class DeployedRow:
         except ValueError:
             pass
 
-    # ── Color helpers ────────────────────────────────────────────────────────
+    # -- Color helpers ---------------------------------------------------------
 
     def _get_buy_pct(self) -> int:
-        return BUY_LABEL_TO_PCT.get(self.buy_label_var.get(), 5)
+        try:
+            v = int(self.buy_pct_var.get())
+        except (tk.TclError, ValueError):
+            v = 5
+        return v if v in (4, 5, 6) else 5
 
     def _update_buy_color(self):
-        pct = self._get_buy_pct()
-        c = buy_pct_color(pct)
-        fg = 'white' if pct >= 6 else 'black'
-        self.buy_om.config(bg=c, fg=fg, activebackground=c, activeforeground=fg)
+        """Selected buy gear shows in a bright gear-blue, the rest are greyed."""
+        sel = self._get_buy_pct()
+        for pct, rb in self._buy_radios.items():
+            if pct == sel:
+                rb.config(fg=_BUY_SEL[pct], font=_F_SM_B)
+            else:
+                rb.config(fg='#AAAAAA', font=_F_SM)
 
     def _on_buy_change(self, _=None):
         self._update_buy_color()
@@ -213,14 +238,14 @@ class DeployedRow:
         fg = 'white' if float(pct) >= 5 else 'black'
         stepper.set_value_color(c, fg)
 
-    # ── Public API ───────────────────────────────────────────────────────────
+    # -- Public API ------------------------------------------------------------
 
     def update_live(self, price: float):
         self.current_price = price
 
     def set_army_pct(self, pct):
         self._army_pct = pct
-        self.army_pct_var.set(f"{pct:.1f}%" if pct is not None else '--')
+        self.army_pct_var.set(f"({pct:.1f}%)" if pct is not None else '')
 
     def compute(self):
         """Recompute all output fields. Guarded against recursive calls."""
@@ -268,7 +293,7 @@ class DeployedRow:
         for i, res in enumerate(calc_buy_cascade(shares, avg_cost, buy_pct)):
             if res['price'] is not None:
                 self.buy_info_var[i].set(
-                    f"{fmt_price(res['price'], ccy)} \u00d7 {res['qty']}")
+                    f"{fmt_price(res['price'], ccy)} × {res['qty']}")
                 self.buy_info_lbl[i].config(fg=_BUY_FG)
             else:
                 self.buy_info_var[i].set('--')
@@ -280,7 +305,7 @@ class DeployedRow:
         for i, res in enumerate(calc_sell_tiers(shares, avg_cost, pcts, acts)):
             if res['price'] is not None:
                 self.t_info_var[i].set(
-                    f"{fmt_price(res['price'], ccy)} \u00d7 {res['qty']}")
+                    f"{fmt_price(res['price'], ccy)} × {res['qty']}")
                 self.t_info_lbl[i].config(fg='black')
             else:
                 self.t_info_var[i].set('--')
