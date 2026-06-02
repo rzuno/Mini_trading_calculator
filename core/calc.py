@@ -141,6 +141,30 @@ def calc_buy_shares(shares: int, buy_pct: int) -> int:
     return max(1, round_half_up(shares * ratio))
 
 
+def calc_buy_cascade(shares: int, avg_cost: float, buy_pct: int,
+                     levels: int = 3) -> list:
+    """Cascade of buy (rescue) triggers at a single fixed gear.
+
+    Each level fires at `buy_pct` below the running average; the bought shares
+    (rounded as in calc_buy_shares) are folded into the running average before
+    the next level is computed, so trigger N reflects already having caught
+    triggers 1..N-1. Returns `levels` dicts {'price', 'qty'}; entries are
+    {None, None} when inputs are invalid."""
+    result = []
+    cur_shares, cur_avg = shares, avg_cost
+    for _ in range(levels):
+        if cur_shares <= 0 or cur_avg <= 0:
+            result.append({'price': None, 'qty': None})
+            continue
+        price = calc_buy_trigger(cur_avg, buy_pct)
+        qty   = calc_buy_shares(cur_shares, buy_pct)
+        result.append({'price': price, 'qty': qty})
+        new_shares = cur_shares + qty
+        cur_avg    = (cur_avg * cur_shares + price * qty) / new_shares
+        cur_shares = new_shares
+    return result
+
+
 # ── Load (empty stock entry) calculations ────────────────────────────────────
 def calc_load_price(peak_5d: float, load_pct: int) -> float:
     return peak_5d * (1.0 - load_pct / 100.0)

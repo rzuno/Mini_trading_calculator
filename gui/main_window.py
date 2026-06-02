@@ -252,6 +252,7 @@ class App:
                         mode='deployed',
                         avg_cost=state['avg_cost'],
                         buy_pct=state['buy_pct'],
+                        shares=state['shares'],
                         sell_tiers=[(state[f't{i+1}_active'], state[f't{i+1}_pct'])
                                     for i in range(3)],
                         current_price=current_price)

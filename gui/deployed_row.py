@@ -2,9 +2,11 @@ import tkinter as tk
 from core.calc import (
     STOCK_NAMES, BUY_GEAR_PCTS, BUY_GEAR_INFO, BUY_GEAR_LABELS, BUY_LABEL_TO_PCT,
     buy_pct_color, sell_pct_color, gap_color, fmt_price,
-    calc_buy_trigger, calc_buy_shares,
-    calc_sell_tiers, calc_gap_rate,
+    calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
 )
+
+# Readable blue for buy-trigger values (matches the chart's rescue lines)
+_BUY_FG = '#3366CC'
 from gui.stepper import Stepper
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
@@ -56,7 +58,7 @@ class DeployedRow:
         self.current_var   = tk.StringVar(value='--')
         self.gap_var       = tk.StringVar(value='--')
         self.cost_var      = tk.StringVar(value='--')
-        self.buy_info_var  = tk.StringVar(value='--')
+        self.buy_info_var  = [tk.StringVar(value='--') for _ in range(3)]
         self.t_info_var    = [tk.StringVar(value='--') for _ in range(3)]
         self.army_pct_var  = tk.StringVar(value='--')
 
@@ -132,13 +134,34 @@ class DeployedRow:
         _out('Total Cost:', self.cost_var)
         _out('Current:', self.current_var)
         self.gap_lbl = _out('Gap:', self.gap_var, width=9)
-        _out('Buy Trigger:', self.buy_info_var)
 
-        # Visual separator between buy and sell
-        tk.Label(r1, text='  \u2502  ', fg='#CCC', font=_F_SM).pack(side='left')
+        # \u2500\u2500 Buy/sell ladder: cascading buy triggers on top, the matching sell
+        # tier directly beneath each, aligned in 3 columns \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        ladder = tk.Frame(self.frame)
+        ladder.pack(fill='x', pady=(2, 0))
 
-        self.t_info_lbl = [
-            _out(f'Sell T{i+1}:', self.t_info_var[i]) for i in range(3)]
+        self.buy_info_lbl = []
+        self.t_info_lbl   = []
+        for col in range(3):
+            cell = tk.Frame(ladder)
+            cell.grid(row=0, column=col, sticky='w', padx=(0, 20))
+
+            bf = tk.Frame(cell)
+            bf.pack(anchor='w')
+            tk.Label(bf, text=f'Buy {col+1}:', fg='#888', font=_F_SM,
+                     width=8, anchor='w').pack(side='left')
+            blbl = tk.Label(bf, textvariable=self.buy_info_var[col],
+                            font=_F_OUT, fg=_BUY_FG)
+            blbl.pack(side='left')
+            self.buy_info_lbl.append(blbl)
+
+            sf = tk.Frame(cell)
+            sf.pack(anchor='w')
+            tk.Label(sf, text=f'Sell T{col+1}:', fg='#888', font=_F_SM,
+                     width=8, anchor='w').pack(side='left')
+            slbl = tk.Label(sf, textvariable=self.t_info_var[col], font=_F_OUT)
+            slbl.pack(side='left')
+            self.t_info_lbl.append(slbl)
 
         # ── Reactive traces (added after all widgets are built) ──────────────
         self.shares_var.trace_add('write', lambda *_: self._on_input_change())
@@ -240,11 +263,16 @@ class DeployedRow:
         # Total cost
         self.cost_var.set(fmt_price(shares * avg_cost, ccy))
 
-        # Buy trigger
+        # Buy trigger cascade (each level catches the prior ones)
         buy_pct = self._get_buy_pct()
-        trigger = calc_buy_trigger(avg_cost, buy_pct)
-        n_buy   = calc_buy_shares(shares, buy_pct)
-        self.buy_info_var.set(f"{fmt_price(trigger, ccy)} \u00d7 {n_buy}")
+        for i, res in enumerate(calc_buy_cascade(shares, avg_cost, buy_pct)):
+            if res['price'] is not None:
+                self.buy_info_var[i].set(
+                    f"{fmt_price(res['price'], ccy)} \u00d7 {res['qty']}")
+                self.buy_info_lbl[i].config(fg=_BUY_FG)
+            else:
+                self.buy_info_var[i].set('--')
+                self.buy_info_lbl[i].config(fg='#CCC')
 
         # Sell tiers
         pcts = [self.t_pct[i].get() for i in range(3)]
@@ -269,10 +297,12 @@ class DeployedRow:
             self.t_pct[2].set(p[1] + 1)
 
     def _clear(self):
-        for v in (self.current_var, self.gap_var, self.cost_var, self.buy_info_var):
+        for v in (self.current_var, self.gap_var, self.cost_var):
             v.set('--')
         self.gap_lbl.config(fg='black')
         for i in range(3):
+            self.buy_info_var[i].set('--')
+            self.buy_info_lbl[i].config(fg='#CCC')
             self.t_info_var[i].set('--')
             self.t_info_lbl[i].config(fg='#CCC')
 

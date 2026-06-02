@@ -1,5 +1,5 @@
 import tkinter as tk
-from core.calc import STOCK_NAMES, fmt_price
+from core.calc import STOCK_NAMES, fmt_price, calc_buy_cascade
 
 # ── Fonts (kept at 1.5× — user says graph fonts are fine) ───────────────────
 _F_TITLE = ('Segoe UI', 17, 'bold')
@@ -14,7 +14,7 @@ class CandleChartWindow:
 
     def __init__(self, parent, ticker, ohlc_data, currency,
                  mode=None, load_pct=None,
-                 avg_cost=0, buy_pct=5, sell_tiers=None,
+                 avg_cost=0, buy_pct=5, shares=0, sell_tiers=None,
                  current_price=None):
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
@@ -29,6 +29,8 @@ class CandleChartWindow:
         self.buy_pct = buy_pct
         self.sell_tiers = sell_tiers or []
         self.current_price = current_price
+        self.buy_cascade = (calc_buy_cascade(shares, avg_cost, buy_pct)
+                            if mode == 'deployed' else [])
 
         if not ohlc_data:
             tk.Label(self.win, text="No data available",
@@ -111,7 +113,9 @@ class CandleChartWindow:
             for active, pct in self.sell_tiers:
                 if active:
                     all_prices.append(self.avg_cost * (1 + pct / 100))
-            all_prices.append(self.avg_cost * (1 - self.buy_pct / 100))
+            for res in self.buy_cascade:
+                if res['price'] is not None:
+                    all_prices.append(res['price'])
 
         p_min = min(all_prices)
         p_max = max(all_prices)
@@ -256,11 +260,16 @@ class CandleChartWindow:
                               text=f'+{pct}%: {fmt_price(sell_p, self.ccy)}',
                               anchor='w', font=_F_REF, fill=clr)
 
-        # Rescue / buy trigger line
-        rescue_p = self.avg_cost * (1 - self.buy_pct / 100)
-        y_rescue = y_of(rescue_p)
-        c.create_line(left_pad, y_rescue, left_pad + chart_w, y_rescue,
-                      fill='#3366CC', dash=(4, 3), width=1.5)
-        c.create_text(label_x, y_rescue,
-                      text=f'-{self.buy_pct}%: {fmt_price(rescue_p, self.ccy)}',
-                      anchor='w', font=_F_REF, fill='#3366CC')
+        # Rescue / buy trigger cascade lines (descending blue shades)
+        buy_colors = ['#3366CC', '#284E9E', '#1C3A75']
+        for idx, res in enumerate(self.buy_cascade):
+            if res['price'] is None:
+                continue
+            y_b = y_of(res['price'])
+            clr = buy_colors[min(idx, len(buy_colors) - 1)]
+            c.create_line(left_pad, y_b, left_pad + chart_w, y_b,
+                          fill=clr, dash=(4, 3), width=1.5)
+            c.create_text(label_x, y_b,
+                          text=f'Buy{idx+1}: {fmt_price(res["price"], self.ccy)} '
+                               f'×{res["qty"]}',
+                          anchor='w', font=_F_REF, fill=clr)
