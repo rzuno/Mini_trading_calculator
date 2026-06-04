@@ -125,6 +125,47 @@ def gap_color(gap_pct: float) -> str:
     return '#003399'
 
 
+# ── Auto gear (5-day-volatility-driven gear selection) ───────────────────────
+# Each gear bundles a load drop %, a buy/reload gear %, and the three sell-tier
+# percentages. In auto mode the whole bundle is chosen from the 5-day
+# volatility; the buy_pct keys line up with BUY_GEAR_INFO (4->×0.5, 5->×0.6,
+# 6->×0.7), so the reload ratio follows automatically.
+AUTO_GEARS = {
+    1: {'load_pct': 6, 'buy_pct': 4, 'tiers': (2, 4, 6)},
+    2: {'load_pct': 7, 'buy_pct': 5, 'tiers': (3, 5, 7)},
+    3: {'load_pct': 8, 'buy_pct': 6, 'tiers': (4, 6, 8)},
+}
+
+# 5-day volatility (%) cut points: V < LO -> gear 1, LO <= V < HI -> gear 2,
+# V >= HI -> gear 3.
+VOL_LO = 9.0
+VOL_HI = 14.0
+
+
+def calc_volatility(high_5d, low_5d):
+    """5-day volatility as a percent of the 5-day high:
+    100 * (high - low) / high. Returns None when inputs are unusable."""
+    if not high_5d or high_5d <= 0 or low_5d is None or low_5d < 0:
+        return None
+    return 100.0 * (high_5d - low_5d) / high_5d
+
+
+def select_auto_gear(volatility) -> int:
+    """Map a 5-day volatility percent to gear 1, 2, or 3. Falls back to gear 1
+    when volatility is unknown."""
+    if volatility is None or volatility < VOL_LO:
+        return 1
+    if volatility < VOL_HI:
+        return 2
+    return 3
+
+
+def auto_gear_params(volatility) -> dict:
+    """Gear parameter bundle (load_pct, buy_pct, tiers) for the given
+    volatility."""
+    return AUTO_GEARS[select_auto_gear(volatility)]
+
+
 # ── Rounding ─────────────────────────────────────────────────────────────────
 def round_half_up(x: float) -> int:
     return math.floor(x + 0.5)

@@ -14,6 +14,7 @@ FIELDNAMES = [
     'load_gear', 'buy_pct',
     't1_pct', 't2_pct', 't3_pct',
     't1_active', 't2_active', 't3_active',
+    'auto_mode',
     'last_updated',
 ]
 
@@ -60,6 +61,7 @@ def _blank(ticker: str, tier: str) -> dict:
         't1_active':   True,
         't2_active':   True,
         't3_active':   True,
+        'auto_mode':   True,
         'last_updated': str(date.today()),
     }
 
@@ -116,6 +118,7 @@ def _parse_row(row: dict) -> dict:
         't1_active':   b('t1_active', True),
         't2_active':   b('t2_active', True),
         't3_active':   b('t3_active', True),
+        'auto_mode':   b('auto_mode', True),
         'last_updated': row.get('last_updated', ''),
     }
 
@@ -171,5 +174,6 @@ def save_positions(positions: list) -> None:
                 't1_active':    int(bool(pos.get('t1_active', True))),
                 't2_active':    int(bool(pos.get('t2_active', True))),
                 't3_active':    int(bool(pos.get('t3_active', True))),
+                'auto_mode':    int(bool(pos.get('auto_mode', True))),
                 'last_updated': today,
             })

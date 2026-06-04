@@ -3,6 +3,7 @@ from core.calc import (
     display_name, BUY_GEAR_INFO,
     sell_pct_color, gap_color, fmt_price,
     calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
+    select_auto_gear, auto_gear_params,
 )
 from gui.stepper import Stepper
 
@@ -33,6 +34,7 @@ class DeployedRow:
         self.tier           = pos['tier']
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.current_price  = None
+        self.volatility     = None
         self._army_pct      = None
         self._on_compute_cb = on_compute
         self._computing     = False
@@ -58,6 +60,8 @@ class DeployedRow:
             tk.IntVar(value=int(pos.get(f't{i+1}_pct', [4, 6, 8][i])))
             for i in range(3)]
 
+        self.auto_var = tk.BooleanVar(value=bool(pos.get('auto_mode', True)))
+
         # -- Variables - outputs -----------------------------------------------
         self.current_var   = tk.StringVar(value='--')
         self.gap_var       = tk.StringVar(value='--')
@@ -65,6 +69,7 @@ class DeployedRow:
         self.buy_info_var  = [tk.StringVar(value='--') for _ in range(3)]
         self.t_info_var    = [tk.StringVar(value='--') for _ in range(3)]
         self.army_pct_var  = tk.StringVar(value='')
+        self.vol_var       = tk.StringVar(value='V --')
 
         # -- ROW 0: title (+ army%), Graph, Avg Cost, Shares -------------------
         r0 = tk.Frame(self.frame)
@@ -79,7 +84,16 @@ class DeployedRow:
         tk.Label(r0, textvariable=self.army_pct_var,
                  font=_F_SM, fg='#888').pack(side='left', padx=(3, 6))
         tk.Button(r0, text='Graph', font=_F_SM, width=6,
-                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(0, 12))
+                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(0, 6))
+
+        # Auto / Manual lock — when AUTO the buy/sell gear is chosen from
+        # volatility and locked; click to switch to MANUAL editing.
+        self.auto_btn = tk.Checkbutton(
+            r0, variable=self.auto_var, indicatoron=False, takefocus=0,
+            width=7, font=_F_BTN, bd=1)
+        self.auto_btn.pack(side='left', padx=(0, 6))
+        tk.Label(r0, textvariable=self.vol_var, font=_F_SM, fg='#666'
+                 ).pack(side='left', padx=(0, 12))
 
         tk.Label(r0, text='Avg Cost:', font=_F_LBL).pack(side='left')
         self.avg_entry = tk.Entry(r0, textvariable=self.avg_cost_var,
@@ -96,8 +110,12 @@ class DeployedRow:
         body = tk.Frame(self.frame)
         body.pack(fill='x')
 
-        # Right: gear box. Buy radios (one selectable) | Sell tiers (toggle +
-        # stepper). Higher level on top: -4% over -6%, T3 over T1.
+        # Right: gear box. Buy radios (one selectable) | sell tiers (toggle +
+        # stepper). Higher level on top: -4% over -6%, T3 over T1. In auto mode
+        # the gear is chosen from volatility and the buy radios / sell steppers
+        # are locked, but the tier toggles stay editable so you can show only
+        # the tiers you want. (The Auto/Manual lock + volatility readout live
+        # up on the title row.)
         gear = tk.Frame(body)
 
         tk.Label(gear, text='Buy Gear', font=_F_SM, fg='#888'
@@ -187,6 +205,11 @@ class DeployedRow:
         for i in range(3):
             self.t_active[i].trace_add('write', lambda *_: self._on_input_change())
             self.t_pct[i].trace_add('write', lambda *_: self._on_input_change())
+        self.auto_var.trace_add('write', lambda *_: self._on_input_change())
+
+        # Set the lock/button/label state now; deployed rows are not computed
+        # until the first price fetch arrives.
+        self._apply_auto()
 
     # -- Input change handler --------------------------------------------------
 
@@ -221,17 +244,68 @@ class DeployedRow:
         return v if v in (4, 5, 6) else 5
 
     def _update_buy_color(self):
-        """Selected buy gear shows in a bright gear-blue, the rest are greyed."""
+        """Selected buy gear shows in a bright gear-blue, the rest are greyed.
+        disabledforeground is kept in sync so the selection stays legible when
+        the radios are locked in auto mode."""
         sel = self._get_buy_pct()
         for pct, rb in self._buy_radios.items():
             if pct == sel:
-                rb.config(fg=_BUY_SEL[pct], font=_F_SM_B)
+                rb.config(fg=_BUY_SEL[pct], disabledforeground=_BUY_SEL[pct],
+                          font=_F_SM_B)
             else:
-                rb.config(fg='#AAAAAA', font=_F_SM)
+                rb.config(fg='#AAAAAA', disabledforeground='#CCCCCC',
+                          font=_F_SM)
 
     def _on_buy_change(self, _=None):
         self._update_buy_color()
         self._on_input_change()
+
+    # -- Auto-mode helpers -----------------------------------------------------
+
+    def _update_auto_btn(self):
+        """Reflect the auto/manual state on the toggle button."""
+        if self.auto_var.get():
+            self.auto_btn.config(text='AUTO', fg='white', bg='#2E5C86',
+                                 selectcolor='#2E5C86')
+        else:
+            self.auto_btn.config(text='MANUAL', fg='#444', bg='#E8E8E8',
+                                 selectcolor='#E8E8E8')
+
+    def _update_vol_label(self):
+        # The adjacent AUTO/MANUAL button shows the mode, so the label only
+        # carries the volatility (and the gear it maps to in auto).
+        vol = self.volatility
+        if vol is None:
+            self.vol_var.set('V --')
+        elif self.auto_var.get():
+            self.vol_var.set(f'V {vol:.1f}% → G{select_auto_gear(vol)}')
+        else:
+            self.vol_var.set(f'V {vol:.1f}%')
+
+    def _set_gear_enabled(self, enabled: bool):
+        """Lock (auto) or unlock (manual) the buy radios and sell-tier
+        steppers. The tier on/off checkboxes always stay editable."""
+        state = 'normal' if enabled else 'disabled'
+        for rb in self._buy_radios.values():
+            rb.config(state=state)
+        for step in self._steppers:
+            step.set_enabled(enabled)
+
+    def _apply_auto(self):
+        """In auto mode, drive the buy gear and sell-tier percents from the
+        5-day volatility and lock those controls; manual mode leaves them be."""
+        auto = self.auto_var.get()
+        if auto and self.volatility is not None:
+            g = auto_gear_params(self.volatility)
+            if self._get_buy_pct() != g['buy_pct']:
+                self.buy_pct_var.set(g['buy_pct'])
+            for i in range(3):
+                if self.t_pct[i].get() != g['tiers'][i]:
+                    self.t_pct[i].set(g['tiers'][i])
+        self._update_buy_color()
+        self._set_gear_enabled(not auto)
+        self._update_auto_btn()
+        self._update_vol_label()
 
     def _color_spn(self, stepper, pct):
         c = sell_pct_color(float(pct))
@@ -240,8 +314,11 @@ class DeployedRow:
 
     # -- Public API ------------------------------------------------------------
 
-    def update_live(self, price: float):
-        self.current_price = price
+    def update_live(self, price: float = None, volatility: float = None):
+        if price is not None:
+            self.current_price = price
+        if volatility is not None:
+            self.volatility = volatility
 
     def set_army_pct(self, pct):
         self._army_pct = pct
@@ -258,6 +335,8 @@ class DeployedRow:
             self._computing = False
 
     def _compute_impl(self):
+        # Auto mode picks the gear from volatility and locks the controls.
+        self._apply_auto()
         # Enforce T1 < T2 < T3
         self._enforce_order()
         for i in range(3):
@@ -336,7 +415,8 @@ class DeployedRow:
         except: shares = 0
         try:    avg_cost = float(self.avg_cost_var.get().replace(',', ''))
         except: avg_cost = 0.0
-        return {
+        auto = self.auto_var.get()
+        state = {
             'ticker':     self.ticker,
             'tier':       self.tier,
             'is_deployed': True,
@@ -350,4 +430,10 @@ class DeployedRow:
             't1_active':  self.t_active[0].get(),
             't2_active':  self.t_active[1].get(),
             't3_active':  self.t_active[2].get(),
+            'auto_mode':  auto,
         }
+        # Keep the load gear in sync in auto mode so it is correct if the
+        # position later demotes back to an empty card.
+        if auto and self.volatility is not None:
+            state['load_gear'] = auto_gear_params(self.volatility)['load_pct']
+        return state

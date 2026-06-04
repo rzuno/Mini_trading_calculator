@@ -2,7 +2,7 @@ import tkinter as tk
 import threading
 from datetime import datetime
 
-from core.calc import stock_sort_key
+from core.calc import stock_sort_key, calc_volatility
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from core.data_feed import fetch_all
 from gui.deployed_row import DeployedRow
@@ -173,12 +173,10 @@ class App:
         deployed.sort(key=lambda p: p.get('shares', 0) * p.get('avg_cost', 0),
                       reverse=True)
 
-        # Empty: shallowest load gear first, Major before Minor within same gear
-        _TIER_ORDER = {'Major': 0, 'Minor': 1}
-        empty.sort(key=lambda p: (
-            p.get('load_gear', 5),
-            _TIER_ORDER.get(p.get('tier', 'Minor'), 1),
-        ))
+        # Empty: fixed display order — majors first, then minors alphabetically
+        # (same as the global order). Independent of gear, which now changes
+        # with volatility and so must not reshuffle the cards.
+        empty.sort(key=lambda p: stock_sort_key(p['ticker']))
 
         self._build_deployed(deployed)
         self._build_empty(empty)
@@ -342,7 +340,8 @@ class App:
             if s:
                 for k in ('is_deployed', 'shares', 'avg_cost', 'cost_basis',
                           'buy_pct', 't1_pct', 't2_pct', 't3_pct',
-                          't1_active', 't2_active', 't3_active', 'load_gear'):
+                          't1_active', 't2_active', 't3_active', 'load_gear',
+                          'auto_mode'):
                     if k in s:
                         pos[k] = s[k]
 
@@ -380,8 +379,9 @@ class App:
         # Update deployed rows
         for row in self.deployed_rows:
             d = data.get(row.ticker, {})
-            if d.get('price'):
-                row.update_live(d['price'])
+            row.update_live(
+                d.get('price'),
+                volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
             row.compute()
 
         # Update empty rows
@@ -390,7 +390,8 @@ class App:
             row.update_live(
                 d.get('price'),
                 d.get('5d_high'),
-                d.get('5d_closes', []))
+                d.get('5d_closes', []),
+                volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
             row.compute()
 
         self._update_army(fx_rate)

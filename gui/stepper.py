@@ -45,5 +45,18 @@ class Stepper(tk.Frame):
         self._var.set(max(self._lo, min(self._hi, v + delta)))
 
     def set_value_color(self, bg, fg):
-        """Tint the centre value box; the buttons stay neutral."""
-        self.entry.config(bg=bg, fg=fg, insertbackground=fg)
+        """Tint the centre value box; the buttons stay neutral. The tint is
+        applied across normal/readonly/disabled states so a locked (auto-mode)
+        stepper still shows its gear color."""
+        self.entry.config(bg=bg, fg=fg, insertbackground=fg,
+                          readonlybackground=bg,
+                          disabledbackground=bg, disabledforeground=fg)
+
+    def set_enabled(self, enabled: bool):
+        """Enable for manual editing, or lock for auto mode. When locked the
+        arrows are disabled and the value box is read-only (value still shown,
+        not editable)."""
+        btn_state = 'normal' if enabled else 'disabled'
+        self.down_btn.config(state=btn_state)
+        self.up_btn.config(state=btn_state)
+        self.entry.config(state='normal' if enabled else 'readonly')

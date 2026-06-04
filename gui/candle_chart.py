@@ -1,5 +1,5 @@
 import tkinter as tk
-from core.calc import STOCK_NAMES, fmt_price, calc_buy_cascade
+from core.calc import STOCK_NAMES, fmt_price, calc_buy_cascade, calc_volatility
 
 # ── Fonts (kept at 1.5× — user says graph fonts are fine) ───────────────────
 _F_TITLE = ('Segoe UI', 17, 'bold')
@@ -47,7 +47,7 @@ class CandleChartWindow:
         all_lows  = [d['low']  for d in ohlc_data]
         max_high  = max(all_highs)
         min_low   = min(all_lows)
-        vol = (max_high - min_low) / min_low * 100 if min_low > 0 else 0
+        vol = calc_volatility(max_high, min_low) or 0
 
         tk.Label(stats, text=name, font=_F_TITLE).pack(anchor='w')
         tk.Label(stats,
@@ -214,9 +214,9 @@ class CandleChartWindow:
                       text=f'Low: {fmt_price(min_low, self.ccy)}',
                       anchor='w', font=_F_REF, fill='#DC143C')
 
-        # Vertical connector High→Low with gap %
+        # Vertical connector High→Low with 5-day volatility %
         c.create_line(vc1_x, y_h, vc1_x, y_l, fill='#555', width=1)
-        gap = (max_high - min_low) / min_low * 100 if min_low > 0 else 0
+        gap = calc_volatility(max_high, min_low) or 0
         c.create_text(vc1_x - 4, (y_h + y_l) / 2,
                       text=f'{gap:.1f}%', anchor='e',
                       font=_F_REF, fill='#555')

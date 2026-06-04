@@ -11,7 +11,8 @@ def _fetch_ticker_data(ticker: str) -> dict:
     close can be stale in yfinance history(); we patch it with the
     live regularMarketPrice from ticker.info.
     """
-    result = {'price': None, '5d_high': None, '5d_closes': [], '5d_ohlc': []}
+    result = {'price': None, '5d_high': None, '5d_low': None,
+              '5d_closes': [], '5d_ohlc': []}
     try:
         t = yf.Ticker(ticker)
 
@@ -47,6 +48,7 @@ def _fetch_ticker_data(ticker: str) -> dict:
 
             result['price'] = float(hist['Close'].iloc[-1])
             result['5d_high'] = float(hist['High'].max())
+            result['5d_low'] = float(hist['Low'].min())
             result['5d_closes'] = [float(c) for c in hist['Close'].tolist()]
             for idx, row in hist.iterrows():
                 result['5d_ohlc'].append({

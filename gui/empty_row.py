@@ -3,6 +3,7 @@ from core.calc import (
     display_name, LOAD_PCT_MIN, LOAD_PCT_MAX,
     normalize_load_pct, load_pct_color, fmt_price,
     calc_load_price, calc_load_shares,
+    select_auto_gear, auto_gear_params,
 )
 from gui.stepper import Stepper
 
@@ -28,6 +29,15 @@ class EmptyRow:
         self.get_unit_cash = get_unit_cash
         self.current_price = None
         self.peak_5d       = None
+        self.volatility    = None
+        self._computing    = False
+
+        # Gear bundle carried for auto-promotion (driven by auto mode, or the
+        # stored values when manual). The empty card has no buy/sell UI, so
+        # these are kept internally and surfaced once the stock deploys.
+        self._buy_pct   = pos.get('buy_pct', 5)
+        self._t_pcts    = [pos.get(f't{i+1}_pct', [4, 6, 8][i]) for i in range(3)]
+        self._t_actives = [bool(pos.get(f't{i+1}_active', True)) for i in range(3)]
 
         # ── Card frame (parent grids this; the row does not self-place) ───────
         self.frame = tk.Frame(parent, bd=1, relief='groove', padx=6, pady=3)
@@ -39,6 +49,8 @@ class EmptyRow:
         self.peak_var       = tk.StringVar(value='--')
         self.current_var    = tk.StringVar(value='--')
         self.load_info_var  = tk.StringVar(value='--')
+        self.vol_var        = tk.StringVar(value='')
+        self.auto_var       = tk.BooleanVar(value=bool(pos.get('auto_mode', True)))
 
         # Avg cost / shares for auto-promotion
         self.avg_cost_var = tk.StringVar(
@@ -57,7 +69,14 @@ class EmptyRow:
         tk.Label(r0, text=f"{row_num}. {name}",
                  font=name_font, anchor='w').pack(side='left')
         tk.Button(r0, text='Graph', font=_F_SM, width=6,
-                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 10))
+                  command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 6))
+
+        # Auto / Manual lock — when AUTO the load gear is chosen from volatility
+        # and the stepper is locked; click to switch to MANUAL editing.
+        self.auto_btn = tk.Checkbutton(
+            r0, variable=self.auto_var, indicatoron=False, takefocus=0,
+            width=7, font=_F_BTN, bd=1)
+        self.auto_btn.pack(side='left', padx=(0, 10))
 
         tk.Label(r0, text='5D High:', font=_F_SM, fg='#888').pack(side='left')
         tk.Label(r0, textvariable=self.peak_var,
@@ -75,6 +94,8 @@ class EmptyRow:
             entry_width=4, value_font=_F_VAL, btn_font=_F_BTN)
         self.gear_step.pack(side='left', padx=(2, 0))
         tk.Label(r0, text='%', font=_F_SM, fg='#888').pack(side='left')
+        tk.Label(r0, textvariable=self.vol_var, font=_F_SM, fg='#666'
+                 ).pack(side='left', padx=(8, 0))
         self._update_gear_color()
 
         # ── Row 1: load target + avg cost / shares for auto-deploy ───────────
@@ -99,8 +120,9 @@ class EmptyRow:
         tk.Label(r1, text='(fill & Save to deploy)', font=_F_SM,
                  fg='#AAA').pack(side='left', padx=(4, 0))
 
-        # Trace for load gear (reactive)
+        # Traces (reactive)
         self.load_pct_var.trace_add('write', lambda *_: self.compute())
+        self.auto_var.trace_add('write', lambda *_: self._on_auto_toggle())
 
     # ── Formatting ───────────────────────────────────────────────────────────
 
@@ -133,13 +155,59 @@ class EmptyRow:
         fg  = 'black' if pct <= 5 else 'white'
         self.gear_step.set_value_color(c, fg)
 
+    # ── Auto-mode helpers ─────────────────────────────────────────────────────
+
+    def _update_auto_btn(self):
+        """Reflect the auto/manual state on the toggle button."""
+        if self.auto_var.get():
+            self.auto_btn.config(text='AUTO', fg='white', bg='#2E5C86',
+                                 selectcolor='#2E5C86')
+        else:
+            self.auto_btn.config(text='MANUAL', fg='#444', bg='#E8E8E8',
+                                 selectcolor='#E8E8E8')
+
+    def _update_vol_label(self):
+        # The load-gear value (-6/-7/-8) already shows which gear auto picked,
+        # so the compact empty card only needs the volatility number.
+        vol = self.volatility
+        self.vol_var.set('' if vol is None else f'V {vol:.1f}%')
+
+    def _on_auto_toggle(self):
+        self._update_auto_btn()
+        self.compute()
+
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def update_live(self, price: float, peak_5d: float, closes_5d: list = None):
+    def update_live(self, price: float, peak_5d: float, closes_5d: list = None,
+                    volatility: float = None):
         self.current_price = price
         self.peak_5d       = peak_5d
+        if volatility is not None:
+            self.volatility = volatility
 
     def compute(self):
+        """Reactive recompute, guarded so setting the load gear in auto mode
+        does not re-enter through the variable trace."""
+        if self._computing:
+            return
+        self._computing = True
+        try:
+            self._compute_impl()
+        finally:
+            self._computing = False
+
+    def _compute_impl(self):
+        # In auto mode with known volatility, the load gear is chosen for you
+        # and the stepper is locked; manual mode leaves it editable.
+        auto = self.auto_var.get()
+        if auto and self.volatility is not None:
+            lp = auto_gear_params(self.volatility)['load_pct']
+            if self._get_load_pct() != lp:
+                self.load_pct_var.set(-lp)
+        self.gear_step.set_enabled(not auto)
+        self._update_auto_btn()
+        self._update_vol_label()
+
         ccy = self.currency
         load_price = None
         self._update_gear_color()
@@ -171,6 +239,15 @@ class EmptyRow:
         except: shares = 0
         try:    avg_cost = float(self.avg_cost_var.get().replace(',', ''))
         except: avg_cost = 0.0
+
+        auto = self.auto_var.get()
+        if auto and self.volatility is not None:
+            g = auto_gear_params(self.volatility)
+            load_gear, buy_pct, tiers = g['load_pct'], g['buy_pct'], g['tiers']
+        else:
+            load_gear = self._get_load_pct()
+            buy_pct, tiers = self._buy_pct, self._t_pcts
+
         return {
             'ticker':     self.ticker,
             'tier':       self.tier,
@@ -178,8 +255,11 @@ class EmptyRow:
             'shares':     shares,
             'avg_cost':   avg_cost,
             'cost_basis': shares * avg_cost,
-            'load_gear':  self._get_load_pct(),
-            'buy_pct':    5,
-            't1_pct':     4.0,  't2_pct': 6.0,  't3_pct': 8.0,
-            't1_active':  True, 't2_active': True, 't3_active': True,
+            'load_gear':  load_gear,
+            'buy_pct':    buy_pct,
+            't1_pct':     tiers[0], 't2_pct': tiers[1], 't3_pct': tiers[2],
+            't1_active':  self._t_actives[0],
+            't2_active':  self._t_actives[1],
+            't3_active':  self._t_actives[2],
+            'auto_mode':  auto,
         }
