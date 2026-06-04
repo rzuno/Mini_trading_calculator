@@ -160,11 +160,11 @@ class EmptyRow:
     def _update_auto_btn(self):
         """Reflect the auto/manual state on the toggle button."""
         if self.auto_var.get():
-            self.auto_btn.config(text='AUTO', fg='white', bg='#2E5C86',
-                                 selectcolor='#2E5C86')
+            self.auto_btn.config(text='AUTO', fg='white', bg='#2E8B57',
+                                 selectcolor='#2E8B57')
         else:
-            self.auto_btn.config(text='MANUAL', fg='#444', bg='#E8E8E8',
-                                 selectcolor='#E8E8E8')
+            self.auto_btn.config(text='MANUAL', fg='black', bg='#E6B800',
+                                 selectcolor='#E6B800')
 
     def _update_vol_label(self):
         # The load-gear value (-6/-7/-8) already shows which gear auto picked,
