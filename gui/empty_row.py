@@ -37,7 +37,9 @@ class EmptyRow:
         # these are kept internally and surfaced once the stock deploys.
         self._buy_pct   = pos.get('buy_pct', 5)
         self._t_pcts    = [pos.get(f't{i+1}_pct', [4, 6, 8][i]) for i in range(3)]
-        self._t_actives = [bool(pos.get(f't{i+1}_active', True)) for i in range(3)]
+        # Default sell-tier activation: only T2 on (others off, still clickable).
+        self._t_actives = [bool(pos.get(f't{i+1}_active', d))
+                           for i, d in enumerate((False, True, False))]
 
         # ── Card frame (parent grids this; the row does not self-place) ───────
         self.frame = tk.Frame(parent, bd=1, relief='groove', padx=6, pady=3)

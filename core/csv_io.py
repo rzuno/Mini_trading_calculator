@@ -58,9 +58,9 @@ def _blank(ticker: str, tier: str) -> dict:
         't1_pct':      4.0,
         't2_pct':      6.0,
         't3_pct':      8.0,
-        't1_active':   True,
+        't1_active':   False,
         't2_active':   True,
-        't3_active':   True,
+        't3_active':   False,
         'auto_mode':   True,
         'last_updated': str(date.today()),
     }
@@ -115,9 +115,9 @@ def _parse_row(row: dict) -> dict:
         't1_pct':      f('t1_pct', t1d),
         't2_pct':      f('t2_pct', t2d),
         't3_pct':      f('t3_pct', t3d),
-        't1_active':   b('t1_active', True),
+        't1_active':   b('t1_active', False),
         't2_active':   b('t2_active', True),
-        't3_active':   b('t3_active', True),
+        't3_active':   b('t3_active', False),
         'auto_mode':   b('auto_mode', True),
         'last_updated': row.get('last_updated', ''),
     }

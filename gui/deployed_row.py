@@ -53,9 +53,11 @@ class DeployedRow:
             pct_init = 5
         self.buy_pct_var = tk.IntVar(value=pct_init)
 
+        # Default sell-tier activation: only T2 (the middle tier) on; the
+        # others are off by default but stay clickable.
         self.t_active = [
-            tk.BooleanVar(value=bool(pos.get(f't{i+1}_active', True)))
-            for i in range(3)]
+            tk.BooleanVar(value=bool(pos.get(f't{i+1}_active', d)))
+            for i, d in enumerate((False, True, False))]
         self.t_pct = [
             tk.IntVar(value=int(pos.get(f't{i+1}_pct', [4, 6, 8][i])))
             for i in range(3)]
