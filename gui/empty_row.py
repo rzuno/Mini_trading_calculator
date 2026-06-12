@@ -8,8 +8,9 @@ from core.calc import (
 from gui.stepper import Stepper
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
-_F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
-_F_NAME_MINOR = ('Segoe UI', 13)
+# KR stocks (Samsung, SK Hynix) are bold; US stocks are plain.
+_F_NAME_KR = ('Segoe UI', 13, 'bold')
+_F_NAME_US = ('Segoe UI', 13)
 _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
@@ -67,9 +68,11 @@ class EmptyRow:
         name = display_name(self.ticker)
         if self.ticker.endswith('.KS'):
             name += ' (KR)'
-        name_font = _F_NAME_MAJOR if self.tier == 'Major' else _F_NAME_MINOR
-        tk.Label(r0, text=f"{row_num}. {name}",
-                 font=name_font, anchor='w').pack(side='left')
+        self._disp_name = name
+        name_font = _F_NAME_KR if self.ticker.endswith('.KS') else _F_NAME_US
+        self._name_lbl = tk.Label(r0, text=f"{row_num}. {name}",
+                                  font=name_font, anchor='w')
+        self._name_lbl.pack(side='left')
         tk.Button(r0, text='Graph', font=_F_SM, width=6,
                   command=lambda: on_graph(self.ticker)).pack(side='left', padx=(4, 6))
 
@@ -179,6 +182,10 @@ class EmptyRow:
         self.compute()
 
     # ── Public API ───────────────────────────────────────────────────────────
+
+    def set_row_num(self, n: int):
+        """Update the leading ordinal after the cards are re-ordered."""
+        self._name_lbl.config(text=f"{n}. {self._disp_name}")
 
     def update_live(self, price: float, peak_5d: float, closes_5d: list = None,
                     volatility: float = None):

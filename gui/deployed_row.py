@@ -13,8 +13,9 @@ _BUY_FG = '#3366CC'
 _BUY_SEL = {4: '#3A6EA5', 5: '#2C5C95', 6: '#1F4A85'}
 
 # -- Fonts (1.3x scale for QHD) ----------------------------------------------
-_F_NAME_MAJOR = ('Segoe UI', 13, 'bold')
-_F_NAME_MINOR = ('Segoe UI', 13)
+# KR stocks (Samsung, SK Hynix) are bold; US stocks are plain.
+_F_NAME_KR = ('Segoe UI', 13, 'bold')
+_F_NAME_US = ('Segoe UI', 13)
 _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
@@ -80,7 +81,7 @@ class DeployedRow:
         name = display_name(self.ticker)
         if self.ticker.endswith('.KS'):
             name += ' (KR)'
-        name_font = _F_NAME_MAJOR if self.tier == 'Major' else _F_NAME_MINOR
+        name_font = _F_NAME_KR if self.ticker.endswith('.KS') else _F_NAME_US
         tk.Label(r0, text=f"{row_num}. {name}",
                  font=name_font, anchor='w').pack(side='left')
         tk.Label(r0, textvariable=self.army_pct_var,
@@ -159,7 +160,7 @@ class DeployedRow:
         # the gear sits just to its right (small gap) instead of far-right.
         left = tk.Frame(body)
         left.pack(side='left')
-        gear.pack(side='left', anchor='n', padx=(20, 0))
+        gear.pack(side='left', anchor='n', padx=(10, 0))
 
         def _out(parent, label, var, **kw):
             tk.Label(parent, text=label, fg='#888', font=_F_SM).pack(side='left')

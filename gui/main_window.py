@@ -22,8 +22,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI Seesaw Mini-Calculator")
-        self.root.minsize(1340, 700)
-        self._center_window(1700, 1320)
+        self.root.minsize(1440, 700)
+        self._center_window(1800, 1320)
 
         self.config    = load_config()
         self.positions = load_positions()
@@ -36,6 +36,7 @@ class App:
         self._current_peaks  = {}
         self._ohlc_data      = {}
         self._closes_data    = {}
+        self._volatility     = {}
         self._last_data      = {}
 
         # Header vars
@@ -173,13 +174,37 @@ class App:
         deployed.sort(key=lambda p: p.get('shares', 0) * p.get('avg_cost', 0),
                       reverse=True)
 
-        # Empty: fixed display order — majors first, then minors alphabetically
-        # (same as the global order). Independent of gear, which now changes
-        # with volatility and so must not reshuffle the cards.
-        empty.sort(key=lambda p: stock_sort_key(p['ticker']))
+        # Empty: most volatile first (more volatile = more profitable under the
+        # current strategy). Falls back to the fixed catalogue order for stocks
+        # whose volatility is not yet known (e.g. before the first price fetch).
+        # _apply_live re-grids these once fresh volatility arrives.
+        empty.sort(key=lambda p: self._vol_order_key(
+            p['ticker'], self._volatility.get(p['ticker'])))
 
         self._build_deployed(deployed)
         self._build_empty(empty)
+
+    def _vol_order_key(self, ticker, vol):
+        """Sort key for empty cards: highest 5-day volatility first, unknown
+        volatility last, ties broken by the fixed catalogue order."""
+        return (-vol if vol is not None else float('inf'),
+                stock_sort_key(ticker))
+
+    def _reorder_empty(self):
+        """Re-grid the empty cards in place by current volatility so the most
+        volatile sits on top. Avoids a full rebuild (keeps focus/entries)."""
+        if not self.empty_rows:
+            return
+        ordered = sorted(
+            self.empty_rows,
+            key=lambda r: self._vol_order_key(r.ticker, r.volatility))
+        if ordered == self.empty_rows:
+            return
+        for i, row in enumerate(ordered):
+            r, c = divmod(i, 2)
+            row.frame.grid_configure(row=r, column=c)
+            row.set_row_num(i + 1)
+        self.empty_rows = ordered
 
     # ── Deployed section ─────────────────────────────────────────────────────
 
@@ -369,6 +394,8 @@ class App:
             if d.get('5d_high'):    self._current_peaks[t]  = d['5d_high']
             if d.get('5d_ohlc'):    self._ohlc_data[t]      = d['5d_ohlc']
             if d.get('5d_closes'):  self._closes_data[t]    = d['5d_closes']
+            vol = calc_volatility(d.get('5d_high'), d.get('5d_low'))
+            if vol is not None:     self._volatility[t]     = vol
 
         if fx_rate:
             self.fx_var.set(f"{fx_rate:,.2f}")
@@ -393,6 +420,9 @@ class App:
                 d.get('5d_closes', []),
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
             row.compute()
+
+        # Re-order empty cards now that fresh volatility is known
+        self._reorder_empty()
 
         self._update_army(fx_rate)
 
