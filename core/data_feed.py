@@ -66,23 +66,40 @@ def _fetch_ticker_data(ticker: str) -> dict:
     return result
 
 
-def fetch_fx_rate(fx_ticker: str = 'USDKRW=X') -> Optional[float]:
+def fetch_fx_rate(fx_ticker: str = 'USDKRW=X') -> tuple:
+    """Return (current_rate, avg_3m) for the FX pair.
+
+    The 3-month average is the mean daily close over the trailing ~3 months
+    and is used as the reference point for the FX banner. Either element is
+    None when unavailable.
+    """
+    rate = None
+    avg_3m = None
     try:
         t = yf.Ticker(fx_ticker)
-        price = t.fast_info.last_price
-        if price is not None and float(price) > 0:
-            return float(price)
-        hist = t.history(period='1d')
+
+        try:
+            price = t.fast_info.last_price
+            if price is not None and float(price) > 0:
+                rate = float(price)
+        except Exception:
+            pass
+
+        hist = t.history(period='3mo')
         if not hist.empty:
-            return float(hist['Close'].iloc[-1])
-        return None
+            closes = hist['Close'].dropna()
+            if len(closes) > 0:
+                avg_3m = float(closes.mean())
+                if rate is None:
+                    rate = float(closes.iloc[-1])
     except Exception:
-        return None
+        pass
+    return rate, avg_3m
 
 
 def fetch_all(tickers: list, fx_ticker: str = 'USDKRW=X') -> tuple:
     """
-    Returns (data_dict, fx_rate).
+    Returns (data_dict, fx_rate, fx_avg_3m).
     data_dict maps ticker -> {price, 5d_high, 5d_closes, 5d_ohlc}
     Fetches all tickers concurrently.
     """
@@ -98,5 +115,5 @@ def fetch_all(tickers: list, fx_ticker: str = 'USDKRW=X') -> tuple:
     for th in threads:
         th.join()
 
-    fx_rate = fetch_fx_rate(fx_ticker)
-    return results, fx_rate
+    fx_rate, fx_avg_3m = fetch_fx_rate(fx_ticker)
+    return results, fx_rate, fx_avg_3m

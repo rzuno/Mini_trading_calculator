@@ -125,6 +125,21 @@ def gap_color(gap_pct: float) -> str:
     return '#003399'
 
 
+def fx_dev_color(pct: float) -> str:
+    """Color for the FX deviation from the 3-month average. Positive (FX above
+    average) trends red and negative trends blue, deepening with magnitude over
+    the typical +/-3% range."""
+    if pct >= 3:    return '#CC0000'   # strong red
+    if pct >= 2:    return '#E03030'
+    if pct >= 1:    return '#FF6666'   # light red
+    if pct > 0:     return '#FF9999'   # faint red
+    if pct == 0:    return '#888888'
+    if pct > -1:    return '#99BBE0'   # faint blue
+    if pct > -2:    return '#6699CC'   # light blue
+    if pct > -3:    return '#3366CC'
+    return '#003399'                    # strong blue
+
+
 # ── Auto gear (5-day-volatility-driven gear selection) ───────────────────────
 # Each gear bundles a load drop %, a buy/reload gear %, and the three sell-tier
 # percentages. In auto mode the whole bundle is chosen from the 5-day

@@ -2,7 +2,7 @@ import tkinter as tk
 import threading
 from datetime import datetime
 
-from core.calc import stock_sort_key, calc_volatility
+from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from core.data_feed import fetch_all
 from gui.deployed_row import DeployedRow
@@ -16,6 +16,7 @@ _F_HDR     = ('Segoe UI', 13)
 _F_HDR_B   = ('Segoe UI', 13, 'bold')
 _F_BTN     = ('Segoe UI', 13, 'bold')
 _F_SM      = ('Segoe UI', 10)
+_F_FX_BANNER = ('Segoe UI', 11)
 
 
 class App:
@@ -32,6 +33,7 @@ class App:
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
 
         self._fx_rate        = None
+        self._fx_avg_3m      = None
         self._current_prices = {}
         self._current_peaks  = {}
         self._ohlc_data      = {}
@@ -44,6 +46,8 @@ class App:
         self.unit_krw_var     = tk.StringVar(value=f"{self.config['unit_cash_krw']:,}")
         self.unit_usd_var     = tk.StringVar(value=str(self.config['unit_cash_usd']))
         self.fx_var           = tk.StringVar(value='--')
+        self.fx_pct_var       = tk.StringVar(value='')
+        self.fx_banner_var    = tk.StringVar(value='')
         self.last_refresh_var = tk.StringVar(value='--')
         self.status_var       = tk.StringVar(value='Initializing...')
         self.deploy_info_var  = tk.StringVar(value='')
@@ -113,6 +117,33 @@ class App:
         except ValueError:
             return 0.0
 
+    def _update_fx_display(self):
+        """Show the current FX rate with its % offset from the 3-month average,
+        plus a proportional ±1/2/3% ladder banner around that average."""
+        rate = self._fx_rate
+        avg  = self._fx_avg_3m
+
+        if not rate:
+            self.fx_var.set('N/A')
+            self.fx_pct_var.set('')
+            self.fx_banner_var.set('')
+            return
+
+        self.fx_var.set(f"{rate:,.2f}")
+        if avg and avg > 0:
+            pct = (rate - avg) / avg * 100.0
+            self.fx_pct_var.set(f"({pct:+.1f}%)")
+            self._fx_pct_lbl.config(fg=fx_dev_color(pct))
+            steps = []
+            for k in (-3, -2, -1, 0, 1, 2, 3):
+                v   = avg * (1 + k / 100.0)
+                tag = '3m avg' if k == 0 else f'{k:+d}%'
+                steps.append(f"{v:,.0f} ({tag})")
+            self.fx_banner_var.set('    '.join(steps))
+        else:
+            self.fx_pct_var.set('')
+            self.fx_banner_var.set('')
+
     def _update_unit_usd(self):
         """Auto-derive USD unit cash = KRW unit cash / FX rate."""
         if not self._fx_rate:
@@ -154,6 +185,18 @@ class App:
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
         _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
         _lbl('FX Rate:');        _val(self.fx_var, width=9)
+
+        # Deviation from the 3-month average, colored red (above) / blue (below)
+        # by magnitude.
+        self._fx_pct_lbl = tk.Label(f, textvariable=self.fx_pct_var,
+                                    font=_F_HDR_B, anchor='w', width=8)
+        self._fx_pct_lbl.grid(row=0, column=c, padx=(0, 2), sticky='w'); c += 1
+
+        # Proportional ±1/2/3% ladder around the 3-month average FX, on the
+        # same row (there is room to the right of the FX rate).
+        tk.Label(f, textvariable=self.fx_banner_var, font=_F_FX_BANNER,
+                 fg='#777', anchor='w').grid(row=0, column=c, padx=(14, 2),
+                                             sticky='w'); c += 1
 
     # ── Rebuild ──────────────────────────────────────────────────────────────
 
@@ -372,22 +415,25 @@ class App:
 
     def _reapply(self):
         if self._last_data:
-            self._apply_live(self._last_data, self._fx_rate, quiet=True)
+            self._apply_live(self._last_data, self._fx_rate,
+                             self._fx_avg_3m, quiet=True)
 
     # ── Live data ────────────────────────────────────────────────────────────
 
     def _fetch_bg(self):
         tickers = [p['ticker'] for p in self.positions]
         try:
-            data, fx = fetch_all(tickers, self.config.get('fx_ticker', 'USDKRW=X'))
+            data, fx, fx_avg = fetch_all(
+                tickers, self.config.get('fx_ticker', 'USDKRW=X'))
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f'Error: {e}'))
             return
-        self.root.after(0, self._apply_live, data, fx)
+        self.root.after(0, self._apply_live, data, fx, fx_avg)
 
-    def _apply_live(self, data, fx_rate, quiet=False):
+    def _apply_live(self, data, fx_rate, fx_avg=None, quiet=False):
         self._last_data = data
         self._fx_rate   = fx_rate
+        self._fx_avg_3m = fx_avg
 
         for t, d in data.items():
             if d.get('price'):      self._current_prices[t] = d['price']
@@ -397,11 +443,9 @@ class App:
             vol = calc_volatility(d.get('5d_high'), d.get('5d_low'))
             if vol is not None:     self._volatility[t]     = vol
 
+        self._update_fx_display()
         if fx_rate:
-            self.fx_var.set(f"{fx_rate:,.2f}")
             self._update_unit_usd()
-        else:
-            self.fx_var.set('N/A')
 
         # Update deployed rows
         for row in self.deployed_rows:
