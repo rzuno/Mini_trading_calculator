@@ -284,8 +284,7 @@ Mini_trading_calculator/
 │   └── csv_io.py        — read/write CSV and config
 └── gui/
     ├── main_window.py   — header, FX panel, sections, refresh loop
-    ├── deployed_row.py  — DEPLOYED card
-    ├── empty_row.py     — EMPTY card
+    ├── stock_row.py     — unified stock card (EMPTY + DEPLOYED), 3 gear boxes
     ├── stepper.py       — +/- stepper widget
     └── candle_chart.py  — candlestick popup
 ```

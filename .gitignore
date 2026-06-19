@@ -24,4 +24,8 @@ Thumbs.db
 # Virtual environment
 venv/
 .venv/
+
+# Secrets — never commit any env/key files (Toss credentials live here)
 .env
+*.env
+Toss_api_key.env

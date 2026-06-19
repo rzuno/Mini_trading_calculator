@@ -18,7 +18,9 @@
       "Bash(python -m py_compile core/calc.py gui/stepper.py gui/deployed_row.py gui/empty_row.py gui/main_window.py)",
       "Bash(python -c \"import gui.main_window; print\\('imports OK'\\)\")",
       "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); im.crop\\(\\(10,145,1015,470\\)\\).save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\); print\\(im.size\\)\")",
-      "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); im.crop\\(\\(10,145,1015,460\\)\\).save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\)\")"
+      "Bash(python -c \"from PIL import Image; im=Image.open\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_layout.png'\\); im.crop\\(\\(10,145,1015,460\\)\\).save\\(r'c:\\\\py\\\\Mini_trading_calculator\\\\_crop.png'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['gui/stock_row.py','gui/candle_chart.py','gui/main_window.py','core/calc.py']]; print\\('syntax OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ]
   }
 }

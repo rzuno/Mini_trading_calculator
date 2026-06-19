@@ -247,6 +247,25 @@ def calc_load_shares(peak_5d: float, load_pct: int, unit_cash: float) -> int:
     return max(1, round_half_up(unit_cash / load_price))
 
 
+def calc_load_ladder(peak_5d: float, load_pct: int, buy_pct: int,
+                     unit_cash: float, rescues: int = 2) -> tuple:
+    """Projected buy ladder for an EMPTY stock, treating the LOAD as the first
+    (initial) buy of one unit and cascading `rescues` rescue triggers from it,
+    exactly as a deployed stock would once it owns the load shares.
+
+    Returns (ladder, load_price, load_shares) where ladder is a list of
+    {'price', 'qty'} of length 1 + rescues: index 0 is the LOAD, the rest are
+    the projected rescues. All-None entries when inputs are unusable."""
+    load_price  = calc_load_price(peak_5d, load_pct) if peak_5d and peak_5d > 0 else 0.0
+    load_shares = calc_load_shares(peak_5d, load_pct, unit_cash)
+    if load_price <= 0 or load_shares <= 0:
+        return ([{'price': None, 'qty': None} for _ in range(1 + rescues)],
+                0.0, 0)
+    ladder = [{'price': load_price, 'qty': load_shares}]
+    ladder += calc_buy_cascade(load_shares, load_price, buy_pct, levels=rescues)
+    return ladder, load_price, load_shares
+
+
 # ── Sell tier calculations ───────────────────────────────────────────────────
 def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives: list) -> list:
     active_idx = [i for i, on in enumerate(tier_actives) if on]

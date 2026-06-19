@@ -1,0 +1,6 @@
+# Mini Trading Calculator — runtime dependencies
+yfinance>=0.2          # market data (current source) + FX 3-month average
+requests>=2.31         # Toss Open API (providers/toss_market_provider.py)
+
+# Optional: nicer .env loading. The code also reads KEY=VALUE files without it.
+# python-dotenv>=1.0

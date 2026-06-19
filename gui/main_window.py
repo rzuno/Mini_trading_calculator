@@ -5,8 +5,7 @@ from datetime import datetime
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from core.data_feed import fetch_all
-from gui.deployed_row import DeployedRow
-from gui.empty_row import EmptyRow
+from gui.stock_row import StockRow
 from gui.candle_chart import CandleChartWindow
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
@@ -20,8 +19,11 @@ _F_FX_BANNER   = ('Segoe UI', 11)
 _F_FX_BANNER_B = ('Segoe UI', 11, 'bold')
 _F_FX_BTN      = ('Segoe UI', 11, 'bold')
 
-# Switch-tracker button: green = a dollar switch already done at that threshold.
-_FX_LIT_BG = '#2E8B57'
+# Switch-tracker buttons: 0 is always green (the neutral/reset rung); a done
+# switch lights red on the sell (+) side and blue on the buy (-) side.
+_FX_GREEN = '#2E8B57'
+_FX_RED   = '#CC3333'
+_FX_BLUE  = '#3366CC'
 
 
 class App:
@@ -219,15 +221,24 @@ class App:
         self._persist_fx_level()
 
     def _update_fx_buttons(self):
-        """Color the switch buttons: green where a switch has been recorded."""
+        """Color the switch buttons: the 0 rung is always green; a recorded
+        switch lights red on the + (sell) side and blue on the - (buy) side."""
         if not hasattr(self, 'fx_switch_btns'):
             return
         lvl = self.fx_switch_level
         for k, b in self.fx_switch_btns.items():
-            lit = (0 < k <= lvl) or (lvl <= k < 0)
-            if lit:
-                b.config(bg=_FX_LIT_BG, fg='white',
-                         activebackground=_FX_LIT_BG, activeforeground='white')
+            if k == 0:
+                color = _FX_GREEN
+            elif (0 < k <= lvl):
+                color = _FX_RED
+            elif (lvl <= k < 0):
+                color = _FX_BLUE
+            else:
+                color = None
+
+            if color:
+                b.config(bg=color, fg='white',
+                         activebackground=color, activeforeground='white')
             else:
                 b.config(bg=self._fx_btn_default_bg, fg='black',
                          activebackground=self._fx_btn_default_bg,
@@ -440,8 +451,10 @@ class App:
         box.grid_columnconfigure(0, weight=1, uniform='dcol')
         box.grid_columnconfigure(1, weight=1, uniform='dcol')
         for i, pos in enumerate(deployed):
-            row = DeployedRow(
-                parent=box, row_num=i + 1, pos=pos,
+            ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
+            row = StockRow(
+                parent=box, row_num=i + 1, pos=pos, deployed=True,
+                get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph,
                 on_compute=self._on_row_compute)
             r, c = divmod(i, 2)
@@ -466,10 +479,11 @@ class App:
         box.grid_columnconfigure(1, weight=1, uniform='ecol')
         for i, pos in enumerate(empty):
             ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
-            row = EmptyRow(
-                parent=box, row_num=i + 1, pos=pos,
+            row = StockRow(
+                parent=box, row_num=i + 1, pos=pos, deployed=False,
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
-                on_graph=self._on_graph)
+                on_graph=self._on_graph,
+                on_compute=self._on_row_compute)
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             self.empty_rows.append(row)
@@ -492,37 +506,25 @@ class App:
     # ── Graph ────────────────────────────────────────────────────────────────
 
     def _on_graph(self, ticker):
-        """Open chart popup with mode-specific reference lines."""
+        """Open the chart popup using the row's already-computed ladder, so the
+        empty (pseudo) and deployed charts draw through one unified path."""
         ohlc = self._ohlc_data.get(ticker, [])
         ccy  = 'KRW' if ticker.endswith('.KS') else 'USD'
         current_price = self._current_prices.get(ticker)
 
-        pos = self._find_pos(ticker)
-        if pos.get('is_deployed'):
-            for row in self.deployed_rows:
-                if row.ticker == ticker:
-                    state = row.get_state()
-                    CandleChartWindow(
-                        self.root, ticker, ohlc, ccy,
-                        mode='deployed',
-                        avg_cost=state['avg_cost'],
-                        buy_pct=state['buy_pct'],
-                        shares=state['shares'],
-                        sell_tiers=[(state[f't{i+1}_active'], state[f't{i+1}_pct'])
-                                    for i in range(3)],
-                        current_price=current_price)
-                    return
-        else:
-            for row in self.empty_rows:
-                if row.ticker == ticker:
-                    CandleChartWindow(
-                        self.root, ticker, ohlc, ccy,
-                        mode='empty',
-                        load_pct=row._get_load_pct(),
-                        current_price=current_price)
-                    return
+        for row in self.deployed_rows + self.empty_rows:
+            if row.ticker == ticker:
+                cd = row.chart_data()
+                CandleChartWindow(
+                    self.root, ticker, ohlc, ccy,
+                    anchor_label=cd['anchor_label'],
+                    anchor_price=cd['anchor_price'],
+                    buy_lines=cd['buy_lines'],
+                    sell_lines=cd['sell_lines'],
+                    current_price=current_price)
+                return
 
-        # Fallback
+        # Fallback (ticker has no row yet)
         CandleChartWindow(self.root, ticker, ohlc, ccy,
                           current_price=current_price)
 
@@ -613,16 +615,8 @@ class App:
         if fx_rate:
             self._update_unit_usd()
 
-        # Update deployed rows
-        for row in self.deployed_rows:
-            d = data.get(row.ticker, {})
-            row.update_live(
-                d.get('price'),
-                volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
-            row.compute()
-
-        # Update empty rows
-        for row in self.empty_rows:
+        # Update every row through the one unified signature.
+        for row in self.deployed_rows + self.empty_rows:
             d = data.get(row.ticker, {})
             row.update_live(
                 d.get('price'),
