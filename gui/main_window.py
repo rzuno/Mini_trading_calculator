@@ -1,10 +1,11 @@
 import tkinter as tk
+from tkinter import ttk
 import threading
 from datetime import datetime
 
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
-from core.data_feed import fetch_all
+from providers import get_provider
 from gui.stock_row import StockRow
 from gui.candle_chart import CandleChartWindow
 
@@ -35,6 +36,18 @@ class App:
 
         self.config    = load_config()
         self.positions = load_positions()
+
+        # Market-data provider. Toss is the default; fall back to Yahoo if Toss
+        # can't initialize (e.g. missing credentials) so launch never breaks.
+        self._provider_init_note = ''
+        try:
+            self._provider = get_provider(self.config)
+        except Exception as e:
+            from providers import YahooMarketProvider
+            self._provider = YahooMarketProvider()
+            self._provider_init_note = f"Toss unavailable ({e}); using Yahoo."
+        self.provider_var = tk.StringVar(
+            value=getattr(self._provider, 'name', 'yahoo').title())
 
         # Sort positions in fixed order on load
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
@@ -104,6 +117,9 @@ class App:
 
         # Auto-derive USD when KRW changes (header only)
         self.unit_krw_var.trace_add('write', lambda *_: self._update_unit_usd())
+
+        if self._provider_init_note:
+            self.status_var.set(self._provider_init_note)
 
         # Auto-refresh on launch
         self.root.after(300, self._on_save_refresh)
@@ -291,6 +307,140 @@ class App:
         _lbl('Total Units:');    _entry(self.N_var, 4)
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
         _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
+
+        # Market-data source selector. Toss is the default (listed first and
+        # shown in bold); switching re-fetches.
+        _lbl('Data:')
+        self._provider_om = tk.OptionMenu(
+            f, self.provider_var, 'Toss', 'Yahoo',
+            command=lambda v: self._switch_provider(v))
+        self._provider_om.config(width=6)
+        menu = self._provider_om['menu']
+        try:
+            menu.entryconfig(menu.index('Toss'), font=_F_HDR_B)
+            menu.entryconfig(menu.index('Yahoo'), font=_F_HDR)
+        except tk.TclError:
+            pass
+        self._provider_om.grid(row=0, column=c, padx=2); c += 1
+        self._refresh_provider_button()
+
+        tk.Button(f, text='Account Info', font=_F_HDR,
+                  command=self._on_account_info
+                  ).grid(row=0, column=c, padx=(8, 2)); c += 1
+
+    def _refresh_provider_button(self):
+        """Bold the selector when Toss (the default) is active."""
+        is_toss = self.provider_var.get().lower() == 'toss'
+        self._provider_om.config(font=_F_HDR_B if is_toss else _F_HDR)
+
+    def _switch_provider(self, name: str):
+        """Swap the live market-data provider at runtime. Reverts cleanly if the
+        new provider can't be created (e.g. Toss credentials missing)."""
+        name = name.lower()
+        current = getattr(self._provider, 'name', 'yahoo')
+        if name == current:
+            return
+        try:
+            prov = get_provider({'market_provider': name})
+        except Exception as e:
+            self.status_var.set(f"Cannot use {name.title()}: {e}")
+            self.provider_var.set(current.title())
+            self._refresh_provider_button()
+            return
+        self._provider = prov
+        self.config['market_provider'] = name
+        self._refresh_provider_button()
+        self.status_var.set(f"Data source → {name.title()}; refreshing…")
+        self._on_save_refresh()
+
+    # ── Account info (Toss, read-only) ──────────────────────────────────────────
+
+    def _on_account_info(self):
+        """Read holdings + cash from Toss in the background and show them in a
+        popup. Read-only; needs Toss credentials regardless of the selected
+        market-data provider."""
+        self.status_var.set('Reading Toss account…')
+        threading.Thread(target=self._account_bg, daemon=True).start()
+
+    def _account_bg(self):
+        try:
+            from providers.toss_market_provider import TossMarketProvider
+            snap = TossMarketProvider.from_env().account_snapshot()
+        except Exception as e:
+            self.root.after(0, lambda: self.status_var.set(
+                f'Account read failed: {e}'))
+            return
+        self.root.after(0, self._show_account_window, snap)
+
+    def _show_account_window(self, snap):
+        self.status_var.set('Ready')
+        if not snap:
+            self.status_var.set('No Toss account found.')
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title('Toss Account — Holdings (read-only)')
+        win.geometry('940x540')
+
+        tk.Label(win, text='Toss Holdings  (read-only snapshot — for checking '
+                           'against your manual data)',
+                 font=_F_HDR_B).pack(anchor='w', padx=12, pady=(10, 4))
+
+        cols = ('name', 'mkt', 'shares', 'avg', 'last', 'value', 'pl')
+        tv = ttk.Treeview(win, columns=cols, show='headings', height=15)
+        for cid, txt, w, anc in (
+                ('name', 'Stock', 200, 'w'), ('mkt', 'Mkt', 50, 'center'),
+                ('shares', 'Shares', 90, 'e'), ('avg', 'Avg Cost', 120, 'e'),
+                ('last', 'Current', 120, 'e'), ('value', 'Value', 140, 'e'),
+                ('pl', 'P/L %', 80, 'e')):
+            tv.heading(cid, text=txt)
+            tv.column(cid, width=w, anchor=anc)
+        tv.pack(fill='both', expand=True, padx=12, pady=4)
+
+        from core.calc import fmt_price
+        for it in snap['items']:
+            ccy = it['currency']
+            pl = it['pl_rate']
+            tv.insert('', 'end', values=(
+                f"{it['name']} ({it['symbol']})",
+                it['country'],
+                f"{it['shares']:,.0f}" if ccy == 'KRW' else f"{it['shares']:,.4f}".rstrip('0').rstrip('.'),
+                fmt_price(it['avg'], ccy),
+                fmt_price(it['last'], ccy),
+                fmt_price(it['value'], ccy) if it['value'] is not None else '--',
+                f"{pl*100:+.2f}" if pl is not None else '--'))
+
+        # Summary: cash + reserve/army size cross-check
+        fx = self._fx_rate or 0
+        cash_krw = snap['cash_krw'] or 0
+        cash_usd = snap['cash_usd'] or 0
+        reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
+        try:
+            unit_krw = float(self.unit_krw_var.get().replace(',', ''))
+            n_units = int(self.N_var.get())
+        except (ValueError, ZeroDivisionError):
+            unit_krw, n_units = 0, 0
+
+        deployed_krw = sum(
+            (it['value'] or 0) * (fx if it['currency'] == 'USD' and fx else 1)
+            for it in snap['items'])
+
+        lines = [
+            f"Cash:  ₩{cash_krw:,.0f}   +   ${cash_usd:,.2f}"
+            + (f"   ≈ ₩{reserve_krw:,.0f}" if fx else "  (FX unknown)"),
+        ]
+        if unit_krw > 0:
+            lines.append(
+                f"Reserve army:  {reserve_krw / unit_krw:,.1f} units"
+                f"      Deployed (Toss): ₩{deployed_krw:,.0f} = "
+                f"{deployed_krw / unit_krw:,.1f} units"
+                + (f"  /  {n_units}" if n_units else ""))
+        if fx:
+            lines.append(f"(converted at current FX {fx:,.2f}; "
+                         f"Toss holdings only — other brokers not included)")
+
+        tk.Label(win, text='\n'.join(lines), font=_F_SEC_INFO, fg='#333',
+                 justify='left', anchor='w').pack(anchor='w', padx=12, pady=(6, 10))
 
     # ── FX panel ───────────────────────────────────────────────────────────────
 
@@ -591,7 +741,7 @@ class App:
     def _fetch_bg(self):
         tickers = [p['ticker'] for p in self.positions]
         try:
-            data, fx, fx_avg = fetch_all(
+            data, fx, fx_avg = self._provider.fetch_all(
                 tickers, self.config.get('fx_ticker', 'USDKRW=X'))
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f'Error: {e}'))
@@ -685,6 +835,7 @@ class App:
                 'fx_ticker':          self.config.get('fx_ticker', 'USDKRW=X'),
                 'peak_lookback_days': self.config.get('peak_lookback_days', 5),
                 'fx_switch_level':    self.fx_switch_level,
+                'market_provider':    self.config.get('market_provider', 'yahoo'),
             }
             save_config(cfg)
             self.config = cfg

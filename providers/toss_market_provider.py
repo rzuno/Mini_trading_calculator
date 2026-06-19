@@ -30,6 +30,13 @@ from providers.market_data_base import MarketDataProvider, empty_stock_data
 DEFAULT_BASE = 'https://openapi.tossinvest.com'
 _TIMEOUT = 10
 
+# Candles are in the tighter MARKET_DATA_CHART rate-limit group, so per-symbol
+# candle calls are bounded in concurrency and retried on HTTP 429.
+_CHART_CONCURRENCY = 3
+_MAX_RETRIES = 4
+_BACKOFF = 0.7        # seconds; grows linearly per retry
+_BACKOFF_CAP = 5.0
+
 # Approximate market timezones for the "is the latest daily bar still today
 # (in-progress)?" check. DST for the US is ignored here on purpose — this is a
 # heuristic and must be confirmed against GET /api/v1/market-calendar before the
@@ -58,6 +65,20 @@ def to_toss_symbol(ticker: str) -> str:
     """Internal ticker -> Toss symbol. KR uses the 6-digit code (drop .KS);
     US uses the plain ticker."""
     return ticker[:-3] if ticker.endswith('.KS') else ticker
+
+
+def from_toss_symbol(symbol: str, market_country: str) -> str:
+    """Toss symbol -> internal ticker. KR 6-digit codes get the .KS suffix."""
+    return f"{symbol}.KS" if market_country == 'KR' else symbol
+
+
+def _to_float(x, default=None):
+    try:
+        if x in (None, ''):
+            return default
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
 
 class TossMarketProvider(MarketDataProvider):
@@ -114,15 +135,36 @@ class TossMarketProvider(MarketDataProvider):
             self._token_exp = time.time() + int(tok.get('expires_in', 300)) - 60
             return self._token
 
-    def _get(self, path: str, params: dict) -> dict:
-        resp = requests.get(
-            f"{self.base}{path}", params=params,
-            headers={'Authorization': f'Bearer {self._access_token()}'},
-            timeout=_TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
-        # BFF common envelope: the payload lives under "result".
-        return body.get('result', body)
+    def _get(self, path: str, params: dict, account=None) -> dict:
+        """GET with bearer auth, retrying on HTTP 429 (rate limit) using the
+        Retry-After / X-RateLimit-Reset header when present, else a linear
+        backoff. Account-scoped reads pass the accountSeq via the
+        X-Tossinvest-Account header."""
+        headers = {'Authorization': f'Bearer {self._access_token()}'}
+        if account is not None:
+            headers['X-Tossinvest-Account'] = str(account)
+        last = None
+        for attempt in range(_MAX_RETRIES):
+            resp = requests.get(
+                f"{self.base}{path}", params=params,
+                headers=headers, timeout=_TIMEOUT)
+            if resp.status_code == 429:
+                last = resp
+                wait = resp.headers.get('Retry-After') \
+                    or resp.headers.get('X-RateLimit-Reset')
+                try:
+                    wait = float(wait)
+                except (TypeError, ValueError):
+                    wait = _BACKOFF * (attempt + 1)
+                time.sleep(min(wait, _BACKOFF_CAP))
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            # BFF common envelope: the payload lives under "result".
+            return body.get('result', body)
+        if last is not None:
+            last.raise_for_status()
+        return {}
 
     # -- Raw reads -------------------------------------------------------------
 
@@ -204,10 +246,14 @@ class TossMarketProvider(MarketDataProvider):
         for t, p in prices.items():
             data[t]['price'] = p
 
-        # Candles (one call per symbol, fetched concurrently)
+        # Candles: one call per symbol (MARKET_DATA_CHART group). Bound the
+        # concurrency so we don't trip the chart rate limit; _get retries 429.
+        sem = threading.Semaphore(_CHART_CONCURRENCY)
+
         def _one(t):
             try:
-                bars = self.get_candles(t, count=6)
+                with sem:
+                    bars = self.get_candles(t, count=6)
             except Exception:
                 return
             currency = 'KRW' if t.endswith('.KS') else 'USD'
@@ -259,3 +305,53 @@ class TossMarketProvider(MarketDataProvider):
 
     def get_fx_rate(self, fx_ticker: str = 'USDKRW=X') -> Optional[float]:
         return self.get_exchange_rate('USD', 'KRW')
+
+    # -- Account reads (Phase 2, read-only) -----------------------------------
+
+    def get_accounts(self) -> list:
+        """List brokerage accounts: [{accountNo, accountSeq, accountType}]."""
+        res = self._get('/api/v1/accounts', {})
+        return res if isinstance(res, list) else (res.get('result', []) if res else [])
+
+    def get_holdings(self, account_seq, symbol: str = None) -> dict:
+        params = {'symbol': to_toss_symbol(symbol)} if symbol else {}
+        return self._get('/api/v1/holdings', params, account=account_seq) or {}
+
+    def get_buying_power(self, account_seq, currency: str) -> Optional[float]:
+        r = self._get('/api/v1/buying-power', {'currency': currency},
+                      account=account_seq) or {}
+        return _to_float(r.get('cashBuyingPower'))
+
+    def account_snapshot(self) -> Optional[dict]:
+        """Read-only snapshot for the GUI's Account Info view: normalized
+        holdings + cash buying power per currency. Uses the first account.
+        Returns None when there is no account."""
+        accts = self.get_accounts()
+        if not accts:
+            return None
+        seq = accts[0].get('accountSeq')
+        overview = self.get_holdings(seq)
+
+        items = []
+        for it in overview.get('items', []) or []:
+            mv = it.get('marketValue') or {}
+            pl = it.get('profitLoss') or {}
+            items.append({
+                'ticker':   from_toss_symbol(it.get('symbol', ''),
+                                             it.get('marketCountry', '')),
+                'symbol':   it.get('symbol'),
+                'name':     it.get('name'),
+                'country':  it.get('marketCountry'),
+                'currency': it.get('currency'),
+                'shares':   _to_float(it.get('quantity'), 0) or 0,
+                'avg':      _to_float(it.get('averagePurchasePrice'), 0) or 0,
+                'last':     _to_float(it.get('lastPrice'), 0) or 0,
+                'value':    _to_float(mv.get('amount')),
+                'pl_rate':  _to_float(pl.get('rate')),
+            })
+        return {
+            'account_seq': seq,
+            'items':       items,
+            'cash_krw':    self.get_buying_power(seq, 'KRW'),
+            'cash_usd':    self.get_buying_power(seq, 'USD'),
+        }
