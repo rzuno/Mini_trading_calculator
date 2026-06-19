@@ -1,55 +1,57 @@
 # AI Seesaw Mini-Calculator
-## Project Manual v0.1
+## Project Manual v0.3
 
-**Sister project of:** AI Seesaw Trading (main program v1.4.2)  
-**Goal:** Single-window, fully manual, stateless calculator and bookkeeper for a 14-stock AI-sector portfolio.  
-**Automation level:** Zero. All decisions are made by the user. The program only computes numbers.  
-**Interface:** Single tkinter window. No pop-ups. No tabs. All information visible at once.
+**Sister project of:** AI Seesaw Trading (main program)
+**Goal:** Single-window, reactive calculator and bookkeeper for an AI-sector portfolio.
+**Automation level:** Decisions are the user's. The program computes numbers, can auto-pick gears from volatility, and tracks a manual dollar-switch ledger.
+**Interface:** Single tkinter window with a scrollable card grid. A candlestick chart opens in a popup on demand.
 
 ---
 
 ## 0. Philosophy and Scope
 
-The Mini-Calculator is a **field tool**, not a command center. The main Seesaw program is a full strategy machine with a perk engine, anchor tracking, and semi-autonomous signals. The Mini-Calculator strips all of that away and retains only the arithmetic that the user performs manually every trading session:
+The Mini-Calculator is a **field tool**, not a command center. It reads a position snapshot from CSV, fetches live prices and FX, and displays the arithmetic the user performs every trading session:
 
-1. Where is my next buy trigger?
-2. How many shares do I buy there?
-3. Where do I set my sell orders, and in what quantities?
+1. Where is my next buy trigger, and how many shares?
+2. Where do I set my sell orders, and in what quantities?
+3. Where is an empty stock's entry (LOAD) trigger?
+4. Is the FX rate far enough from its 3-month average to switch some won/dollar?
 
-Everything else — perk scoring, idle flags, regime detection, anchor management — belongs in the main program only. The Mini-Calculator has no state machine. It reads a position snapshot from a CSV file, fetches live prices, and displays computed output numbers.
+It deliberately omits the main program's perk engine, anchor tracking, regime detection, and idle flags.
 
 ---
 
 ## 1. Portfolio Definition
 
-### 1.1 Stock List (Hardcoded, Expandable by Editing CSV)
+### 1.1 Stock List (stored in `data/positions.csv`, seeded from `core/csv_io.py`)
 
-| # | Ticker | Name | Exchange | Currency | Tier |
-|---|--------|------|----------|----------|------|
-| 1 | 005930.KS | Samsung Electronics | KRX | KRW | Major |
-| 2 | 000660.KS | SK Hynix | KRX | KRW | Major |
-| 3 | NVDA | NVIDIA | NASDAQ | USD | Major |
-| 4 | GOOGL | Alphabet | NASDAQ | USD | Major |
-| 5 | MU | Micron | NASDAQ | USD | Minor |
-| 6 | MSFT | Microsoft | NASDAQ | USD | Minor |
-| 7 | WDC | Western Digital (SanDisk) | NASDAQ | USD | Minor |
-| 8 | AMD | AMD | NASDAQ | USD | Minor |
-| 9 | TSM | TSMC | NYSE | USD | Minor |
-| 10 | AVGO | Broadcom | NASDAQ | USD | Minor |
-| 11 | PLTR | Palantir | NYSE | USD | Minor |
-| 12 | AAPL | Apple | NASDAQ | USD | Minor |
-| 13 | AMZN | Amazon | NASDAQ | USD | Minor |
-| 14 | STX | Seagate | NASDAQ | USD | Minor |
+| # | Ticker | Name | Currency | Bold? |
+|---|--------|------|----------|-------|
+| 1 | 005930.KS | Samsung Electronics | KRW | **Yes (KR)** |
+| 2 | 000660.KS | SK Hynix | KRW | **Yes (KR)** |
+| 3 | NVDA | NVIDIA | USD | No |
+| 4 | GOOGL | Alphabet | USD | No |
+| 5 | MU | Micron | USD | No |
+| 6 | MSFT | Microsoft | USD | No |
+| 7 | SNDK | SanDisk | USD | No |
+| 8 | AMD | AMD | USD | No |
+| 9 | TSM | TSMC | USD | No |
+| 10 | AVGO | Broadcom | USD | No |
+| 11 | PLTR | Palantir | USD | No |
+| 12 | AAPL | Apple | USD | No |
+| 13 | AMZN | Amazon | USD | No |
+| 14 | STX | Seagate | USD | No |
+| 15 | INTC | Intel | USD | No |
+| 16 | ORCL | Oracle | USD | No |
 
-### 1.2 Tier Rules
+To add a stock: add a name in `STOCK_NAMES` (`core/calc.py`), a default in `_PORTFOLIO` (`core/csv_io.py`), and a row in `data/positions.csv`.
 
-| Tier | Load Multiplier | Meaning |
-|------|----------------|---------|
-| Major | 1.0× | Full unit entry at LOAD |
-| Minor | 0.5× | Half unit entry at LOAD |
+### 1.2 Classification: KR vs US
 
-**This multiplier applies to LOAD only.** RESCUE logic is identical for Major and Minor stocks.  
-The reason: once a position is open, the rescue calculation is purely based on how deep the stock has dropped and how many units are already deployed — the Major/Minor distinction no longer matters.
+Stocks are classified only by **market**: Korean (`.KS`, priced in KRW) or US (priced in USD). The classification is derived from the ticker suffix — there is no separate field to maintain.
+
+- **Korean stocks are shown in bold** in both the deployed and empty cards, with a `(KR)` suffix. US stocks are plain text.
+- The old **Major/Minor tier is retired.** Every stock now loads a **full unit** of cash. The `tier` column still exists in the CSV for backward compatibility but no longer changes any calculation.
 
 ---
 
@@ -58,391 +60,246 @@ The reason: once a position is open, the rescue calculation is purely based on h
 ### 2.1 Capital Units
 
 ```
-N          : total number of army units in the portfolio (user-defined, e.g. 20)
-unit_cash  : total_capital / N  (in KRW for Korean stocks, USD for US stocks)
+N               : total number of army units in the portfolio (user-defined)
+unit_cash_krw   : cash value of one unit, in KRW (user-defined)
+unit_cash_usd   : auto-derived = unit_cash_krw / FX rate  (display/reference)
 ```
 
-For US stocks, `unit_cash` is tracked in USD. The FX rate (USD/KRW) is fetched live and displayed as reference only — it does not convert unit_cash automatically. The user manages the KRW/USD split manually.
+The KRW unit is the source of truth; the USD unit is recomputed whenever the KRW unit or the FX rate changes.
 
-### 2.2 Per-Stock State Variables (Stored in CSV)
+### 2.2 Per-Stock State (stored in CSV)
 
 ```
-ticker         : str    — Yahoo Finance symbol
-shares         : int    — shares currently held (0 = empty)
-avg_cost       : float  — average cost per share (0.0 if empty)
-cost_basis     : float  — total cash deployed (shares × avg_cost)
-peak_5d        : float  — highest High of the last 5 trading days (auto-fetched)
-buy_gear       : str    — 'A', 'B', or 'C'  (user selects)
-sell_gear      : str    — 'A', 'B', 'C', 'D', or 'E'  (user selects)
-last_updated   : date   — timestamp of last CSV write
+ticker        : str    — Yahoo Finance symbol
+tier          : str    — legacy 'Major'/'Minor' (no longer affects math)
+is_deployed   : bool   — derived/maintained; True when a position is open
+shares        : int    — shares held (0 = empty)
+avg_cost      : float  — average cost per share
+cost_basis    : float  — shares × avg_cost
+load_gear     : int    — LOAD drop %, 4..15 (per stock)
+buy_pct       : int    — RESCUE gear: 4, 5, or 6 (%)
+t1_pct/t2_pct/t3_pct       : float — sell-tier percents (enforced T1<T2<T3)
+t1_active/t2_active/t3_active : bool — which sell tiers are shown
+auto_mode     : bool   — AUTO (gear from volatility) vs MANUAL
+last_updated  : date   — timestamp of last CSV write
 ```
 
 ### 2.3 Stock States
 
-Each stock is in exactly one of two states:
+| State | Condition | Section |
+|-------|-----------|---------|
+| **DEPLOYED** | `is_deployed` (shares > 0) | Upper |
+| **EMPTY** | otherwise | Lower |
 
-| State | Condition | Display Section |
-|-------|-----------|-----------------|
-| **DEPLOYED** | `shares > 0` | Upper section of window |
-| **EMPTY** | `shares == 0` | Lower section of window |
-
----
-
-## 3. Buy Logic
-
-### 3.1 RESCUE Zones (DEPLOYED stocks only)
-
-When a stock is held (`shares > 0`), the calculator shows three potential buy zones below the current average cost. These zones represent averaged-down entries.
-
-| Zone | Drop from avg_cost | Buy Size (units) | Note |
-|------|--------------------|-----------------|------|
-| A | −4% | 0.5u | Same for Major and Minor |
-| B | −5% | 0.6u | Same for Major and Minor |
-| C | −6% | 0.7u | Same for Major and Minor |
-
-**Trigger price formulas:**
-```
-price_A = avg_cost × 0.96
-price_B = avg_cost × 0.95
-price_C = avg_cost × 0.94
-```
-
-The user selects which zone is active (A, B, or C) using the buy gear selector. The calculator displays **all three prices always**, but highlights the selected zone.
-
-**Note on Minor stocks:** The calculator shows the same RESCUE quantities for Minor stocks as for Major stocks. The user is expected to exercise judgment — in practice, Minor positions should not be chased as deeply as Major ones. A soft guideline (not enforced by the program) is to cap Minor stock deployment at ~3 units total. This discipline is left to the user and will be formalized in the main Seesaw program later.
-
-### 3.2 Share Quantization (Rounding Rule)
-
-Converting a unit-based buy size to integer shares:
-
-```
-target_cash = buy_ratio × unit_cash
-raw_shares  = target_cash / current_price
-buy_shares  = max(1, round_half_up(raw_shares))
-```
-
-**round_half_up:** standard rounding where 0.5 always rounds up (not Python's banker's rounding).
-
-```python
-import math
-def round_half_up(x):
-    return math.floor(x + 0.5)
-```
-
-**Minimum 1 share** is always enforced regardless of unit size.
-
-**Example:**
-```
-unit_cash = 1,000,000 KRW
-avg_cost  = 80,000 KRW
-Zone A: buy_ratio = 0.5
-target_cash = 0.5 × 1,000,000 = 500,000 KRW
-price_A     = 80,000 × 0.96 = 76,800 KRW
-raw_shares  = 500,000 / 76,800 ≈ 6.51
-buy_shares  = round_half_up(6.51) = 7
-```
-
-### 3.3 LOAD Logic (EMPTY stocks only)
-
-When a stock has zero shares, the entry point is computed from the 5-day high (fetched from Yahoo Finance), not from avg_cost.
-
-#### Load Gear Table
-
-The load gear is **user-selectable per stock**. It controls how far the stock must drop from its recent peak before the user considers entering. Default is **L2 (−5%)** for all stocks.
-
-| Load Gear | Drop Threshold | Character | Typical Use |
-|-----------|---------------|-----------|-------------|
-| L1 | −4% | Eager | Catch breakouts early; very active |
-| **L2** | **−5%** | **Default** | **Standard entry for all stocks** |
-| L3 | −6% | Patient | Wait for a cleaner dip |
-| L4 | −10% | Selective | Only enter on a real correction |
-| L5 | −15% | Dormant | Park the slot; only wake on a crash |
-
-**L4 and L5 are primarily intended for Minor stocks** that the user wants to deprioritize during periods when major stocks are active. Setting a minor stock to L5 effectively says "ignore this for now — only alert me if it crashes."
-
-#### LOAD Formula
-
-```
-peak_5d      = max(High) over last 5 completed trading days
-load_drop    = selected load gear drop %  (4 / 5 / 6 / 10 / 15)
-load_price   = peak_5d × (1 - load_drop / 100)
-load_units   = 1.0 × tier_multiplier       (Major: 1.0u  /  Minor: 0.5u)
-target_cash  = load_units × unit_cash
-buy_shares   = max(1, round_half_up(target_cash / load_price))
-```
-
-The tier_multiplier (Major=1.0, Minor=0.5) **only appears here** in the LOAD formula.  
-Once a position is open, all subsequent RESCUE calculations use plain unit ratios (0.5 / 0.6 / 0.7) regardless of tier.
-
-#### EMPTY Row Display
-
-The calculator shows for each empty stock:
-- `peak_5d` — the 5-day high fetched live
-- `load_price` — the computed entry trigger price
-- `buy_shares` — recommended number of shares to buy at load
-- `load_gear` — currently selected gear (L1–L5), user-editable
-
-No sell ladder is shown until a position exists.
+On **Save & Refresh** the program auto-promotes an empty stock to deployed when `shares > 0` and `avg_cost > 0`, and auto-demotes a deployed stock to empty when `shares ≤ 0`.
 
 ---
 
-## 4. Sell Logic
+## 3. AUTO / MANUAL Gear (volatility-driven)
 
-### 4.1 The Five Sell Gears
+Each card has an **AUTO / MANUAL** toggle.
 
-| Gear | Label | Tier 1 | Tier 2 | Tier 3 | Character |
-|------|-------|--------|--------|--------|-----------|
-| A | Emergency | +2% | +4% | +6% | Evacuation |
-| B | Conservative | +3% | +5% | +7% | Cautious |
-| C | Default | +4% | +6% | +8% | Standard |
-| D | Confident | +5% | +7% | +9% | Holding |
-| E | Greedy | +6% | +8% | +10% | Patient |
+- **MANUAL** — the user sets the gear controls directly (load stepper, buy radios, sell steppers).
+- **AUTO** — the gear bundle is chosen from the stock's **5-day volatility** and the controls are locked (the sell-tier on/off checkboxes stay editable).
 
-**Formula for sell prices (from avg_cost):**
+**5-day volatility:**
 ```
-sell_1 = avg_cost × (1 + tier1_pct / 100)
-sell_2 = avg_cost × (1 + tier2_pct / 100)
-sell_3 = avg_cost × (1 + tier3_pct / 100)
+V = 100 × (5d_high − 5d_low) / 5d_high     [%]
 ```
 
-### 4.2 Sell Quantity Split
+**Gear selection from V:**
 
-The 3-tier ladder splits the current share count as follows:
+| Volatility | Gear | LOAD drop | RESCUE gear | Sell tiers (T1/T2/T3) |
+|------------|------|-----------|-------------|------------------------|
+| V < 9% | 1 | −6% | −4% (×0.5) | +2 / +4 / +6% |
+| 9% ≤ V < 14% | 2 | −7% | −5% (×0.6) | +3 / +5 / +7% |
+| V ≥ 14% | 3 | −8% | −6% (×0.7) | +4 / +6 / +8% |
 
-```
-Q       = shares currently held
-qty_1   = round_half_up(Q × 0.50)          # 50% at Tier 1
-qty_2   = round_half_up((Q - qty_1) × 0.50) # 50% of remainder at Tier 2
-qty_3   = Q - qty_1 - qty_2                # 100% of remainder at Tier 3
-```
-
-**Example:**
-```
-Q = 10 shares, Gear C (4/6/8%)
-qty_1 = 5   → sell at avg_cost × 1.04
-qty_2 = 3   → sell at avg_cost × 1.06
-qty_3 = 2   → sell at avg_cost × 1.08
-```
+(Cut points `VOL_LO = 9`, `VOL_HI = 14`; bundles in `AUTO_GEARS`, all in `core/calc.py`.)
 
 ---
 
-## 5. Real-Time Data
+## 4. LOAD Logic (EMPTY stocks)
 
-### 5.1 Data Sources
-
-| Data | Source | Method |
-|------|--------|--------|
-| Current price (all stocks) | Yahoo Finance | `yfinance` library |
-| 5-day High (for LOAD) | Yahoo Finance | `yfinance` 5-day OHLCV |
-| USD/KRW FX rate | Yahoo Finance | ticker `USDKRW=X` |
-
-### 5.2 Refresh Behavior
-
-- On program launch: auto-fetch all prices and FX rate.
-- Manual **[Refresh]** button: re-fetch all live data on demand.
-- No automatic refresh loop (no timers). User triggers refreshes manually.
-- If a fetch fails (network error), display the last cached value with a warning indicator.
-
-### 5.3 Gap Rate Display
+When a stock has no position, the entry is computed from the 5-day high.
 
 ```
-gap_rate = (current_price - avg_cost) / avg_cost × 100   [%]
+peak_5d     = highest High over the last 5 trading days (fetched)
+load_pct    = LOAD drop %, 4..15 (auto from volatility, or manual stepper)
+load_price  = peak_5d × (1 − load_pct / 100)
+load_shares = max(1, round_half_up(unit_cash / load_price))
 ```
 
-Shown in the row for each DEPLOYED stock. Color-coded:
-- Green: positive (above avg_cost)
-- Red: negative (below avg_cost)
-- Gray: within ±1% (roughly flat)
+**Every stock loads one full unit of cash.** If a single share already costs more than a unit (e.g. SK Hynix), the minimum of **1 share** applies. The LOAD stepper is continuous from −4% to −15% in 1% steps, colored on a blue gradient (light at −4%, dark at −15%).
+
+The empty card shows: 5-day high, current price (turns green when at/below the load price), the LOAD gear, and `load_price × load_shares`. It also carries optional Avg Cost / Shares fields so a fill can be entered and deployed on the next Save.
 
 ---
 
-## 6. GUI Layout
+## 5. RESCUE Logic (DEPLOYED stocks)
 
-### 6.1 Single-Window Design
+Three averaging-down buy triggers below `avg_cost`. The RESCUE gear sets the drop and the buy ratio:
 
-The entire interface is one non-resizable (or fixed-ratio) tkinter window. No pop-ups, no new windows, no tabs. Everything visible simultaneously.
+| Gear | Drop | Buy ratio |
+|------|------|-----------|
+| −4% | avg × 0.96 | ×0.5 |
+| −5% | avg × 0.95 | ×0.6 |
+| −6% | avg × 0.94 | ×0.7 |
 
-**Window sections (top to bottom):**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  [Portfolio Header: Capital N, unit_cash, FX rate, timestamp]   │
-├─────────────────────────────────────────────────────────────────┤
-│  DEPLOYED STOCKS (rows for stocks with shares > 0)              │
-│  ─────────────────────────────────────────────────────          │
-│  [Column headers]                                               │
-│  [Row per stock]                                                │
-│  ...                                                            │
-├─────────────────────────────────────────────────────────────────┤
-│  EMPTY STOCKS (rows for stocks with shares == 0)                │
-│  ─────────────────────────────────────────────────────          │
-│  [Column headers]                                               │
-│  [Row per stock]                                                │
-│  ...                                                            │
-├─────────────────────────────────────────────────────────────────┤
-│  [Refresh]  [Save]  [Status bar: last updated time]             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 Column Layout — DEPLOYED Row
-
-| Column | Content | Input/Output |
-|--------|---------|-------------|
-| # | Row number | — |
-| Ticker | Stock symbol | — |
-| Shares | Shares held | **Manual input** |
-| Avg Cost | Average cost per share | **Manual input** |
-| Current | Live price | Auto-fetched |
-| Gap % | (current − avg) / avg × 100 | Computed |
-| Ccy | Currency (KRW/USD) | — |
-| Buy Gear | A / B / C selector | **Manual select** |
-| Buy @ | Trigger price for selected zone | Computed |
-| Buy # | Number of shares to buy | Computed |
-| Sell Gear | A / B / C / D / E selector | **Manual select** |
-| T1 Price | Sell tier 1 price | Computed |
-| T1 # | Shares to sell at tier 1 | Computed |
-| T2 Price | Sell tier 2 price | Computed |
-| T2 # | Shares to sell at tier 2 | Computed |
-| T3 Price | Sell tier 3 price | Computed |
-| T3 # | Shares to sell at tier 3 | Computed |
-
-### 6.3 Column Layout — EMPTY Row
-
-| Column | Content | Input/Output |
-|--------|---------|-------------|
-| # | Row number | — |
-| Ticker | Stock symbol | — |
-| Tier | Major / Minor | — |
-| 5D High | 5-day highest High | Auto-fetched |
-| Current | Live price | Auto-fetched |
-| Ccy | Currency | — |
-| Load Gear | L1 / L2 / L3 / L4 / L5 selector | **Manual select** |
-| Load @ | Entry trigger price | Computed |
-| Load # | Shares to buy at Load | Computed |
-
-Columns for avg_cost, gap%, rescue gear, and sell tiers are hidden or blank for EMPTY rows.
-
-### 6.4 Portfolio Header Bar
-
-Displays:
-```
-Total Units (N): [editable]    Unit Cash (KRW): [editable]    Unit Cash (USD): [editable]
-USD/KRW: [live]    Last Refresh: [timestamp]
-```
-
-`N`, `unit_cash_krw`, and `unit_cash_usd` are editable fields. Changing them triggers recomputation of all buy quantities across all rows.
+The three triggers **cascade**: each level's bought shares (`max(1, round_half_up(shares × ratio))`) are folded into the running average before the next trigger is computed, so trigger 2 already assumes trigger 1 was caught.
 
 ---
 
-## 7. CSV Persistence
+## 6. SELL Logic (DEPLOYED stocks)
 
-### 7.1 File Location
+Three sell tiers, each an **on/off toggle + a percent stepper** (1–20%, with `T1 < T2 < T3` enforced). By default only **T2** is active. Sell prices:
 
 ```
-./data/positions.csv
+sell_i = avg_cost × (1 + tier_i_pct / 100)
 ```
 
-Created automatically on first run if not present, pre-populated with all 14 tickers, shares=0.
+**Quantity split** across the *active* tiers:
+- 1 active: 100% of shares at that tier.
+- 2 active: 50% at the lower, the remainder at the higher.
+- 3 active: 50%, then 50% of the remainder, then the rest.
 
-### 7.2 CSV Schema
+---
 
-```csv
-ticker,tier,shares,avg_cost,cost_basis,load_gear,buy_gear,sell_gear,last_updated
-NVDA,Major,25,420.50,10512.50,L2,B,C,2026-03-27
-005930.KS,Major,0,0.0,0.0,L2,A,C,2026-03-27
-MU,Minor,0,0.0,0.0,L4,A,C,2026-03-27
-...
+## 7. FX Panel and the Dollar-Switch Tracker
+
+The FX panel sits directly under the header.
+
+### 7.1 Rate and 3-Month Average
+
+```
+FX Rate:  1,534.50  (+2.3%)     3-Month Avg:  1,500
 ```
 
-`load_gear` persists per stock so that a Minor stock parked at L5 stays dormant across sessions until the user consciously changes it.
+- The **current USD/KRW rate** is fetched live (`USDKRW=X`).
+- The **3-month average** is the mean daily close over the trailing ~3 months (`core/data_feed.fetch_fx_rate`).
+- The deviation `(rate − avg) / avg` is shown next to the rate, **colored red when above** the average and **blue when below**, deepening with magnitude (`fx_dev_color`).
 
-### 7.3 Save Behavior
+### 7.2 The ±3% Ladder
 
-- **[Save]** button writes the current state of all rows back to CSV.
-- No auto-save (prevents accidental overwrites).
-- On launch, CSV is read and the window is populated. Live prices are then fetched.
+Seven rungs around the average, at −3%, −2%, −1%, 0 (avg), +1%, +2%, +3%, each showing the **target FX price** (`avg × (1 + k/100)`). The rung the live rate currently sits at is **bold**. These are pure proportional calculations off the one real value (the 3-month average).
 
-### 7.4 Config File
+### 7.3 The Switch Strategy
 
-A separate `config.json` stores portfolio-level settings:
+Capital is split in thirds: **1/3 always in won, 1/3 always in dollars, 1/3 switched** by FX.
+
+```
+switch_pool (KRW) = N × unit_cash_krw / 3
+```
+
+At each threshold the **marginal** trade is `|k| / 6` of the pool, sized in USD at the neutral (3-month average) rate:
+
+| Threshold | Action | Marginal amount |
+|-----------|--------|-----------------|
+| +1% | sell USD | 1/6 of pool |
+| +2% | sell USD | 2/6 of pool |
+| +3% | sell USD | 3/6 of pool |
+| −1% | buy USD | 1/6 of pool |
+| −2% | buy USD | 2/6 of pool |
+| −3% | buy USD | 3/6 of pool |
+
+Doing all three steps on one side sums to the whole pool (`1/6 + 2/6 + 3/6 = 1`). Example: pool ₩9,000,000 at avg 1,500 → $6,000 → steps **$1,000 / $2,000 / $3,000**. The amounts auto-resize with `N`, the KRW unit, and the average rate, and the panel prints the pool summary so the numbers are always visible.
+
+### 7.4 The 7 Clickable Buttons (manual ledger)
+
+Below each rung is a button: `-3 -2 -1 0 +1 +2 +3`. They record **how many switch steps you have already done**, so you can tell at a glance whether a trade is still owed.
+
+- Clicking **+k** lights `+1 … +k` green; clicking **−k** lights `−1 … −k` green; clicking **0** clears all.
+- Example: after selling at +1% and +2%, click **+2** so `+1` and `+2` are green — you then hold until +3%. If +3% hits, sell the +3 step and click **+3**.
+- The single level is saved to `config.json` as `fx_switch_level` and restored on launch.
+
+This is a manual tracker: you can always trade off-schedule when a position demands it; the panel is for the FX-driven switching you control by rule.
+
+---
+
+## 8. Ordering of Cards
+
+- **DEPLOYED — by size, largest first.** Size is the cost basis in a common currency; USD positions are converted to KRW with the live FX rate before comparing. Korean stocks are **no longer forced to the front** — they sit wherever their true value lands.
+- **EMPTY — by 5-day volatility, most volatile first.** Under the strategy, a more volatile stock is more profitable, so it floats to the top. Stocks whose volatility is not yet known fall back to the catalogue order.
+
+Both orderings re-grid live after each price fetch (no full rebuild), so cards re-sort without disturbing fields you are editing.
+
+---
+
+## 9. Real-Time Data
+
+| Data | Source |
+|------|--------|
+| Current price, 5-day High/Low/closes/OHLC | Yahoo Finance via `yfinance` |
+| USD/KRW rate + 3-month average | ticker `USDKRW=X` |
+
+- **Save & Refresh** (single main button): collect inputs → auto-promote/demote → rebuild → save CSV + config → fetch prices and FX in a background thread → recompute and re-sort.
+- Auto-refresh once on launch. No timed refresh loop.
+- The **gap rate** `(current − avg)/avg × 100` is shown per deployed stock, color-coded (red above cost, blue below, gray near flat).
+
+---
+
+## 10. Graph
+
+Each card has a **Graph** button that opens a candlestick popup (`gui/candle_chart.py`) for the last 5 days, with mode-specific reference lines (avg cost + buy/sell levels for deployed; load target for empty) and the current price.
+
+---
+
+## 11. Persistence
+
+### 11.1 `data/positions.csv`
+
+```
+ticker,tier,is_deployed,shares,avg_cost,cost_basis,load_gear,buy_pct,
+t1_pct,t2_pct,t3_pct,t1_active,t2_active,t3_active,auto_mode,last_updated
+```
+
+Created automatically (all tickers, shares = 0) on first run if missing. Legacy gear keys (`A/B/C`, `L1`–`L7`, sell `A`–`E`) are migrated on read.
+
+### 11.2 `config.json`
 
 ```json
 {
-  "N": 20,
+  "N": 30,
   "unit_cash_krw": 1000000,
-  "unit_cash_usd": 750,
+  "unit_cash_usd": 650.01,
   "fx_ticker": "USDKRW=X",
-  "peak_lookback_days": 5
+  "peak_lookback_days": 5,
+  "fx_switch_level": 0
 }
 ```
 
 ---
 
-## 8. What This Program Deliberately Omits
-
-The following features from the main Seesaw program are **intentionally excluded**:
-
-| Excluded Feature | Reason |
-|-----------------|--------|
-| Perk / trait system | Manual override handles this |
-| RELOAD logic | User uses RESCUE zones in practice |
-| RESET logic | Too stateful for a manual tool |
-| Anchor tracking | User knows when to update mentally |
-| G/L/V committee scoring | Not needed for field calculations |
-| Sell gear auto-selection | User selects gear manually |
-| Graphs / charts | Use brokerage app for visuals |
-| Idle engine / flags | Main program handles this |
-| Floating entry/exit % | Only fixed presets (3 buy zones, 5 sell gears) |
-| Automation / scheduling | Fully manual operation |
-
----
-
-## 9. Development Notes
-
-### 9.1 Libraries Required
+## 12. File Structure
 
 ```
-yfinance       — market data and FX
-tkinter        — GUI (standard library)
-pandas         — CSV handling
-math           — round_half_up
-json           — config file
-datetime       — timestamps
-```
-
-### 9.2 File Structure
-
-```
-mini_calculator/
+Mini_trading_calculator/
 ├── main.py              — entry point, launches GUI
-├── config.json          — portfolio settings (N, unit_cash, etc.)
+├── config.json          — portfolio settings + fx_switch_level
 ├── data/
-│   └── positions.csv    — position state
+│   └── positions.csv    — position state (volatile; auto-saved on launch)
 ├── core/
-│   ├── calc.py          — all formulas (buy/sell calculations)
-│   ├── data_feed.py     — yfinance wrappers (price, 5d high, FX)
+│   ├── calc.py          — catalogue, gears, all formulas, colors
+│   ├── data_feed.py     — yfinance wrappers (price, 5d OHLC, FX + 3m avg)
 │   └── csv_io.py        — read/write CSV and config
 └── gui/
-    ├── main_window.py   — root window layout
-    ├── deployed_row.py  — row widget for DEPLOYED stocks
-    └── empty_row.py     — row widget for EMPTY stocks
+    ├── main_window.py   — header, FX panel, sections, refresh loop
+    ├── deployed_row.py  — DEPLOYED card
+    ├── empty_row.py     — EMPTY card
+    ├── stepper.py       — +/- stepper widget
+    └── candle_chart.py  — candlestick popup
 ```
-
-### 9.3 Relationship to Main Program
-
-The Mini-Calculator is an **independent project**. It does not import or depend on any code from the main Seesaw program. The strategy logic it implements is a strict subset of the main program's strategy, but is re-implemented from scratch for clarity and simplicity.
-
-The main Seesaw program changelog should note the creation of this sister project at v1.4.2.
 
 ---
 
-## 10. Version History
+## 13. Version History
 
 | Version | Date | Notes |
 |---------|------|-------|
-| 0.1 | 2026-03-27 | Initial specification. Project started. |
+| 0.1 | 2026-03-27 | Initial specification. |
+| 0.2 | — | Continuous LOAD gear (−4…−15%), buy 4/5/6% radios, sell-tier steppers, AUTO/MANUAL volatility gear, candlestick graph, KR/US bold styling, deployed-by-size & empty-by-volatility ordering, FX 3-month average + deviation. |
+| 0.3 | 2026-06-19 | Added Oracle (ORCL). Every stock loads a full unit (Minor 0.5× tier retired). Deployed order normalized across currencies (KR no longer pinned to front). FX dollar-switch tracker: ±3% ladder, per-threshold amounts (\|k\|/6 of the 1/3 switch pool), and 7 clickable level buttons persisted as `fx_switch_level`. |
 
 ---
 
-*This manual is the authoritative specification for the Mini-Calculator project.  
-All implementation decisions should reference this document first.*
+*This manual reflects the current implementation. When code and manual disagree, update this document.*

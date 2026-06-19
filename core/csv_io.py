@@ -24,24 +24,29 @@ DEFAULT_CONFIG = {
     "unit_cash_usd": 750,
     "fx_ticker": "USDKRW=X",
     "peak_lookback_days": 5,
+    "fx_switch_level": 0,
 }
 
+# Every stock loads a full unit now, so the old Major/Minor tier no longer
+# changes any math. The column is kept for CSV back-compat; all new defaults
+# are 'Major'. Bold display = Korean (.KS) stocks, decided separately.
 _PORTFOLIO = [
     ('005930.KS', 'Major'),
     ('000660.KS', 'Major'),
     ('NVDA',  'Major'),
     ('GOOGL', 'Major'),
-    ('MU',    'Minor'),
-    ('MSFT',  'Minor'),
-    ('SNDK',  'Minor'),
-    ('AMD',   'Minor'),
-    ('TSM',   'Minor'),
-    ('AVGO',  'Minor'),
-    ('PLTR',  'Minor'),
-    ('AAPL',  'Minor'),
-    ('AMZN',  'Minor'),
-    ('STX',   'Minor'),
-    ('INTC',  'Minor'),
+    ('MU',    'Major'),
+    ('MSFT',  'Major'),
+    ('SNDK',  'Major'),
+    ('AMD',   'Major'),
+    ('TSM',   'Major'),
+    ('AVGO',  'Major'),
+    ('PLTR',  'Major'),
+    ('AAPL',  'Major'),
+    ('AMZN',  'Major'),
+    ('STX',   'Major'),
+    ('INTC',  'Major'),
+    ('ORCL',  'Major'),
 ]
 
 

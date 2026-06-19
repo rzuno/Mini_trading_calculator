@@ -225,8 +225,7 @@ class EmptyRow:
             pct = self._get_load_pct()
             self.peak_var.set(fmt_price(self.peak_5d, ccy))
             load_price = calc_load_price(self.peak_5d, pct)
-            n  = calc_load_shares(self.peak_5d, pct, self.tier,
-                                  self.get_unit_cash())
+            n  = calc_load_shares(self.peak_5d, pct, self.get_unit_cash())
             self.load_info_var.set(f"{fmt_price(load_price, ccy)} \u00d7 {n}")
         else:
             self.peak_var.set('--')

@@ -17,9 +17,8 @@ STOCK_NAMES = {
     'AMZN':  'Amazon',
     'STX':   'Seagate',
     'INTC':  'Intel',
+    'ORCL':  'Oracle',
 }
-
-TIER_MULTIPLIER = {'Major': 1.0, 'Minor': 0.5}
 
 # ── Fixed stock display order ────────────────────────────────────────────────
 MAJOR_ORDER = ['005930.KS', '000660.KS', 'GOOGL', 'NVDA']
@@ -236,14 +235,16 @@ def calc_load_price(peak_5d: float, load_pct: int) -> float:
     return peak_5d * (1.0 - load_pct / 100.0)
 
 
-def calc_load_shares(peak_5d: float, load_pct: int, tier: str, unit_cash: float) -> int:
+def calc_load_shares(peak_5d: float, load_pct: int, unit_cash: float) -> int:
+    """Shares to buy at the load trigger. Every stock loads a full unit of cash
+    (KR and US alike); when one share already costs more than a unit, the
+    minimum of 1 share applies."""
     if peak_5d <= 0 or unit_cash <= 0:
         return 0
     load_price = calc_load_price(peak_5d, load_pct)
     if load_price <= 0:
         return 0
-    target_cash = TIER_MULTIPLIER[tier] * unit_cash
-    return max(1, round_half_up(target_cash / load_price))
+    return max(1, round_half_up(unit_cash / load_price))
 
 
 # ── Sell tier calculations ───────────────────────────────────────────────────

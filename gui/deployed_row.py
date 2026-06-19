@@ -81,9 +81,11 @@ class DeployedRow:
         name = display_name(self.ticker)
         if self.ticker.endswith('.KS'):
             name += ' (KR)'
+        self._disp_name = name
         name_font = _F_NAME_KR if self.ticker.endswith('.KS') else _F_NAME_US
-        tk.Label(r0, text=f"{row_num}. {name}",
-                 font=name_font, anchor='w').pack(side='left')
+        self._name_lbl = tk.Label(r0, text=f"{row_num}. {name}",
+                                  font=name_font, anchor='w')
+        self._name_lbl.pack(side='left')
         tk.Label(r0, textvariable=self.army_pct_var,
                  font=_F_SM, fg='#888').pack(side='left', padx=(3, 6))
         tk.Button(r0, text='Graph', font=_F_SM, width=6,
@@ -316,6 +318,10 @@ class DeployedRow:
         stepper.set_value_color(c, fg)
 
     # -- Public API ------------------------------------------------------------
+
+    def set_row_num(self, n: int):
+        """Update the leading ordinal after the cards are re-ordered."""
+        self._name_lbl.config(text=f"{n}. {self._disp_name}")
 
     def update_live(self, price: float = None, volatility: float = None):
         if price is not None:
