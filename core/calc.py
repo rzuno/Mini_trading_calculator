@@ -268,6 +268,12 @@ def calc_load_ladder(peak_5d: float, load_pct: int, buy_pct: int,
 
 # ── Sell tier calculations ───────────────────────────────────────────────────
 def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives: list) -> list:
+    """Split the held shares across the active sell tiers as evenly as possible,
+    giving any remainder to the LOWER tiers first (T1 before T2 before T3) — i.e.
+    the lower-profit tier sells the larger lot when it doesn't divide evenly.
+
+    Examples (all three active): 5 -> T1=2,T2=2,T3=1 ; 4 -> T1=2,T2=1,T3=1.
+    Two active: 5 -> T1=3,T2=2."""
     active_idx = [i for i, on in enumerate(tier_actives) if on]
     n = len(active_idx)
 
@@ -275,29 +281,13 @@ def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives:
     if n == 0 or avg_cost <= 0 or shares <= 0:
         return result
 
-    def sell_price(i):
-        return avg_cost * (1.0 + tier_pcts[i] / 100.0)
-
-    if n == 1:
-        i = active_idx[0]
-        result[i] = {'price': sell_price(i), 'qty': shares}
-
-    elif n == 2:
-        i1, i2 = active_idx
-        q1 = math.floor(shares * 0.5)
-        q2 = shares - q1
-        result[i1] = {'price': sell_price(i1), 'qty': q1}
-        result[i2] = {'price': sell_price(i2), 'qty': q2}
-
-    else:  # n == 3
-        i1, i2, i3 = active_idx
-        q1 = math.floor(shares * 0.5)
-        q2 = math.floor((shares - q1) * 0.5)
-        q3 = shares - q1 - q2
-        result[i1] = {'price': sell_price(i1), 'qty': q1}
-        result[i2] = {'price': sell_price(i2), 'qty': q2}
-        result[i3] = {'price': sell_price(i3), 'qty': max(0, q3)}
-
+    base, rem = divmod(shares, n)
+    for pos, i in enumerate(active_idx):
+        # active_idx is ascending, so pos 0 is the lowest tier; the first `rem`
+        # (lowest) tiers each get one extra share.
+        q = base + (1 if pos < rem else 0)
+        result[i] = ({'price': avg_cost * (1.0 + tier_pcts[i] / 100.0), 'qty': q}
+                     if q > 0 else {'price': None, 'qty': None})
     return result
 
 

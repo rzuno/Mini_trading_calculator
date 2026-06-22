@@ -336,6 +336,80 @@ class TossMarketProvider(MarketDataProvider):
                       account=account_seq) or {}
         return _to_float(r.get('cashBuyingPower'))
 
+    def get_open_orders(self, account_seq, symbol: str = None) -> list:
+        """Working (un-filled) orders: PENDING / PARTIAL_FILLED / pending-cancel
+        / pending-replace. This is what the API can read back — app-side
+        conditional/reserved orders do not appear here until they trigger."""
+        params = {'status': 'OPEN'}
+        if symbol:
+            params['symbol'] = to_toss_symbol(symbol)
+        res = self._get('/api/v1/orders', params, account=account_seq) or {}
+        return res.get('orders', []) if isinstance(res, dict) else []
+
+    # -- Order placement (LIVE — use deliberately) ----------------------------
+
+    def _post(self, path: str, body: dict = None, account=None) -> tuple:
+        """POST with bearer auth + 429/401 handling. Returns (status_code,
+        json_body); does NOT raise on 4xx so callers can inspect the business
+        error (e.g. order-hours-closed) in body['error']."""
+        last = None
+        tried_reauth = False
+        for attempt in range(_MAX_RETRIES):
+            headers = {'Authorization': f'Bearer {self._access_token()}',
+                       'Content-Type': 'application/json'}
+            if account is not None:
+                headers['X-Tossinvest-Account'] = str(account)
+            resp = requests.post(f"{self.base}{path}", json=body or {},
+                                 headers=headers, timeout=_TIMEOUT)
+            if resp.status_code == 429:
+                last = resp
+                wait = resp.headers.get('Retry-After') \
+                    or resp.headers.get('X-RateLimit-Reset')
+                try:
+                    wait = float(wait)
+                except (TypeError, ValueError):
+                    wait = _BACKOFF * (attempt + 1)
+                time.sleep(min(wait, _BACKOFF_CAP))
+                continue
+            if resp.status_code == 401 and not tried_reauth:
+                tried_reauth = True
+                self._access_token(force=True)
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            return resp.status_code, data
+        if last is not None:
+            try:
+                return last.status_code, last.json()
+            except ValueError:
+                return last.status_code, {}
+        return 0, {}
+
+    def place_limit_order(self, ticker, side, price, qty, account_seq,
+                          time_in_force='DAY', client_order_id=None) -> tuple:
+        """Place a single LIMIT order. side='BUY'|'SELL'. KR price is an integer
+        (KRW, on the tick grid); US price is decimal. Returns (status, body);
+        on success body['result'] carries the orderId. REAL order — caller is
+        responsible for confirmation/guards."""
+        payload = {
+            'symbol':      to_toss_symbol(ticker),
+            'side':        side,
+            'orderType':   'LIMIT',
+            'timeInForce': time_in_force,
+            'quantity':    str(int(qty)),
+            'price':       str(price),
+        }
+        if client_order_id:
+            payload['clientOrderId'] = client_order_id
+        return self._post('/api/v1/orders', payload, account=account_seq)
+
+    def cancel_order(self, order_id, account_seq) -> tuple:
+        """Cancel a working order by id. Returns (status, body)."""
+        return self._post(f'/api/v1/orders/{order_id}/cancel', {},
+                          account=account_seq)
+
     def account_snapshot(self) -> Optional[dict]:
         """Read-only snapshot for the GUI's Account Info view: normalized
         holdings + cash buying power per currency. Uses the first account.
