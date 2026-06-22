@@ -1,4 +1,5 @@
 import os
+import re
 import tkinter as tk
 from tkinter import ttk
 import threading
@@ -707,9 +708,16 @@ class App:
             return False, f'No {side} lines'
 
         ok_n, errs = 0, []
+        ts = datetime.now().strftime('%H%M%S')
         for it in intents:
             price = fmt_order_price(it['ticker'], it['price'])
-            coid = f"g-{it['ticker']}-{it['side']}-{it['label']}".replace(' ', '')[:36]
+            # clientOrderId allows only [A-Za-z0-9_-]; sell labels ("+6%") have
+            # '+'/'%', so sanitize. Append HHMMSS so a cancel-then-reorder within
+            # the 10-min idempotency window places fresh instead of returning the
+            # stale (cancelled) order.
+            base = re.sub(r'[^A-Za-z0-9_-]', '',
+                          f"g{it['ticker']}{it['side']}{it['label']}")
+            coid = f"{base[:28]}{ts}"
             try:
                 status, body = prov.place_limit_order(
                     it['ticker'], it['side'], price, it['qty'], seq,
