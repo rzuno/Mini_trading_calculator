@@ -1,7 +1,15 @@
+import os
 import tkinter as tk
 from tkinter import ttk
 import threading
 from datetime import datetime
+
+# Order execution mode. DRY_RUN = compute and log orders only, never call the
+# broker. (LIVE wiring comes in a later, confirmed step.)
+ORDER_MODE = 'DRY_RUN'
+_ORDERS_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'logs', 'orders.log')
 
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
@@ -328,6 +336,10 @@ class App:
                   command=self._on_account_info
                   ).grid(row=0, column=c, padx=(8, 2)); c += 1
 
+        tk.Label(f, text=f'Orders: {ORDER_MODE}', font=_F_SM,
+                 fg=('#888' if ORDER_MODE == 'DRY_RUN' else '#CC0000')
+                 ).grid(row=0, column=c, padx=(8, 2)); c += 1
+
     def _refresh_provider_button(self):
         """Bold the selector when Toss (the default) is active."""
         is_toss = self.provider_var.get().lower() == 'toss'
@@ -540,8 +552,10 @@ class App:
 
     def _reorder_deployed(self):
         """Re-grid the deployed cards by size (largest first) once the FX rate
-        is known, so KR and US positions interleave by true value."""
-        if not self.deployed_rows:
+        is known, so KR and US positions interleave by true value. Skips while
+        the FX rate is unknown so a transient fetch failure can't flip the order
+        back to KR-first (USD sizes can't be normalized without FX)."""
+        if not self.deployed_rows or not self._fx_rate:
             return
         ordered = sorted(
             self.deployed_rows,
@@ -606,7 +620,8 @@ class App:
                 parent=box, row_num=i + 1, pos=pos, deployed=True,
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph,
-                on_compute=self._on_row_compute)
+                on_compute=self._on_row_compute,
+                on_order=self._on_row_order)
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=2)
             self.deployed_rows.append(row)
@@ -682,6 +697,57 @@ class App:
         """Called when any deployed row recomputes — update army% across all."""
         if self._fx_rate:
             self._update_army(self._fx_rate)
+
+    # ── Orders (DRY-RUN: compute + log only, no broker calls) ───────────────────
+
+    def _on_row_order(self, row, side, active):
+        """Handle a [Buy]/[Sell] latch on a deployed card. In DRY_RUN we only
+        log the orders/cancels that WOULD be sent — nothing reaches Toss."""
+        if not active:
+            self._log_order(row, side, [], withdraw=True)
+            self.status_var.set(
+                f"DRY-RUN: withdraw {side} orders for {row.ticker} (logged)")
+            return
+
+        if side == 'SELL' and row.current_shares() <= 0:
+            self.status_var.set(f"{row.ticker}: no shares to sell — blocked")
+            row.set_order_active('SELL', False)
+            return
+
+        intents = row.order_intents(side)
+        if not intents:
+            self.status_var.set(f"{row.ticker}: no {side} lines to place")
+            row.set_order_active(side, False)
+            return
+
+        # Toss rejects a buy and a sell pending on the same stock at once.
+        opp = 'SELL' if side == 'BUY' else 'BUY'
+        opp_active = (row.sell_active if side == 'BUY' else row.buy_active).get()
+        warn = "  [warn: opposite-side latch also on — Toss would reject]" if opp_active else ""
+
+        self._log_order(row, side, intents)
+        self.status_var.set(
+            f"DRY-RUN: would place {len(intents)} {side} order(s) for "
+            f"{row.ticker} — see logs/orders.log{warn}")
+
+    def _log_order(self, row, side, intents, withdraw=False):
+        from core.calc import fmt_price
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        lines = [f"[{ts}] {ORDER_MODE} "
+                 + (f"WITHDRAW {side} orders for {row.ticker}"
+                    if withdraw else
+                    f"PLACE {side} ({len(intents)}) for {row.ticker}:")]
+        for it in intents:
+            lines.append(
+                f"    {it['side']} {it['label']}: {it['qty']} @ "
+                f"{fmt_price(it['price'], it['currency'])} {it['currency']} "
+                f"(LIMIT, DAY)")
+        try:
+            os.makedirs(os.path.dirname(_ORDERS_LOG), exist_ok=True)
+            with open(_ORDERS_LOG, 'a', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+        except OSError:
+            pass
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 

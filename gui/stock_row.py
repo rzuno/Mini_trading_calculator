@@ -47,7 +47,7 @@ class StockRow:
     """
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
-                 get_unit_cash, on_graph, on_compute=None):
+                 get_unit_cash, on_graph, on_compute=None, on_order=None):
         self.deployed       = deployed
         self.ticker         = pos['ticker']
         self.tier           = pos.get('tier', 'Major')
@@ -55,6 +55,7 @@ class StockRow:
         self.get_unit_cash  = get_unit_cash
         self.on_graph       = on_graph
         self._on_compute_cb = on_compute
+        self.on_order       = on_order
         self.current_price  = None
         self.peak_5d        = None
         self.volatility     = None
@@ -93,6 +94,10 @@ class StockRow:
             for i in range(3)]
 
         self.auto_var = tk.BooleanVar(value=bool(pos.get('auto_mode', True)))
+
+        # Order-button latches (deployed only). Ephemeral UI state — not saved.
+        self.buy_active  = tk.BooleanVar(value=False)
+        self.sell_active = tk.BooleanVar(value=False)
 
         # -- Output variables --------------------------------------------------
         self.current_var  = tk.StringVar(value='--')
@@ -163,7 +168,20 @@ class StockRow:
                  width=6, justify='right', font=_F_VAL
                  ).pack(side='left', padx=(2, 8))
 
-        if not self.deployed:
+        if self.deployed:
+            # Order toggles: latch on = "place" the ladder, latch off = withdraw.
+            self.buy_btn = tk.Checkbutton(
+                r0, text='Buy', variable=self.buy_active, indicatoron=False,
+                width=5, font=_F_BTN, bd=1, takefocus=0,
+                command=lambda: self._on_order_toggle('BUY'))
+            self.buy_btn.pack(side='left', padx=(4, 2))
+            self.sell_btn = tk.Checkbutton(
+                r0, text='Sell', variable=self.sell_active, indicatoron=False,
+                width=5, font=_F_BTN, bd=1, takefocus=0,
+                command=lambda: self._on_order_toggle('SELL'))
+            self.sell_btn.pack(side='left', padx=(0, 2))
+            self._color_order_btns()
+        else:
             tk.Label(r0, text='(fill & Save to deploy)', font=_F_SM,
                      fg='#AAA').pack(side='left', padx=(2, 0))
 
@@ -521,6 +539,51 @@ class StockRow:
 
     def set_row_num(self, n: int):
         self._name_lbl.config(text=f"{n}. {self._disp_name}")
+
+    # -- Order buttons (deployed only) ----------------------------------------
+
+    def _color_order_btns(self):
+        """Buy latches blue, Sell latches red when active; grey when off."""
+        if not self.deployed:
+            return
+        self.buy_btn.config(
+            bg=('#3366CC' if self.buy_active.get() else 'SystemButtonFace'),
+            fg=('white' if self.buy_active.get() else 'black'),
+            selectcolor='#3366CC')
+        self.sell_btn.config(
+            bg=('#CC3333' if self.sell_active.get() else 'SystemButtonFace'),
+            fg=('white' if self.sell_active.get() else 'black'),
+            selectcolor='#CC3333')
+
+    def _on_order_toggle(self, side: str):
+        self._color_order_btns()
+        if self.on_order:
+            active = (self.buy_active if side == 'BUY' else self.sell_active).get()
+            self.on_order(self, side, active)
+
+    def set_order_active(self, side: str, active: bool):
+        """Let the controller force a latch state (e.g. block a 0-share sell)."""
+        (self.buy_active if side == 'BUY' else self.sell_active).set(bool(active))
+        self._color_order_btns()
+
+    def order_intents(self, side: str) -> list:
+        """The orders this card's current ladder represents on the given side:
+        BUY = the 3 buy lines, SELL = the active sell tiers. Each is
+        {ticker, side, label, price, qty, currency}."""
+        lines = self._buy_lines if side == 'BUY' else self._sell_lines
+        out = []
+        for label, price, qty in lines:
+            if price is None or not qty:
+                continue
+            out.append({'ticker': self.ticker, 'side': side, 'label': label,
+                        'price': price, 'qty': int(qty), 'currency': self.currency})
+        return out
+
+    def current_shares(self) -> int:
+        try:
+            return int(self.shares_var.get().replace(',', '') or 0)
+        except ValueError:
+            return 0
 
     def set_army_pct(self, pct):
         self._army_pct = pct

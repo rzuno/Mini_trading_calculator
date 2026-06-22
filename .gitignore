@@ -17,6 +17,9 @@ docs_main_calculator/
 *.swp
 *.swo
 
+# Logs (order dry-run / api logs)
+logs/
+
 # OS
 Thumbs.db
 .DS_Store

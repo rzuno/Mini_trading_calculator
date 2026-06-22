@@ -84,6 +84,13 @@ def _to_float(x, default=None):
 class TossMarketProvider(MarketDataProvider):
     name = 'toss'
 
+    # Toss invalidates a client's previous token whenever a new one is issued,
+    # so ALL instances for a given client_id must share ONE token. (A second
+    # instance minting its own token — e.g. the Account Info reader — would
+    # otherwise 401 the main provider's next request.) Keyed by client_id.
+    _token_cache = {}            # client_id -> (token, expiry_epoch)
+    _token_lock = threading.Lock()
+
     def __init__(self, client_id: str, client_secret: str,
                  base: str = DEFAULT_BASE, fx_average_provider=None):
         if not client_id or not client_secret:
@@ -94,9 +101,6 @@ class TossMarketProvider(MarketDataProvider):
         self._client_secret = client_secret
         self.base = (base or DEFAULT_BASE).rstrip('/')
         self._fx_avg_provider = fx_average_provider
-        self._token = None
-        self._token_exp = 0.0
-        self._lock = threading.Lock()
 
     # -- Construction from environment ----------------------------------------
 
@@ -117,10 +121,14 @@ class TossMarketProvider(MarketDataProvider):
 
     # -- Auth ------------------------------------------------------------------
 
-    def _access_token(self) -> str:
-        with self._lock:
-            if self._token and time.time() < self._token_exp:
-                return self._token
+    def _access_token(self, force: bool = False) -> str:
+        """Return a shared access token for this client_id, minting a new one
+        only when missing/expired (or forced after a 401)."""
+        cid = self._client_id
+        with TossMarketProvider._token_lock:
+            tok, exp = TossMarketProvider._token_cache.get(cid, (None, 0.0))
+            if tok and not force and time.time() < exp:
+                return tok
             resp = requests.post(
                 f"{self.base}/oauth2/token",
                 data={'grant_type': 'client_credentials',
@@ -129,22 +137,24 @@ class TossMarketProvider(MarketDataProvider):
                 headers={'Content-Type': 'application/x-www-form-urlencoded'},
                 timeout=_TIMEOUT)
             resp.raise_for_status()
-            tok = resp.json()
-            self._token = tok['access_token']
+            data = resp.json()
+            token = data['access_token']
             # Refresh a minute early; default to 5 min if expires_in is absent.
-            self._token_exp = time.time() + int(tok.get('expires_in', 300)) - 60
-            return self._token
+            exp = time.time() + int(data.get('expires_in', 300)) - 60
+            TossMarketProvider._token_cache[cid] = (token, exp)
+            return token
 
     def _get(self, path: str, params: dict, account=None) -> dict:
-        """GET with bearer auth, retrying on HTTP 429 (rate limit) using the
-        Retry-After / X-RateLimit-Reset header when present, else a linear
-        backoff. Account-scoped reads pass the accountSeq via the
-        X-Tossinvest-Account header."""
-        headers = {'Authorization': f'Bearer {self._access_token()}'}
-        if account is not None:
-            headers['X-Tossinvest-Account'] = str(account)
+        """GET with bearer auth. Retries on HTTP 429 (rate limit) using the
+        Retry-After / X-RateLimit-Reset header (else linear backoff), and once
+        on 401 by re-minting the shared token. Account-scoped reads pass the
+        accountSeq via the X-Tossinvest-Account header."""
         last = None
+        tried_reauth = False
         for attempt in range(_MAX_RETRIES):
+            headers = {'Authorization': f'Bearer {self._access_token()}'}
+            if account is not None:
+                headers['X-Tossinvest-Account'] = str(account)
             resp = requests.get(
                 f"{self.base}{path}", params=params,
                 headers=headers, timeout=_TIMEOUT)
@@ -157,6 +167,10 @@ class TossMarketProvider(MarketDataProvider):
                 except (TypeError, ValueError):
                     wait = _BACKOFF * (attempt + 1)
                 time.sleep(min(wait, _BACKOFF_CAP))
+                continue
+            if resp.status_code == 401 and not tried_reauth:
+                tried_reauth = True
+                self._access_token(force=True)   # token stale → re-mint once
                 continue
             resp.raise_for_status()
             body = resp.json()
