@@ -1,4 +1,5 @@
 import tkinter as tk
+from tkinter import messagebox
 from core.calc import STOCK_NAMES, fmt_price, calc_volatility
 
 # ── Fonts (kept at 1.5× — user says graph fonts are fine) ───────────────────
@@ -27,8 +28,13 @@ class CandleChartWindow:
     def __init__(self, parent, ticker, ohlc_data, currency,
                  anchor_label='Avg', anchor_price=None,
                  buy_lines=None, sell_lines=None, current_price=None,
-                 ordered_lines=None):
+                 ordered_lines=None, order_actions=None):
         self.win = tk.Toplevel(parent)
+        self.ticker = ticker
+        # order_actions (Toss auto mode only): {ordered, pending, place, cancel,
+        # refresh, lock_gear}. When present, Order/Cancel buttons are shown.
+        self.order_actions = order_actions
+        self._ordered = bool(order_actions and order_actions.get('ordered'))
         name = STOCK_NAMES.get(ticker, ticker)
         suffix = '  (KR)' if ticker.endswith('.KS') else ''
         self.win.title(f"{name}{suffix} — 5-Day Chart")
@@ -91,10 +97,69 @@ class CandleChartWindow:
                            f"Range={pct:.1f}%"),
                      font=_F_DAY, fg=clr).pack(anchor='w')
 
+        # ── Order / Cancel bar (Toss auto mode only) ──────────────────────────
+        if self.order_actions:
+            bar = tk.Frame(self.win, padx=12, pady=4)
+            bar.pack(fill='x')
+            self._order_btn = tk.Button(bar, text='Order', font=_F_STAT,
+                                        width=10, command=self._do_order)
+            self._order_btn.pack(side='left', padx=(0, 6))
+            self._cancel_btn = tk.Button(bar, text='Cancel', font=_F_STAT,
+                                         width=10, command=self._do_cancel)
+            self._cancel_btn.pack(side='left', padx=(0, 12))
+            self._order_status = tk.Label(bar, text='', font=_F_REF, fg='#333')
+            self._order_status.pack(side='left')
+            self._update_order_buttons()
+
         # ── Canvas ────────────────────────────────────────────────────────────
         self.canvas = tk.Canvas(self.win, bg='white', highlightthickness=0)
         self.canvas.pack(fill='both', expand=True, padx=12, pady=(8, 12))
         self.canvas.bind('<Configure>', lambda e: self._draw())
+
+    # ── Order / Cancel handlers ───────────────────────────────────────────────
+    def _update_order_buttons(self):
+        self._order_btn.config(state='disabled' if self._ordered else 'normal')
+        self._cancel_btn.config(state='normal' if self._ordered else 'disabled')
+        self._order_status.config(
+            text=('● live orders resting — gear locked' if self._ordered
+                  else 'no live orders — projection shown'),
+            fg=('#0033AA' if self._ordered else '#666'))
+
+    def _do_order(self):
+        pend = self.order_actions.get('pending') or []
+        if not pend:
+            messagebox.showinfo('Order', 'No order lines to send.', parent=self.win)
+            return
+        body = '\n'.join(f"  {s}  {lbl}:  {q} @ {p}" for s, lbl, p, q in pend)
+        if not messagebox.askyesno(
+                'Confirm order',
+                f"Send these REAL orders to Toss?\n\n{body}\n\n"
+                "(They rest until filled or auto-cleared at session close.)",
+                parent=self.win):
+            return
+        ok, msg = self.order_actions['place']()
+        self._order_status.config(text=msg, fg=('green' if ok else 'red'))
+        if ok:
+            self._ordered = True
+            self.ordered_lines = self.order_actions['refresh']()
+            self.order_actions['lock_gear'](True)
+            self._update_order_buttons()
+            self._draw()
+
+    def _do_cancel(self):
+        if not messagebox.askyesno(
+                'Confirm cancel',
+                f"Cancel ALL live Toss orders for {self.ticker}?",
+                parent=self.win):
+            return
+        ok, msg = self.order_actions['cancel']()
+        self._order_status.config(text=msg, fg=('green' if ok else 'red'))
+        if ok:
+            self._ordered = False
+            self.ordered_lines = []
+            self.order_actions['lock_gear'](False)
+            self._update_order_buttons()
+            self._draw()
 
     # ─────────────────────────────────────────────────────────────────────────
     def _draw(self):
@@ -175,19 +240,20 @@ class CandleChartWindow:
                      f'{self.anchor_label}: {fmt_price(self.anchor_price, self.ccy)}',
                      width=2, dash=(2, 4))
 
-        # Buy ladder (projection, dotted)
-        for idx, (lbl, price, qty) in enumerate(self.buy_lines):
-            if is_ordered(price):
-                continue
-            clr = _BUY_COLORS[min(idx, len(_BUY_COLORS) - 1)]
-            qty_txt = f' ×{qty}' if qty else ''
-            ref_line(price, clr,
-                     f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
+        # BUY projection (dotted) — hidden once buys are live, so only the dashed
+        # ordered buy lines remain (no duplicates).
+        if not self._ordered:
+            for idx, (lbl, price, qty) in enumerate(self.buy_lines):
+                if is_ordered(price):
+                    continue
+                clr = _BUY_COLORS[min(idx, len(_BUY_COLORS) - 1)]
+                qty_txt = f' ×{qty}' if qty else ''
+                ref_line(price, clr,
+                         f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
 
-        # Sell tiers (projection, dotted)
+        # SELL projection (dotted) — always shown: sells aren't placed via API
+        # (they're set as web/app conditional sells), so they stay as reference.
         for idx, (lbl, price, qty) in enumerate(self.sell_lines):
-            if is_ordered(price):
-                continue
             clr = _SELL_COLORS[min(idx, len(_SELL_COLORS) - 1)]
             qty_txt = f' ×{qty}' if qty else ''
             ref_line(price, clr,

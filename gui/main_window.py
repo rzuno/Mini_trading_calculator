@@ -4,12 +4,9 @@ from tkinter import ttk
 import threading
 from datetime import datetime
 
-# Order execution mode. DRY_RUN = compute and log orders only, never call the
-# broker. (LIVE wiring comes in a later, confirmed step.)
-ORDER_MODE = 'DRY_RUN'
-_ORDERS_LOG = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'logs', 'orders.log')
+# Order execution mode. LIVE = the graph Order/Cancel buttons place/cancel real
+# Toss orders (behind a confirmation dialog). Set to 'DRY_RUN' to disable.
+ORDER_MODE = 'LIVE'
 
 # Hardcoded remnant held at the KB broker — shown only in the KB popup and added
 # to the full army size. Vanishes later when merged into Toss (then it adds 0
@@ -19,10 +16,10 @@ KB_HOLDINGS = [
     {'ticker': 'NVDA',  'shares': 7,  'avg': 207.49},
     {'ticker': 'MSFT',  'shares': 15, 'avg': 390.69},
 ]
-# Hidden from the main cards in Toss(auto) mode (KB-only). MSFT is NOT here
-# because it is also held in Toss, so it shows as a Toss deployed card while its
-# KB lot still appears in the KB popup.
-KB_ONLY_TICKERS = {'GOOGL', 'NVDA'}
+# Tickers to hide from the main cards in Toss(auto) mode. Empty now: GOOGL and
+# NVDA are shown as (empty) Toss cards so they can be traded in Toss
+# independently of the KB lot, which still appears in the KB popup.
+KB_ONLY_TICKERS = set()
 
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
@@ -624,7 +621,6 @@ class App:
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph,
                 on_compute=self._on_row_compute,
-                on_order=self._on_row_order,
                 editable=not self._auto)
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=2)
@@ -686,6 +682,10 @@ class App:
         for row in self.deployed_rows + self.empty_rows:
             if row.ticker == ticker:
                 cd = row.chart_data()
+                # Order/Cancel only in Toss(auto) mode and when ORDER_MODE=LIVE.
+                actions = None
+                if self._auto and ORDER_MODE == 'LIVE':
+                    actions = self._build_order_actions(row, ordered)
                 CandleChartWindow(
                     self.root, ticker, ohlc, ccy,
                     anchor_label=cd['anchor_label'],
@@ -693,12 +693,104 @@ class App:
                     buy_lines=cd['buy_lines'],
                     sell_lines=cd['sell_lines'],
                     current_price=current_price,
-                    ordered_lines=ordered)
+                    ordered_lines=ordered,
+                    order_actions=actions)
                 return
 
         # Fallback (ticker has no row yet)
         CandleChartWindow(self.root, ticker, ohlc, ccy,
                           current_price=current_price, ordered_lines=ordered)
+
+    # ── Live order placement from the graph ─────────────────────────────────────
+
+    def _row_intents(self, row):
+        """Orders this card places: the BUY ladder only. Toss forbids a buy and
+        a sell resting on the same stock at once (opposite-pending), so sells are
+        left to the web/app conditional-sell feature; the API handles buys."""
+        return list(row.order_intents('BUY'))
+
+    def _build_order_actions(self, row, ordered):
+        from core.calc import fmt_order_price
+        pending = [(it['side'], it['label'],
+                    fmt_order_price(it['ticker'], it['price']), it['qty'])
+                   for it in self._row_intents(row)]
+        return {
+            'ordered':   bool(ordered),
+            'pending':   pending,
+            'place':     lambda r=row: self._graph_place(r),
+            'cancel':    lambda t=row.ticker: self._graph_cancel(t),
+            'refresh':   lambda t=row.ticker: self._toss_open_order_lines(t),
+            'lock_gear': lambda b, r=row: r.set_gear_locked(b),
+        }
+
+    def _account_seq(self, prov):
+        if self._toss_acct_seq is None:
+            accts = prov.get_accounts()
+            if not accts:
+                return None
+            self._toss_acct_seq = accts[0]['accountSeq']
+        return self._toss_acct_seq
+
+    def _graph_place(self, row):
+        """Place the card's ladder as real Toss LIMIT/DAY orders. Returns
+        (ok, message). Per-order errors (e.g. opposite-pending for a deployed
+        buy+sell, or market-closed) are reported, not pre-guarded."""
+        from core.calc import fmt_order_price
+        prov = self._toss_provider()
+        if prov is None:
+            return False, 'Toss unavailable'
+        try:
+            seq = self._account_seq(prov)
+        except Exception as e:
+            return False, f'Account error: {e}'
+        if not seq:
+            return False, 'No Toss account'
+
+        intents = self._row_intents(row)
+        if not intents:
+            return False, 'No order lines'
+
+        ok_n, errs = 0, []
+        for it in intents:
+            price = fmt_order_price(it['ticker'], it['price'])
+            coid = f"g-{it['ticker']}-{it['side']}-{it['label']}".replace(' ', '')[:36]
+            try:
+                status, body = prov.place_limit_order(
+                    it['ticker'], it['side'], price, it['qty'], seq,
+                    client_order_id=coid)
+            except Exception as e:
+                errs.append(f"{it['label']}:{type(e).__name__}")
+                continue
+            if status == 200 and (body.get('result') or {}).get('orderId'):
+                ok_n += 1
+            else:
+                code = (body.get('error') or {}).get('code') or status
+                errs.append(f"{it['label']}:{code}")
+
+        msg = f"Placed {ok_n}/{len(intents)}"
+        if errs:
+            msg += "  (" + "; ".join(errs[:4]) + ")"
+        self.status_var.set(msg)
+        return ok_n > 0, msg
+
+    def _graph_cancel(self, ticker):
+        """Cancel every live Toss order for a ticker. Returns (ok, message)."""
+        prov = self._toss_provider()
+        if prov is None:
+            return False, 'Toss unavailable'
+        try:
+            seq = self._account_seq(prov)
+            orders = prov.get_open_orders(seq, ticker)
+            n = 0
+            for o in orders:
+                st, _ = prov.cancel_order(o['orderId'], seq)
+                if st == 200:
+                    n += 1
+            msg = f"Cancelled {n}/{len(orders)} for {ticker}"
+            self.status_var.set(msg)
+            return True, msg
+        except Exception as e:
+            return False, f'Cancel error: {e}'
 
     def _toss_provider(self):
         """A Toss provider for account/order reads (reuses the active provider
@@ -746,57 +838,6 @@ class App:
         """Called when any deployed row recomputes — update army% across all."""
         if self._fx_rate:
             self._update_army(self._fx_rate)
-
-    # ── Orders (DRY-RUN: compute + log only, no broker calls) ───────────────────
-
-    def _on_row_order(self, row, side, active):
-        """Handle a [Buy]/[Sell] latch on a deployed card. In DRY_RUN we only
-        log the orders/cancels that WOULD be sent — nothing reaches Toss."""
-        if not active:
-            self._log_order(row, side, [], withdraw=True)
-            self.status_var.set(
-                f"DRY-RUN: withdraw {side} orders for {row.ticker} (logged)")
-            return
-
-        if side == 'SELL' and row.current_shares() <= 0:
-            self.status_var.set(f"{row.ticker}: no shares to sell — blocked")
-            row.set_order_active('SELL', False)
-            return
-
-        intents = row.order_intents(side)
-        if not intents:
-            self.status_var.set(f"{row.ticker}: no {side} lines to place")
-            row.set_order_active(side, False)
-            return
-
-        # Toss rejects a buy and a sell pending on the same stock at once.
-        opp = 'SELL' if side == 'BUY' else 'BUY'
-        opp_active = (row.sell_active if side == 'BUY' else row.buy_active).get()
-        warn = "  [warn: opposite-side latch also on — Toss would reject]" if opp_active else ""
-
-        self._log_order(row, side, intents)
-        self.status_var.set(
-            f"DRY-RUN: would place {len(intents)} {side} order(s) for "
-            f"{row.ticker} — see logs/orders.log{warn}")
-
-    def _log_order(self, row, side, intents, withdraw=False):
-        from core.calc import fmt_price
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        lines = [f"[{ts}] {ORDER_MODE} "
-                 + (f"WITHDRAW {side} orders for {row.ticker}"
-                    if withdraw else
-                    f"PLACE {side} ({len(intents)}) for {row.ticker}:")]
-        for it in intents:
-            lines.append(
-                f"    {it['side']} {it['label']}: {it['qty']} @ "
-                f"{fmt_price(it['price'], it['currency'])} {it['currency']} "
-                f"(LIMIT, DAY)")
-        try:
-            os.makedirs(os.path.dirname(_ORDERS_LOG), exist_ok=True)
-            with open(_ORDERS_LOG, 'a', encoding='utf-8') as f:
-                f.write('\n'.join(lines) + '\n')
-        except OSError:
-            pass
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 

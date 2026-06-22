@@ -194,6 +194,31 @@ def fmt_price(price, currency: str) -> str:
     return f"{price:,.2f}"
 
 
+# ── KR order tick grid ───────────────────────────────────────────────────────
+def kr_tick_size(price: float) -> int:
+    """KRX/NXT price tick by band; a KR limit price must be a multiple of this."""
+    if price < 2000:     return 1
+    if price < 5000:     return 5
+    if price < 20000:    return 10
+    if price < 50000:    return 50
+    if price < 200000:   return 100
+    if price < 500000:   return 500
+    return 1000
+
+
+def round_kr_tick(price: float) -> int:
+    t = kr_tick_size(price)
+    return int(round(price / t) * t)
+
+
+def fmt_order_price(ticker: str, price: float) -> str:
+    """Format a limit price for the order API: KR snapped to its tick grid (int),
+    US to 2 decimals (>= $1) or 4 decimals (< $1)."""
+    if ticker.endswith('.KS'):
+        return str(round_kr_tick(price))
+    return f"{price:.2f}" if price >= 1 else f"{price:.4f}"
+
+
 # ── Buy (rescue) calculations ────────────────────────────────────────────────
 def calc_buy_trigger(avg_cost: float, drop_pct: int) -> float:
     return avg_cost * (1.0 - drop_pct / 100.0)

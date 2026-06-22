@@ -47,17 +47,16 @@ class StockRow:
     """
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
-                 get_unit_cash, on_graph, on_compute=None, on_order=None,
-                 editable=True):
+                 get_unit_cash, on_graph, on_compute=None, editable=True):
         self.deployed       = deployed
         self.editable       = editable
+        self._order_locked  = False   # True while live orders rest (gear frozen)
         self.ticker         = pos['ticker']
         self.tier           = pos.get('tier', 'Major')
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.get_unit_cash  = get_unit_cash
         self.on_graph       = on_graph
         self._on_compute_cb = on_compute
-        self.on_order       = on_order
         self.current_price  = None
         self.peak_5d        = None
         self.volatility     = None
@@ -96,10 +95,6 @@ class StockRow:
             for i in range(3)]
 
         self.auto_var = tk.BooleanVar(value=bool(pos.get('auto_mode', True)))
-
-        # Order-button latches (deployed only). Ephemeral UI state — not saved.
-        self.buy_active  = tk.BooleanVar(value=False)
-        self.sell_active = tk.BooleanVar(value=False)
 
         # -- Output variables --------------------------------------------------
         self.current_var  = tk.StringVar(value='--')
@@ -172,20 +167,7 @@ class StockRow:
                  width=6, justify='right', font=_F_VAL, state=ent_state
                  ).pack(side='left', padx=(2, 8))
 
-        if self.deployed:
-            # Order toggles: latch on = "place" the ladder, latch off = withdraw.
-            self.buy_btn = tk.Checkbutton(
-                r0, text='Buy', variable=self.buy_active, indicatoron=False,
-                width=5, font=_F_BTN, bd=1, takefocus=0,
-                command=lambda: self._on_order_toggle('BUY'))
-            self.buy_btn.pack(side='left', padx=(4, 2))
-            self.sell_btn = tk.Checkbutton(
-                r0, text='Sell', variable=self.sell_active, indicatoron=False,
-                width=5, font=_F_BTN, bd=1, takefocus=0,
-                command=lambda: self._on_order_toggle('SELL'))
-            self.sell_btn.pack(side='left', padx=(0, 2))
-            self._color_order_btns()
-        elif self.editable:
+        if not self.deployed and self.editable:
             tk.Label(r0, text='(fill & Save to deploy)', font=_F_SM,
                      fg='#AAA').pack(side='left', padx=(2, 0))
 
@@ -286,12 +268,15 @@ class StockRow:
                                             font=_F_SM, fg='#888')
         self._gear_title['sell'].grid(row=0, column=0, columnspan=3, sticky='w')
         self._steppers = [None, None, None]
+        self._tier_checks = [None, None, None]
         for disp, ti in enumerate([2, 1, 0]):
             grow = disp + 1
             tk.Label(sell_box, text=f'T{ti+1}', font=_F_SM
                      ).grid(row=grow, column=0, sticky='e', padx=(0, 1))
-            tk.Checkbutton(sell_box, variable=self.t_active[ti], takefocus=0,
-                           bd=0, pady=0).grid(row=grow, column=1)
+            chk = tk.Checkbutton(sell_box, variable=self.t_active[ti],
+                                 takefocus=0, bd=0, pady=0)
+            chk.grid(row=grow, column=1)
+            self._tier_checks[ti] = chk
             step = Stepper(sell_box, self.t_pct[ti], 1, 20,
                            entry_width=3, value_font=_F_SM, btn_font=_F_SM)
             step.grid(row=grow, column=2, sticky='w')
@@ -350,7 +335,10 @@ class StockRow:
     def _apply_auto(self):
         """In auto mode, drive every gear from the 5-day volatility (the load
         gear too, so it is correct whether the card is empty now or later
-        demotes back to empty)."""
+        demotes back to empty). Frozen while orders rest so the ordered gear
+        can't be overwritten."""
+        if self._order_locked:
+            return
         if self.auto_var.get() and self.volatility is not None:
             g = auto_gear_params(self.volatility)
             if self._get_load_pct() != g['load_pct']:
@@ -363,7 +351,32 @@ class StockRow:
 
     # ── Gear styling (enabled + state muting) ─────────────────────────────────
 
+    def set_gear_locked(self, locked: bool):
+        """Freeze (or release) every gear control while live orders rest."""
+        self._order_locked = bool(locked)
+        self._refresh_gear_styles()
+
     def _refresh_gear_styles(self):
+        # While orders are live the projection must not move: lock everything.
+        if self._order_locked:
+            self.auto_btn.config(state='disabled')   # can't flip AUTO/MANUAL
+            self.load_step.set_enabled(False)
+            for rb in self._buy_radios.values():
+                rb.config(state='disabled')
+            for s in self._steppers:
+                s.set_enabled(False)
+            for ch in self._tier_checks:
+                if ch:
+                    ch.config(state='disabled')
+            for key in ('load', 'buy', 'sell'):
+                self._gear_title[key].config(fg=_MUTE_TITLE)
+            return
+
+        self.auto_btn.config(state='normal')
+        for ch in self._tier_checks:
+            if ch:
+                ch.config(state='normal')
+
         auto = self.auto_var.get()
 
         # Load gear: only active for empty stocks; greyed/disabled when deployed.
@@ -434,6 +447,8 @@ class StockRow:
             self._computing = False
 
     def _enforce_order(self):
+        if self._order_locked:
+            return
         try:
             p = [self.t_pct[i].get() for i in range(3)]
         except Exception:
@@ -544,31 +559,7 @@ class StockRow:
     def set_row_num(self, n: int):
         self._name_lbl.config(text=f"{n}. {self._disp_name}")
 
-    # -- Order buttons (deployed only) ----------------------------------------
-
-    def _color_order_btns(self):
-        """Buy latches blue, Sell latches red when active; grey when off."""
-        if not self.deployed:
-            return
-        self.buy_btn.config(
-            bg=('#3366CC' if self.buy_active.get() else 'SystemButtonFace'),
-            fg=('white' if self.buy_active.get() else 'black'),
-            selectcolor='#3366CC')
-        self.sell_btn.config(
-            bg=('#CC3333' if self.sell_active.get() else 'SystemButtonFace'),
-            fg=('white' if self.sell_active.get() else 'black'),
-            selectcolor='#CC3333')
-
-    def _on_order_toggle(self, side: str):
-        self._color_order_btns()
-        if self.on_order:
-            active = (self.buy_active if side == 'BUY' else self.sell_active).get()
-            self.on_order(self, side, active)
-
-    def set_order_active(self, side: str, active: bool):
-        """Let the controller force a latch state (e.g. block a 0-share sell)."""
-        (self.buy_active if side == 'BUY' else self.sell_active).set(bool(active))
-        self._color_order_btns()
+    # -- Order intents (used by the graph order/cancel flow) ------------------
 
     def order_intents(self, side: str) -> list:
         """The orders this card's current ladder represents on the given side:
