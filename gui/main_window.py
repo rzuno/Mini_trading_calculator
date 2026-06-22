@@ -572,14 +572,15 @@ class App:
 
     def _reorder_cards(self):
         """Re-sort + re-grid all cards once fresh data is in: deployed by size
-        (FX-normalized, only when FX known); empty by gap to the load trigger —
-        smallest gap first (closest to the bait); a stock that has jumped far
-        above its load (big gap) sinks to the bottom."""
+        (FX-normalized, only when FX known); empty by gap to the load trigger.
+        The gap is negative (load below the live price), so the least-negative
+        (or positive — already at/below the bait) sit on top as the closest to a
+        buy; the deepest-blue (farthest below) sink to the bottom."""
         if self._fx_rate:
             self.deployed_rows.sort(
                 key=lambda r: self._norm_krw(_cb(r), r.currency), reverse=True)
         self.empty_rows.sort(
-            key=lambda r: (r._gap if r._gap is not None else float('inf'),
+            key=lambda r: (-r._gap if r._gap is not None else float('inf'),
                            stock_sort_key(r.ticker)))
         self._grid_all_cards()
 

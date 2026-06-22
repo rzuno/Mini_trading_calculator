@@ -541,11 +541,11 @@ class StockRow:
             if self.deployed:
                 gap = calc_gap_rate(self.current_price, anchor_price)  # vs avg
             else:
-                # vs the load trigger, measured as a fraction of the 5-day high so
-                # the magnitude matches the load gear: at current==high the gap is
-                # exactly the gear % (e.g. 8%, not 8.70%).
-                denom = self.peak_5d or anchor_price
-                gap = (self.current_price - anchor_price) / denom * 100.0
+                # Load relative to the current price (the origin): negative = the
+                # load sits n% below the live price, matching the load gear
+                # (at current==high it equals -gear, e.g. -8%). More negative
+                # (deeper blue) = farther below = less likely to be hit soon.
+                gap = (anchor_price - self.current_price) / self.current_price * 100.0
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
             self.gap_lbl.config(fg=gap_color(gap))
