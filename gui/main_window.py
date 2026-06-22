@@ -137,7 +137,6 @@ class App:
         # the cursor is over the bare canvas / scrollbar).
         self.root.bind_all('<MouseWheel>', self._mwheel)
 
-        self._build_footer()
         self._rebuild_sections()
 
         # Auto-derive USD when KRW changes (header only)
@@ -208,11 +207,16 @@ class App:
             tk.Label(win, text='No FX data yet — refresh first.',
                      font=_F_HDR).pack(padx=20, pady=20)
             return
-        head = f"FX Rate: {rate:,.2f}"
-        if avg:
-            head += f"      3-Month Avg: {avg:,.0f}"
-        tk.Label(win, text=head, font=_F_HDR_B).pack(anchor='w', padx=12,
-                                                     pady=(10, 2))
+        head = tk.Frame(win)
+        head.pack(anchor='w', padx=12, pady=(10, 2))
+        tk.Label(head, text=f"FX Rate: {rate:,.2f}",
+                 font=_F_HDR_B).pack(side='left')
+        if avg and avg > 0:
+            pct = (rate - avg) / avg * 100.0
+            tk.Label(head, text=f"({pct:+.1f}%)", font=_F_HDR_B,
+                     fg=fx_dev_color(pct)).pack(side='left', padx=(6, 12))
+            tk.Label(head, text=f"3-Month Avg: {avg:,.0f}",
+                     font=_F_HDR_B).pack(side='left')
         if not (avg and avg > 0):
             tk.Label(win, text='(3-month average unavailable)',
                      fg='#888').pack(anchor='w', padx=12)
@@ -365,7 +369,7 @@ class App:
         self._fx_pct_lbl = tk.Label(f, textvariable=self.fx_pct_var,
                                     font=_F_HDR_B, width=8, anchor='w')
         self._fx_pct_lbl.grid(row=0, column=c, padx=(0, 2)); c += 1
-        tk.Button(f, text='FX ▸', font=_F_SM, command=self._show_fx_detail
+        tk.Button(f, text='FX status', font=_F_SM, command=self._show_fx_detail
                   ).grid(row=0, column=c, padx=(0, 4)); c += 1
 
         # Data mode: Toss (auto) = numbers from the Toss account, read-only
@@ -387,10 +391,25 @@ class App:
         tk.Button(f, text='KB acct', font=_F_HDR, command=self._on_kb_info
                   ).grid(row=0, column=c, padx=(8, 2)); c += 1
 
-        # Second header row: cash + deployed/reserve/total-units banner.
-        tk.Label(f, textvariable=self.banner_var, font=_F_SEC_INFO, fg='#333',
-                 anchor='w').grid(row=1, column=0, columnspan=c, sticky='w',
-                                  padx=(12, 2), pady=(4, 0))
+        # Save & Refresh pinned to the top-right corner (spacer column expands).
+        f.grid_columnconfigure(c, weight=1)
+        tk.Button(f, text='Save & Refresh', command=self._on_save_refresh,
+                  width=16, font=_F_BTN).grid(row=0, column=c + 1, sticky='e',
+                                              padx=(8, 2))
+        span = c + 2
+
+        # Second header row: cash/army banner (left) + last-refresh & status
+        # (right). Replaces the bottom footer so all 16 cards fit without scroll.
+        info = tk.Frame(f)
+        info.grid(row=1, column=0, columnspan=span, sticky='ew', pady=(4, 0))
+        tk.Label(info, textvariable=self.banner_var, font=_F_SEC_INFO,
+                 fg='#333', anchor='w').pack(side='left', padx=(12, 2))
+        tk.Label(info, textvariable=self.status_var, font=_F_SM, anchor='e'
+                 ).pack(side='right', padx=(6, 2))
+        tk.Label(info, textvariable=self.last_refresh_var, font=_F_SM
+                 ).pack(side='right')
+        tk.Label(info, text='Last:', font=_F_SM, fg='#888'
+                 ).pack(side='right', padx=(0, 2))
         self._apply_mode_ui()
 
     def _mode_label(self):
@@ -551,12 +570,15 @@ class App:
 
     def _reorder_cards(self):
         """Re-sort + re-grid all cards once fresh data is in: deployed by size
-        (FX-normalized, only when FX known), empty by volatility."""
+        (FX-normalized, only when FX known); empty by gap to the load trigger —
+        smallest gap first (closest to the bait); a stock that has jumped far
+        above its load (big gap) sinks to the bottom."""
         if self._fx_rate:
             self.deployed_rows.sort(
                 key=lambda r: self._norm_krw(_cb(r), r.currency), reverse=True)
         self.empty_rows.sort(
-            key=lambda r: self._vol_order_key(r.ticker, r.volatility))
+            key=lambda r: (r._gap if r._gap is not None else float('inf'),
+                           stock_sort_key(r.ticker)))
         self._grid_all_cards()
 
     # ── Deployed section ─────────────────────────────────────────────────────
@@ -598,18 +620,6 @@ class App:
     # ── Empty section ────────────────────────────────────────────────────────
 
     # ── Footer ───────────────────────────────────────────────────────────────
-
-    def _build_footer(self):
-        f = tk.Frame(self.root, bd=1, relief='ridge', padx=10, pady=6)
-        f.pack(fill='x', padx=5, pady=(2, 5), side='bottom')
-        tk.Button(f, text='Save & Refresh', command=self._on_save_refresh,
-                  width=16, font=_F_BTN).pack(side='left', padx=4)
-        tk.Label(f, text='Last Refresh:', font=_F_SM,
-                 fg='#888').pack(side='left', padx=(16, 2))
-        tk.Label(f, textvariable=self.last_refresh_var, font=_F_SM
-                 ).pack(side='left', padx=(0, 16))
-        tk.Label(f, textvariable=self.status_var, font=_F_SM,
-                 anchor='w').pack(side='left', padx=4)
 
     # ── Graph ────────────────────────────────────────────────────────────────
 

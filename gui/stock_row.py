@@ -61,6 +61,7 @@ class StockRow:
         self.peak_5d        = None
         self.volatility     = None
         self._army_pct      = None
+        self._gap           = None    # current vs anchor (load) %, for ordering
         self._computing     = False
 
         # Chart data (filled by compute; safe defaults so a graph before the
@@ -518,9 +519,11 @@ class StockRow:
 
         if self.current_price and anchor_price:
             gap = calc_gap_rate(self.current_price, anchor_price)
+            self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
             self.gap_lbl.config(fg=gap_color(gap))
         else:
+            self._gap = None
             self.gap_var.set('--')
             self.gap_lbl.config(fg='black')
 
