@@ -79,6 +79,7 @@ class App:
                 't1_active', 't2_active', 't3_active', 'auto_mode')}
             for p in self.positions}
         self._last_account = None
+        self._last_open_orders = []
 
         # Sort positions in fixed order on load
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
@@ -678,7 +679,7 @@ class App:
             'place_sell':   lambda r=row: self._graph_place(r, 'SELL'),
             'cancel':       lambda t=row.ticker: self._graph_cancel(t),
             'refresh':      lambda t=row.ticker: self._toss_open_order_lines(t),
-            'lock_gear':    lambda b, r=row: r.set_gear_locked(b),
+            'set_state':    lambda side, r=row: r.set_order_state(side),
         }
 
     def _account_seq(self, prov):
@@ -851,8 +852,21 @@ class App:
 
     def _reapply(self):
         if self._last_data:
-            self._apply_live(self._last_data, self._fx_rate,
-                             self._fx_avg_3m, self._last_account, quiet=True)
+            self._apply_live(self._last_data, self._fx_rate, self._fx_avg_3m,
+                             self._last_account, self._last_open_orders,
+                             quiet=True)
+
+    def _apply_order_states(self):
+        """Tag each card with its live Toss order side (BUY/SELL/None) so the
+        title shows 'buy/sell ordered' and the gear locks — even for orders
+        placed in the web. A stock can't have both sides pending."""
+        by_ticker = {}
+        for o in (self._last_open_orders or []):
+            sym = o.get('symbol') or ''
+            ticker = (sym + '.KS') if sym.isdigit() else sym
+            by_ticker.setdefault(ticker, o.get('side'))
+        for row in self.deployed_rows + self.empty_rows:
+            row.set_order_state(by_ticker.get(row.ticker))
 
     # ── Live data ────────────────────────────────────────────────────────────
 
@@ -864,16 +878,21 @@ class App:
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f'Error: {e}'))
             return
-        # In Toss(auto) mode also read the account (holdings + cash) so the
-        # cards and army size come straight from the broker.
-        account = None
+        # In Toss(auto) mode also read the account (holdings + cash) and the
+        # live open orders so the cards/army size and the order-state tags come
+        # straight from the broker.
+        account, open_orders = None, []
         if self._auto:
             try:
                 prov = self._toss_provider()
-                account = prov.account_snapshot() if prov else None
+                if prov:
+                    account = prov.account_snapshot()
+                    seq = self._account_seq(prov)
+                    open_orders = prov.get_open_orders(seq) if seq else []
             except Exception:
-                account = None
-        self.root.after(0, self._apply_live, data, fx, fx_avg, account)
+                account, open_orders = None, []
+        self.root.after(0, self._apply_live, data, fx, fx_avg, account,
+                        open_orders)
 
     def _reconcile_from_toss(self, account):
         """Overlay Toss holdings onto the catalogue: held tickers become
@@ -893,12 +912,15 @@ class App:
                 pos['avg_cost'] = 0.0
                 pos['cost_basis'] = 0.0
 
-    def _apply_live(self, data, fx_rate, fx_avg=None, account=None, quiet=False):
+    def _apply_live(self, data, fx_rate, fx_avg=None, account=None,
+                    open_orders=None, quiet=False):
         self._last_data = data
         self._fx_rate   = fx_rate
         self._fx_avg_3m = fx_avg
         if account is not None:
             self._last_account = account
+        if open_orders is not None:
+            self._last_open_orders = open_orders
 
         for t, d in data.items():
             if d.get('price'):      self._current_prices[t] = d['price']
@@ -929,6 +951,9 @@ class App:
 
         # Re-order all cards now that fresh data is known.
         self._reorder_cards()
+
+        # Tag each card with its live order side (and lock the gear) from Toss.
+        self._apply_order_states()
 
         self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)

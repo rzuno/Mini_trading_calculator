@@ -160,7 +160,7 @@ class CandleChartWindow:
             self._ordered_side = side
             self._ordered = True
             self.ordered_lines = self.order_actions['refresh']()
-            self.order_actions['lock_gear'](True)
+            self.order_actions['set_state'](side)
             self._update_order_buttons()
             self._draw()
 
@@ -176,7 +176,7 @@ class CandleChartWindow:
             self._ordered_side = None
             self._ordered = False
             self.ordered_lines = []
-            self.order_actions['lock_gear'](False)
+            self.order_actions['set_state'](None)
             self._update_order_buttons()
             self._draw()
 

@@ -141,9 +141,14 @@ class StockRow:
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
 
+        # Right side: "[DEPLOYED] [- buy/sell ordered]". The order-state label is
+        # set by set_order_state from live Toss orders. Pack order-state first so
+        # it sits to the right of DEPLOYED.
+        self._order_state_lbl = tk.Label(r0, text='', font=_F_SM_B)
+        self._order_state_lbl.pack(side='right', padx=(4, 2))
         if self.deployed:
             tk.Label(r0, text='DEPLOYED', font=_F_SM_B, fg='#0033AA'
-                     ).pack(side='right', padx=(4, 2))
+                     ).pack(side='right', padx=(4, 0))
 
         # Army % (deployed only)
         tk.Label(r0, textvariable=self.army_pct_var,
@@ -362,6 +367,21 @@ class StockRow:
         self._order_locked = bool(locked)
         self._refresh_gear_styles()
 
+    def set_order_state(self, side):
+        """Reflect live Toss orders on the title: '- buy ordered' (red) /
+        '- sell ordered' (blue) for deployed; 'buy ordered' (red) for empty;
+        blank when none. Also locks the gear while an order rests."""
+        if side == 'BUY':
+            txt = '- buy ordered' if self.deployed else 'buy ordered'
+            self._order_state_lbl.config(text=txt, fg='#CC0000')
+        elif side == 'SELL':
+            self._order_state_lbl.config(
+                text='- sell ordered' if self.deployed else 'sell ordered',
+                fg='#0033AA')
+        else:
+            self._order_state_lbl.config(text='')
+        self.set_gear_locked(side is not None)
+
     def _refresh_gear_styles(self):
         # While orders are live the projection must not move: lock everything.
         if self._order_locked:
@@ -518,7 +538,14 @@ class StockRow:
             self.current_var.set('--')
 
         if self.current_price and anchor_price:
-            gap = calc_gap_rate(self.current_price, anchor_price)
+            if self.deployed:
+                gap = calc_gap_rate(self.current_price, anchor_price)  # vs avg
+            else:
+                # vs the load trigger, measured as a fraction of the 5-day high so
+                # the magnitude matches the load gear: at current==high the gap is
+                # exactly the gear % (e.g. 8%, not 8.70%).
+                denom = self.peak_5d or anchor_price
+                gap = (self.current_price - anchor_price) / denom * 100.0
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
             self.gap_lbl.config(fg=gap_color(gap))
