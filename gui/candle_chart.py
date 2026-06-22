@@ -26,7 +26,8 @@ class CandleChartWindow:
 
     def __init__(self, parent, ticker, ohlc_data, currency,
                  anchor_label='Avg', anchor_price=None,
-                 buy_lines=None, sell_lines=None, current_price=None):
+                 buy_lines=None, sell_lines=None, current_price=None,
+                 ordered_lines=None):
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
         suffix = '  (KR)' if ticker.endswith('.KS') else ''
@@ -37,10 +38,15 @@ class CandleChartWindow:
         self.ccy           = currency
         self.anchor_label  = anchor_label
         self.anchor_price  = anchor_price
-        # buy_lines / sell_lines: list of (label, price, qty); price may be None
+        # buy_lines / sell_lines: list of (label, price, qty); price may be None.
+        # These are PROJECTIONS (drawn dotted).
         self.buy_lines     = [b for b in (buy_lines or []) if b[1] is not None]
         self.sell_lines    = [s for s in (sell_lines or []) if s[1] is not None]
         self.current_price = current_price
+        # ordered_lines: real working orders on Toss, drawn DASHED:
+        # list of {side, price, qty, status}.
+        self.ordered_lines = [o for o in (ordered_lines or [])
+                              if o.get('price')]
 
         if not ohlc_data:
             tk.Label(self.win, text="No data available",
@@ -56,12 +62,19 @@ class CandleChartWindow:
         min_low  = min(d['low']  for d in ohlc_data)
         vol = calc_volatility(max_high, min_low) or 0
 
-        tk.Label(stats, text=name, font=_F_TITLE).pack(anchor='w')
+        title = name + ("   ● ordered on Toss" if self.ordered_lines else "")
+        tk.Label(stats, text=title, font=_F_TITLE,
+                 fg=('#0033AA' if self.ordered_lines else 'black')).pack(anchor='w')
         tk.Label(stats,
                  text=f"5-Day High: {fmt_price(max_high, currency)}    "
                       f"5-Day Low: {fmt_price(min_low, currency)}    "
                       f"Volatility: {vol:.2f}%",
                  font=_F_STAT).pack(anchor='w', pady=(4, 2))
+        if self.ordered_lines:
+            tk.Label(
+                stats,
+                text="Legend:  ···· projection      ──── ordered (live on Toss)",
+                font=_F_REF, fg='#666').pack(anchor='w')
 
         # ── Per-day detail ────────────────────────────────────────────────────
         day_frame = tk.Frame(self.win, padx=12)
@@ -109,6 +122,8 @@ class CandleChartWindow:
             prices.append(p)
         for _, p, _ in self.sell_lines:
             prices.append(p)
+        for o in self.ordered_lines:
+            prices.append(o['price'])
 
         p_min, p_max = min(prices), max(prices)
         p_range = (p_max - p_min) or 1
@@ -139,32 +154,56 @@ class CandleChartWindow:
                           anchor='e', font=_F_AXIS, fill='#888')
 
         # ── Reference lines (labels on the right) ─────────────────────────────
-        def ref_line(price, color, text, width=1.5, dash=(4, 3)):
+        def ref_line(price, color, text, width=1.5, dash=(2, 4)):
             y = y_of(price)
             c.create_line(left_pad, y, left_pad + chart_w, y,
                           fill=color, dash=dash, width=width)
             c.create_text(label_x, y, text=text, anchor='w',
                           font=_F_REF, fill=color)
 
-        # Anchor (avg cost / load price)
+        # Prices that already have a live order — projection lines at (about)
+        # the same price are suppressed so only the solid "ordered" line shows.
+        ordered_prices = [o['price'] for o in self.ordered_lines]
+
+        def is_ordered(price):
+            return any(abs(price - op) <= max(op * 0.0005, 0.01)
+                       for op in ordered_prices)
+
+        # Anchor (avg cost / load price) — dotted projection
         if self.anchor_price:
             ref_line(self.anchor_price, _ANCHOR_CLR,
                      f'{self.anchor_label}: {fmt_price(self.anchor_price, self.ccy)}',
-                     width=2, dash=(8, 4))
+                     width=2, dash=(2, 4))
 
-        # Buy ladder
+        # Buy ladder (projection, dotted)
         for idx, (lbl, price, qty) in enumerate(self.buy_lines):
+            if is_ordered(price):
+                continue
             clr = _BUY_COLORS[min(idx, len(_BUY_COLORS) - 1)]
             qty_txt = f' ×{qty}' if qty else ''
             ref_line(price, clr,
                      f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
 
-        # Sell tiers
+        # Sell tiers (projection, dotted)
         for idx, (lbl, price, qty) in enumerate(self.sell_lines):
+            if is_ordered(price):
+                continue
             clr = _SELL_COLORS[min(idx, len(_SELL_COLORS) - 1)]
             qty_txt = f' ×{qty}' if qty else ''
             ref_line(price, clr,
                      f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
+
+        # Live orders on Toss — drawn DASHED and bold (BUY blue / SELL green)
+        for o in self.ordered_lines:
+            clr = '#0033AA' if o.get('side') == 'BUY' else '#008800'
+            qty_txt = f" ×{o['qty']}" if o.get('qty') else ''
+            y = y_of(o['price'])
+            c.create_line(left_pad, y, left_pad + chart_w, y,
+                          fill=clr, dash=(8, 3), width=2.5)
+            c.create_text(label_x, y,
+                          text=f"ORDERED {o.get('side','')}: "
+                               f"{fmt_price(o['price'], self.ccy)}{qty_txt}",
+                          anchor='w', font=_F_REF, fill=clr)
 
         # Current price — solid line, label on the right
         if self.current_price and self.current_price > 0:

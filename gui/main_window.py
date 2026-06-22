@@ -62,6 +62,7 @@ class App:
 
         self._fx_rate        = None
         self._fx_avg_3m      = None
+        self._toss_acct_seq  = None   # cached Toss accountSeq for order/account reads
         # How many dollar-switch steps have been done: + = sold USD (FX high),
         # - = bought USD (FX low). Range -3..+3, tracked manually on the panel.
         self.fx_switch_level = int(self.config.get('fx_switch_level', 0))
@@ -677,6 +678,7 @@ class App:
         ccy  = 'KRW' if ticker.endswith('.KS') else 'USD'
         current_price = self._current_prices.get(ticker)
 
+        ordered = self._toss_open_order_lines(ticker)
         for row in self.deployed_rows + self.empty_rows:
             if row.ticker == ticker:
                 cd = row.chart_data()
@@ -686,12 +688,55 @@ class App:
                     anchor_price=cd['anchor_price'],
                     buy_lines=cd['buy_lines'],
                     sell_lines=cd['sell_lines'],
-                    current_price=current_price)
+                    current_price=current_price,
+                    ordered_lines=ordered)
                 return
 
         # Fallback (ticker has no row yet)
         CandleChartWindow(self.root, ticker, ohlc, ccy,
-                          current_price=current_price)
+                          current_price=current_price, ordered_lines=ordered)
+
+    def _toss_provider(self):
+        """A Toss provider for account/order reads (reuses the active provider
+        when it's Toss; otherwise builds one). Returns None if unavailable."""
+        if getattr(self._provider, 'name', '') == 'toss':
+            return self._provider
+        try:
+            from providers.toss_market_provider import TossMarketProvider
+            return TossMarketProvider.from_env()
+        except Exception:
+            return None
+
+    def _toss_open_order_lines(self, ticker):
+        """Live working orders for a ticker as chart-ready dicts
+        {side, price, qty, status}. Empty list if Toss is unavailable."""
+        prov = self._toss_provider()
+        if prov is None:
+            return []
+        try:
+            if self._toss_acct_seq is None:
+                accts = prov.get_accounts()
+                if not accts:
+                    return []
+                self._toss_acct_seq = accts[0]['accountSeq']
+            orders = prov.get_open_orders(self._toss_acct_seq, ticker)
+        except Exception:
+            return []
+        out = []
+        for o in orders:
+            try:
+                price = float(o.get('price')) if o.get('price') not in (None, '') else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None:
+                continue
+            try:
+                qty = int(float(o.get('quantity') or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            out.append({'side': o.get('side'), 'price': price, 'qty': qty,
+                        'status': o.get('status')})
+        return out
 
     def _on_row_compute(self):
         """Called when any deployed row recomputes — update army% across all."""

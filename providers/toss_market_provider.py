@@ -410,6 +410,18 @@ class TossMarketProvider(MarketDataProvider):
         return self._post(f'/api/v1/orders/{order_id}/cancel', {},
                           account=account_seq)
 
+    def modify_order(self, order_id, account_seq, price, qty=None,
+                     order_type='LIMIT') -> tuple:
+        """Amend a working order's price (and qty for KR). KR requires quantity;
+        US forbids it (price-only). Returns (status, body)."""
+        body = {'orderType': order_type}
+        if qty is not None:
+            body['quantity'] = str(int(qty))
+        if order_type == 'LIMIT':
+            body['price'] = str(price)
+        return self._post(f'/api/v1/orders/{order_id}/modify', body,
+                          account=account_seq)
+
     def account_snapshot(self) -> Optional[dict]:
         """Read-only snapshot for the GUI's Account Info view: normalized
         holdings + cash buying power per currency. Uses the first account.
