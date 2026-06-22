@@ -1,7 +1,8 @@
 import tkinter as tk
 from core.calc import (
     display_name, BUY_GEAR_INFO, LOAD_PCT_MIN, LOAD_PCT_MAX,
-    normalize_load_pct, load_pct_color, sell_pct_color, gap_color, fmt_price,
+    normalize_load_pct, load_pct_color, sell_pct_color, gap_color,
+    load_gap_color, fmt_price,
     calc_load_ladder, calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
     auto_gear_params, select_auto_gear,
 )
@@ -548,7 +549,8 @@ class StockRow:
                 gap = (anchor_price - self.current_price) / self.current_price * 100.0
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
-            self.gap_lbl.config(fg=gap_color(gap))
+            self.gap_lbl.config(
+                fg=(gap_color(gap) if self.deployed else load_gap_color(gap)))
         else:
             self._gap = None
             self.gap_var.set('--')

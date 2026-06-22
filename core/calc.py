@@ -124,6 +124,18 @@ def gap_color(gap_pct: float) -> str:
     return '#003399'
 
 
+def load_gap_color(gap_pct: float) -> str:
+    """Color for an EMPTY stock's gap to the load trigger (kept distinct from the
+    deployed red/blue P&L colors so a watch-list of empties doesn't read as
+    losses). Purple = load sits below the live price, deeper for farther away;
+    orange when the price is already at or below the load (gap >= 0)."""
+    if gap_pct >= 0:   return '#E08000'   # orange — already at/below the bait
+    if gap_pct > -2:   return '#B084E0'   # light purple — close to a buy
+    if gap_pct > -4:   return '#9A5FD0'
+    if gap_pct > -6:   return '#7E3FBF'
+    return '#5E2CA0'                       # deep purple — far below
+
+
 def fx_dev_color(pct: float) -> str:
     """Color for the FX deviation from the 3-month average. Positive (FX above
     average) trends red and negative trends blue, deepening with magnitude over
