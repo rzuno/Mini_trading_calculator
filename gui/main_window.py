@@ -655,24 +655,29 @@ class App:
 
     # ── Live order placement from the graph ─────────────────────────────────────
 
-    def _row_intents(self, row):
-        """Orders this card places: the BUY ladder only. Toss forbids a buy and
-        a sell resting on the same stock at once (opposite-pending), so sells are
-        left to the web/app conditional-sell feature; the API handles buys."""
-        return list(row.order_intents('BUY'))
-
     def _build_order_actions(self, row, ordered):
+        """Build the graph's order context. Buy and Sell can't rest at once
+        (opposite-pending), so the buttons are gated by which side is already
+        live: ordered_side in {'BUY','SELL',None}."""
         from core.calc import fmt_order_price
-        pending = [(it['side'], it['label'],
-                    fmt_order_price(it['ticker'], it['price']), it['qty'])
-                   for it in self._row_intents(row)]
+
+        def pend(side):
+            return [(it['side'], it['label'],
+                     fmt_order_price(it['ticker'], it['price']), it['qty'])
+                    for it in row.order_intents(side)]
+
+        sides = {o.get('side') for o in ordered}
+        ordered_side = 'BUY' if 'BUY' in sides else ('SELL' if 'SELL' in sides else None)
         return {
-            'ordered':   bool(ordered),
-            'pending':   pending,
-            'place':     lambda r=row: self._graph_place(r),
-            'cancel':    lambda t=row.ticker: self._graph_cancel(t),
-            'refresh':   lambda t=row.ticker: self._toss_open_order_lines(t),
-            'lock_gear': lambda b, r=row: r.set_gear_locked(b),
+            'deployed':     row.deployed,        # sell button only for deployed
+            'ordered_side': ordered_side,
+            'pending_buy':  pend('BUY'),
+            'pending_sell': pend('SELL') if row.deployed else [],
+            'place_buy':    lambda r=row: self._graph_place(r, 'BUY'),
+            'place_sell':   lambda r=row: self._graph_place(r, 'SELL'),
+            'cancel':       lambda t=row.ticker: self._graph_cancel(t),
+            'refresh':      lambda t=row.ticker: self._toss_open_order_lines(t),
+            'lock_gear':    lambda b, r=row: r.set_gear_locked(b),
         }
 
     def _account_seq(self, prov):
@@ -683,10 +688,9 @@ class App:
             self._toss_acct_seq = accts[0]['accountSeq']
         return self._toss_acct_seq
 
-    def _graph_place(self, row):
-        """Place the card's ladder as real Toss LIMIT/DAY orders. Returns
-        (ok, message). Per-order errors (e.g. opposite-pending for a deployed
-        buy+sell, or market-closed) are reported, not pre-guarded."""
+    def _graph_place(self, row, side):
+        """Place one side (BUY ladder or active SELL tiers) as real Toss
+        LIMIT/DAY orders. Returns (ok, message); per-order errors are reported."""
         from core.calc import fmt_order_price
         prov = self._toss_provider()
         if prov is None:
@@ -698,9 +702,9 @@ class App:
         if not seq:
             return False, 'No Toss account'
 
-        intents = self._row_intents(row)
+        intents = list(row.order_intents(side))
         if not intents:
-            return False, 'No order lines'
+            return False, f'No {side} lines'
 
         ok_n, errs = 0, []
         for it in intents:

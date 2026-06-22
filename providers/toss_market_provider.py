@@ -281,10 +281,14 @@ class TossMarketProvider(MarketDataProvider):
             d['5d_ohlc']   = [{'date': b['date'], 'open': b['open'],
                                'high': b['high'], 'low': b['low'],
                                'close': b['close']} for b in five]
-            # Keep the live price as the source of truth; do NOT patch it into a
-            # completed bar (automation_plan.md §10).
             if d['price'] is None and five:
                 d['price'] = five[-1]['close']
+            # Fold today's live price into the high/low so the load anchor tracks
+            # an intraday rise (an uprising stock stays buyable, ~8% below the
+            # live high), instead of being pinned to stale completed-bar highs.
+            if d['price']:
+                d['5d_high'] = max(d['5d_high'], d['price'])
+                d['5d_low']  = min(d['5d_low'], d['price'])
 
         threads = [threading.Thread(target=_one, args=(t,), daemon=True)
                    for t in tickers]

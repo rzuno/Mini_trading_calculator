@@ -61,6 +61,12 @@ def _fetch_ticker_data(ticker: str) -> dict:
 
         if live_price is not None:
             result['price'] = live_price
+
+        # Fold today's live price into the high/low so the load anchor tracks an
+        # intraday rise (keeps an uprising stock buyable).
+        if result['price'] and result['5d_high'] is not None:
+            result['5d_high'] = max(result['5d_high'], result['price'])
+            result['5d_low'] = min(result['5d_low'], result['price'])
     except Exception:
         pass
     return result
