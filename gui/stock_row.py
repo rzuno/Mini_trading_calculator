@@ -47,8 +47,10 @@ class StockRow:
     """
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
-                 get_unit_cash, on_graph, on_compute=None, on_order=None):
+                 get_unit_cash, on_graph, on_compute=None, on_order=None,
+                 editable=True):
         self.deployed       = deployed
+        self.editable       = editable
         self.ticker         = pos['ticker']
         self.tier           = pos.get('tier', 'Major')
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
@@ -157,15 +159,17 @@ class StockRow:
         tk.Label(r0, textvariable=self.vol_var, font=_F_SM, fg='#666'
                  ).pack(side='left', padx=(0, 12))
 
+        ent_state = 'normal' if self.editable else 'readonly'
         tk.Label(r0, text='Avg Cost:', font=_F_LBL).pack(side='left')
         self.avg_entry = tk.Entry(r0, textvariable=self.avg_cost_var,
-                                  width=10, justify='right', font=_F_VAL)
+                                  width=10, justify='right', font=_F_VAL,
+                                  state=ent_state)
         self.avg_entry.pack(side='left', padx=(2, 8))
         self.avg_entry.bind('<FocusOut>', lambda e: self._format_avg())
 
         tk.Label(r0, text='Shares:', font=_F_LBL).pack(side='left')
         tk.Entry(r0, textvariable=self.shares_var,
-                 width=6, justify='right', font=_F_VAL
+                 width=6, justify='right', font=_F_VAL, state=ent_state
                  ).pack(side='left', padx=(2, 8))
 
         if self.deployed:
@@ -181,7 +185,7 @@ class StockRow:
                 command=lambda: self._on_order_toggle('SELL'))
             self.sell_btn.pack(side='left', padx=(0, 2))
             self._color_order_btns()
-        else:
+        elif self.editable:
             tk.Label(r0, text='(fill & Save to deploy)', font=_F_SM,
                      fg='#AAA').pack(side='left', padx=(2, 0))
 

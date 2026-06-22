@@ -11,6 +11,19 @@ _ORDERS_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'logs', 'orders.log')
 
+# Hardcoded remnant held at the KB broker — shown only in the KB popup and added
+# to the full army size. Vanishes later when merged into Toss (then it adds 0
+# but the army total holds because the cash moves into Toss).
+KB_HOLDINGS = [
+    {'ticker': 'GOOGL', 'shares': 5,  'avg': 370.57},
+    {'ticker': 'NVDA',  'shares': 7,  'avg': 207.49},
+    {'ticker': 'MSFT',  'shares': 15, 'avg': 390.69},
+]
+# Hidden from the main cards in Toss(auto) mode (KB-only). MSFT is NOT here
+# because it is also held in Toss, so it shows as a Toss deployed card while its
+# KB lot still appears in the KB popup.
+KB_ONLY_TICKERS = {'GOOGL', 'NVDA'}
+
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from providers import get_provider
@@ -54,8 +67,20 @@ class App:
             from providers import YahooMarketProvider
             self._provider = YahooMarketProvider()
             self._provider_init_note = f"Toss unavailable ({e}); using Yahoo."
-        self.provider_var = tk.StringVar(
-            value=getattr(self._provider, 'name', 'yahoo').title())
+        # Toss (auto): numbers come from the Toss account (read-only cards).
+        # Yahoo (manual): the old CSV/typed workflow.
+        self._auto = (getattr(self._provider, 'name', 'yahoo') == 'toss')
+        self.provider_var = tk.StringVar(value=self._mode_label())
+
+        # Full watchlist + per-ticker gear preferences (auto mode overlays Toss
+        # shares/avg onto these; KB tickers are priced but not shown as cards).
+        self._catalogue = [p['ticker'] for p in self.positions]
+        self._gear_prefs = {
+            p['ticker']: {k: p.get(k) for k in (
+                'tier', 'load_gear', 'buy_pct', 't1_pct', 't2_pct', 't3_pct',
+                't1_active', 't2_active', 't3_active', 'auto_mode')}
+            for p in self.positions}
+        self._last_account = None
 
         # Sort positions in fixed order on load
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
@@ -87,6 +112,7 @@ class App:
         self.last_refresh_var = tk.StringVar(value='--')
         self.status_var       = tk.StringVar(value='Initializing...')
         self.deploy_info_var  = tk.StringVar(value='')
+        self.banner_var       = tk.StringVar(value='')   # cash / army summary
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -313,43 +339,58 @@ class App:
             tk.Label(f, textvariable=var, font=_F_HDR_B,
                      anchor='w', **kw).grid(row=0, column=c, padx=2); c += 1
 
-        _lbl('Total Units:');    _entry(self.N_var, 4)
+        _lbl('Total Units:')
+        self._n_entry = tk.Entry(f, textvariable=self.N_var, width=4,
+                                 justify='right', font=_F_HDR_B)
+        self._n_entry.grid(row=0, column=c, padx=2); c += 1
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
         _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
 
-        # Market-data source selector. Toss is the default (listed first and
-        # shown in bold); switching re-fetches.
+        # Data mode: Toss (auto) = numbers from the Toss account, read-only
+        # cards, live orders; Yahoo (manual) = typed CSV workflow.
         _lbl('Data:')
         self._provider_om = tk.OptionMenu(
-            f, self.provider_var, 'Toss', 'Yahoo',
+            f, self.provider_var, 'Toss (auto)', 'Yahoo (manual)',
             command=lambda v: self._switch_provider(v))
-        self._provider_om.config(width=6)
+        self._provider_om.config(width=13)
         menu = self._provider_om['menu']
         try:
-            menu.entryconfig(menu.index('Toss'), font=_F_HDR_B)
-            menu.entryconfig(menu.index('Yahoo'), font=_F_HDR)
+            menu.entryconfig(menu.index('Toss (auto)'), font=_F_HDR_B)
+            menu.entryconfig(menu.index('Yahoo (manual)'), font=_F_HDR)
         except tk.TclError:
             pass
         self._provider_om.grid(row=0, column=c, padx=2); c += 1
         self._refresh_provider_button()
 
-        tk.Button(f, text='Account Info', font=_F_HDR,
-                  command=self._on_account_info
+        tk.Button(f, text='KB acct', font=_F_HDR, command=self._on_kb_info
                   ).grid(row=0, column=c, padx=(8, 2)); c += 1
 
         tk.Label(f, text=f'Orders: {ORDER_MODE}', font=_F_SM,
                  fg=('#888' if ORDER_MODE == 'DRY_RUN' else '#CC0000')
                  ).grid(row=0, column=c, padx=(8, 2)); c += 1
 
-    def _refresh_provider_button(self):
-        """Bold the selector when Toss (the default) is active."""
-        is_toss = self.provider_var.get().lower() == 'toss'
-        self._provider_om.config(font=_F_HDR_B if is_toss else _F_HDR)
+        # Second header row: cash + deployed/reserve/total-units banner.
+        tk.Label(f, textvariable=self.banner_var, font=_F_SEC_INFO, fg='#333',
+                 anchor='w').grid(row=1, column=0, columnspan=c, sticky='w',
+                                  padx=(12, 2), pady=(4, 0))
+        self._apply_mode_ui()
 
-    def _switch_provider(self, name: str):
-        """Swap the live market-data provider at runtime. Reverts cleanly if the
-        new provider can't be created (e.g. Toss credentials missing)."""
-        name = name.lower()
+    def _mode_label(self):
+        return 'Toss (auto)' if self._auto else 'Yahoo (manual)'
+
+    def _apply_mode_ui(self):
+        """Reflect the data mode: N is auto-computed (read-only) in Toss mode,
+        typed in manual mode."""
+        self._n_entry.config(state='readonly' if self._auto else 'normal')
+        self._refresh_provider_button()
+
+    def _refresh_provider_button(self):
+        """Bold the selector when Toss (auto) — the default — is active."""
+        self._provider_om.config(font=_F_HDR_B if self._auto else _F_HDR)
+
+    def _switch_provider(self, label: str):
+        """Switch data mode at runtime. Reverts cleanly if Toss can't init."""
+        name = 'toss' if str(label).lower().startswith('toss') else 'yahoo'
         current = getattr(self._provider, 'name', 'yahoo')
         if name == current:
             return
@@ -357,103 +398,58 @@ class App:
             prov = get_provider({'market_provider': name})
         except Exception as e:
             self.status_var.set(f"Cannot use {name.title()}: {e}")
-            self.provider_var.set(current.title())
-            self._refresh_provider_button()
+            self.provider_var.set(self._mode_label())
             return
         self._provider = prov
+        self._auto = (name == 'toss')
         self.config['market_provider'] = name
-        self._refresh_provider_button()
-        self.status_var.set(f"Data source → {name.title()}; refreshing…")
+        self.provider_var.set(self._mode_label())
+        self._apply_mode_ui()
+        self.status_var.set(f"Mode → {self._mode_label()}; refreshing…")
         self._on_save_refresh()
 
-    # ── Account info (Toss, read-only) ──────────────────────────────────────────
+    # ── KB account popup (hardcoded remnant, read-only) ─────────────────────────
 
-    def _on_account_info(self):
-        """Read holdings + cash from Toss in the background and show them in a
-        popup. Read-only; needs Toss credentials regardless of the selected
-        market-data provider."""
-        self.status_var.set('Reading Toss account…')
-        threading.Thread(target=self._account_bg, daemon=True).start()
-
-    def _account_bg(self):
-        try:
-            from providers.toss_market_provider import TossMarketProvider
-            snap = TossMarketProvider.from_env().account_snapshot()
-        except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(
-                f'Account read failed: {e}'))
-            return
-        self.root.after(0, self._show_account_window, snap)
-
-    def _show_account_window(self, snap):
-        self.status_var.set('Ready')
-        if not snap:
-            self.status_var.set('No Toss account found.')
-            return
-
+    def _on_kb_info(self):
+        """Show the hardcoded KB-broker remnant (not in Toss). Valued at the
+        live price when available, else at avg cost."""
+        from core.calc import fmt_price, display_name
         win = tk.Toplevel(self.root)
-        win.title('Toss Account — Holdings (read-only)')
-        win.geometry('940x540')
-
-        tk.Label(win, text='Toss Holdings  (read-only snapshot — for checking '
-                           'against your manual data)',
+        win.title('KB account — remnant holdings (read-only)')
+        win.geometry('660x320')
+        tk.Label(win, text='KB brokerage holdings  (hardcoded remnant — merges '
+                           'into Toss later; counted in the full army)',
                  font=_F_HDR_B).pack(anchor='w', padx=12, pady=(10, 4))
 
-        cols = ('name', 'mkt', 'shares', 'avg', 'last', 'value', 'pl')
-        tv = ttk.Treeview(win, columns=cols, show='headings', height=15)
+        cols = ('name', 'shares', 'avg', 'last', 'value')
+        tv = ttk.Treeview(win, columns=cols, show='headings', height=6)
         for cid, txt, w, anc in (
-                ('name', 'Stock', 200, 'w'), ('mkt', 'Mkt', 50, 'center'),
-                ('shares', 'Shares', 90, 'e'), ('avg', 'Avg Cost', 120, 'e'),
-                ('last', 'Current', 120, 'e'), ('value', 'Value', 140, 'e'),
-                ('pl', 'P/L %', 80, 'e')):
+                ('name', 'Stock', 220, 'w'), ('shares', 'Shares', 80, 'e'),
+                ('avg', 'Avg Cost', 110, 'e'), ('last', 'Current', 110, 'e'),
+                ('value', 'Value', 120, 'e')):
             tv.heading(cid, text=txt)
             tv.column(cid, width=w, anchor=anc)
         tv.pack(fill='both', expand=True, padx=12, pady=4)
 
-        from core.calc import fmt_price
-        for it in snap['items']:
-            ccy = it['currency']
-            pl = it['pl_rate']
+        total_usd = 0.0
+        for h in KB_HOLDINGS:
+            price = self._current_prices.get(h['ticker'])
+            val = price * h['shares'] if price else None
+            if val:
+                total_usd += val
             tv.insert('', 'end', values=(
-                f"{it['name']} ({it['symbol']})",
-                it['country'],
-                f"{it['shares']:,.0f}" if ccy == 'KRW' else f"{it['shares']:,.4f}".rstrip('0').rstrip('.'),
-                fmt_price(it['avg'], ccy),
-                fmt_price(it['last'], ccy),
-                fmt_price(it['value'], ccy) if it['value'] is not None else '--',
-                f"{pl*100:+.2f}" if pl is not None else '--'))
+                f"{display_name(h['ticker'])} ({h['ticker']})",
+                h['shares'], fmt_price(h['avg'], 'USD'),
+                fmt_price(price, 'USD') if price else '--',
+                fmt_price(val, 'USD') if val else '--'))
 
-        # Summary: cash + reserve/army size cross-check
-        fx = self._fx_rate or 0
-        cash_krw = snap['cash_krw'] or 0
-        cash_usd = snap['cash_usd'] or 0
-        reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
-        try:
-            unit_krw = float(self.unit_krw_var.get().replace(',', ''))
-            n_units = int(self.N_var.get())
-        except (ValueError, ZeroDivisionError):
-            unit_krw, n_units = 0, 0
-
-        deployed_krw = sum(
-            (it['value'] or 0) * (fx if it['currency'] == 'USD' and fx else 1)
-            for it in snap['items'])
-
-        lines = [
-            f"Cash:  ₩{cash_krw:,.0f}   +   ${cash_usd:,.2f}"
-            + (f"   ≈ ₩{reserve_krw:,.0f}" if fx else "  (FX unknown)"),
-        ]
-        if unit_krw > 0:
-            lines.append(
-                f"Reserve army:  {reserve_krw / unit_krw:,.1f} units"
-                f"      Deployed (Toss): ₩{deployed_krw:,.0f} = "
-                f"{deployed_krw / unit_krw:,.1f} units"
-                + (f"  /  {n_units}" if n_units else ""))
+        fx = self._fx_rate
+        sub = f"Total KB value: ${total_usd:,.0f}"
         if fx:
-            lines.append(f"(converted at current FX {fx:,.2f}; "
-                         f"Toss holdings only — other brokers not included)")
-
-        tk.Label(win, text='\n'.join(lines), font=_F_SEC_INFO, fg='#333',
-                 justify='left', anchor='w').pack(anchor='w', padx=12, pady=(6, 10))
+            sub += f"  ≈ ₩{total_usd * fx:,.0f}"
+        tk.Label(win, text=sub + '   (added to the full army size)',
+                 font=_F_SEC_INFO, fg='#333').pack(anchor='w', padx=12,
+                                                   pady=(6, 10))
 
     # ── FX panel ───────────────────────────────────────────────────────────────
 
@@ -522,8 +518,14 @@ class App:
         # Sort positions
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
 
-        deployed = [p for p in self.positions if p.get('is_deployed')]
-        empty    = [p for p in self.positions if not p.get('is_deployed')]
+        # In Toss(auto) mode, KB-only tickers (GOOGL/NVDA) live in the KB popup,
+        # not the main cards.
+        pool = self.positions
+        if self._auto:
+            pool = [p for p in self.positions
+                    if p['ticker'] not in KB_ONLY_TICKERS]
+        deployed = [p for p in pool if p.get('is_deployed')]
+        empty    = [p for p in pool if not p.get('is_deployed')]
 
         # Deployed: biggest position first, by size in a common currency (USD
         # cost basis is converted to KRW via the FX rate). KR stocks are no
@@ -622,7 +624,8 @@ class App:
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph,
                 on_compute=self._on_row_compute,
-                on_order=self._on_row_order)
+                on_order=self._on_row_order,
+                editable=not self._auto)
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=2)
             self.deployed_rows.append(row)
@@ -649,7 +652,8 @@ class App:
                 parent=box, row_num=i + 1, pos=pos, deployed=False,
                 get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
                 on_graph=self._on_graph,
-                on_compute=self._on_row_compute)
+                on_compute=self._on_row_compute,
+                editable=not self._auto)
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             self.empty_rows.append(row)
@@ -800,22 +804,20 @@ class App:
         """Collect inputs, auto-promote/demote, save, fetch prices, recompute."""
         self._collect()
 
-        changed = False
-        for pos in self.positions:
-            # Auto-demote: deployed with shares=0 → empty
-            if pos.get('is_deployed') and pos.get('shares', 0) <= 0:
-                pos['is_deployed'] = False
-                pos['shares'] = 0
-                pos['avg_cost'] = 0.0
-                pos['cost_basis'] = 0.0
-                changed = True
-            # Auto-promote: empty with shares>0 and avg_cost>0 → deployed
-            elif (not pos.get('is_deployed')
-                  and pos.get('shares', 0) > 0
-                  and pos.get('avg_cost', 0) > 0):
-                pos['is_deployed'] = True
-                pos['cost_basis'] = pos['shares'] * pos['avg_cost']
-                changed = True
+        # Manual mode promotes/demotes from typed shares; Toss mode derives
+        # deployment from the account instead (see _reconcile_from_toss).
+        if not self._auto:
+            for pos in self.positions:
+                if pos.get('is_deployed') and pos.get('shares', 0) <= 0:
+                    pos['is_deployed'] = False
+                    pos['shares'] = 0
+                    pos['avg_cost'] = 0.0
+                    pos['cost_basis'] = 0.0
+                elif (not pos.get('is_deployed')
+                      and pos.get('shares', 0) > 0
+                      and pos.get('avg_cost', 0) > 0):
+                    pos['is_deployed'] = True
+                    pos['cost_basis'] = pos['shares'] * pos['avg_cost']
 
         self._rebuild_sections()
         self._reapply()
@@ -845,7 +847,7 @@ class App:
     def _reapply(self):
         if self._last_data:
             self._apply_live(self._last_data, self._fx_rate,
-                             self._fx_avg_3m, quiet=True)
+                             self._fx_avg_3m, self._last_account, quiet=True)
 
     # ── Live data ────────────────────────────────────────────────────────────
 
@@ -857,12 +859,41 @@ class App:
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f'Error: {e}'))
             return
-        self.root.after(0, self._apply_live, data, fx, fx_avg)
+        # In Toss(auto) mode also read the account (holdings + cash) so the
+        # cards and army size come straight from the broker.
+        account = None
+        if self._auto:
+            try:
+                prov = self._toss_provider()
+                account = prov.account_snapshot() if prov else None
+            except Exception:
+                account = None
+        self.root.after(0, self._apply_live, data, fx, fx_avg, account)
 
-    def _apply_live(self, data, fx_rate, fx_avg=None, quiet=False):
+    def _reconcile_from_toss(self, account):
+        """Overlay Toss holdings onto the catalogue: held tickers become
+        deployed with the broker's shares/avg; everything else is empty. Gear
+        preferences already on each position are preserved."""
+        held = {it['ticker']: it for it in (account.get('items') or [])}
+        for pos in self.positions:
+            it = held.get(pos['ticker'])
+            if it:
+                pos['is_deployed'] = True
+                pos['shares'] = int(round(it.get('shares') or 0))
+                pos['avg_cost'] = it.get('avg') or 0.0
+                pos['cost_basis'] = pos['shares'] * pos['avg_cost']
+            else:
+                pos['is_deployed'] = False
+                pos['shares'] = 0
+                pos['avg_cost'] = 0.0
+                pos['cost_basis'] = 0.0
+
+    def _apply_live(self, data, fx_rate, fx_avg=None, account=None, quiet=False):
         self._last_data = data
         self._fx_rate   = fx_rate
         self._fx_avg_3m = fx_avg
+        if account is not None:
+            self._last_account = account
 
         for t, d in data.items():
             if d.get('price'):      self._current_prices[t] = d['price']
@@ -871,6 +902,11 @@ class App:
             if d.get('5d_closes'):  self._closes_data[t]    = d['5d_closes']
             vol = calc_volatility(d.get('5d_high'), d.get('5d_low'))
             if vol is not None:     self._volatility[t]     = vol
+
+        # Toss mode: derive deployment/shares/avg from the account, then rebuild.
+        if self._auto and self._last_account is not None:
+            self._reconcile_from_toss(self._last_account)
+            self._rebuild_sections()
 
         self._update_fx_display()
         if fx_rate:
@@ -891,6 +927,7 @@ class App:
         self._reorder_deployed()
         self._reorder_empty()
 
+        self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)
 
         if not quiet:
@@ -933,6 +970,50 @@ class App:
                 self.deploy_info_var.set('')
         except (ValueError, ZeroDivisionError):
             self.deploy_info_var.set('')
+
+    def _update_banner(self):
+        """Top-line cash + army summary. In Toss(auto) mode it also computes the
+        total unit count from (deployed + KB + reserve cash) / unit size."""
+        if not self._auto:
+            self.banner_var.set('')
+            return
+        fx = self._fx_rate
+
+        def val_krw(ticker, shares):
+            p = self._current_prices.get(ticker)
+            if not p or not shares:
+                return 0.0
+            if ticker.endswith('.KS'):
+                return p * shares
+            return p * shares * fx if fx else 0.0   # USD needs FX
+
+        deployed_krw = sum(val_krw(r.ticker, r.current_shares())
+                           for r in self.deployed_rows)
+        kb_krw = sum(val_krw(h['ticker'], h['shares']) for h in KB_HOLDINGS)
+
+        acct = self._last_account or {}
+        cash_krw = acct.get('cash_krw') or 0
+        cash_usd = acct.get('cash_usd') or 0
+        reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
+        total_krw = deployed_krw + kb_krw + reserve_krw
+
+        try:
+            unit_krw = float(self.unit_krw_var.get().replace(',', ''))
+        except ValueError:
+            unit_krw = 0.0
+
+        if unit_krw > 0 and total_krw > 0:
+            self.N_var.set(str(max(1, round(total_krw / unit_krw))))
+
+        def u(x):
+            return f"{x / unit_krw:,.1f}u" if unit_krw > 0 else "--"
+
+        self.banner_var.set(
+            f"Cash: ₩{cash_krw:,.0f} + ${cash_usd:,.0f}     "
+            f"Deployed: {u(deployed_krw)}     "
+            f"KB: {u(kb_krw)}     "
+            f"Reserve: {u(reserve_krw)}     "
+            f"Total: ₩{total_krw:,.0f} = {self.N_var.get()} units")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
