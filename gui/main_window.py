@@ -50,7 +50,7 @@ class App:
         self.root = root
         self.root.title("AI Seesaw Mini-Calculator")
         self.root.minsize(1440, 700)
-        self._center_window(1800, 1320)
+        self._place_window()
 
         self.config    = load_config()
         self.positions = load_positions()
@@ -101,11 +101,6 @@ class App:
         self.unit_usd_var     = tk.StringVar(value=str(self.config['unit_cash_usd']))
         self.fx_var           = tk.StringVar(value='--')
         self.fx_pct_var       = tk.StringVar(value='')
-        self.fx_avg_var       = tk.StringVar(value='--')
-        self.fx_pool_var      = tk.StringVar(value='')
-        # Per-threshold (-3..+3) rung price and trade-amount labels.
-        self._fx_rung_vars    = {k: tk.StringVar(value='') for k in range(-3, 4)}
-        self._fx_amt_vars     = {k: tk.StringVar(value='') for k in range(-3, 4)}
         self.last_refresh_var = tk.StringVar(value='--')
         self.status_var       = tk.StringVar(value='Initializing...')
         self.deploy_info_var  = tk.StringVar(value='')
@@ -113,7 +108,6 @@ class App:
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
-        self._build_fx_panel()
 
         # Scrollable content area
         outer = tk.Frame(self.root)
@@ -139,10 +133,9 @@ class App:
             '<Configure>',
             lambda e: self._canvas.itemconfig(self._content_win, width=e.width))
 
-        self._canvas.bind('<Enter>',
-            lambda e: self._canvas.bind_all('<MouseWheel>', self._mwheel))
-        self._canvas.bind('<Leave>',
-            lambda e: self._canvas.unbind_all('<MouseWheel>'))
+        # Wheel scrolls the list from anywhere in the main window (not only when
+        # the cursor is over the bare canvas / scrollbar).
+        self.root.bind_all('<MouseWheel>', self._mwheel)
 
         self._build_footer()
         self._rebuild_sections()
@@ -157,18 +150,24 @@ class App:
         self.root.after(300, self._on_save_refresh)
 
     def _mwheel(self, event):
+        # Ignore wheel events that belong to a popup (Toplevel) so they don't
+        # scroll the main list underneath.
+        try:
+            if event.widget.winfo_toplevel() is not self.root:
+                return
+        except Exception:
+            pass
         self._canvas.yview_scroll(-1 * (event.delta // 120), 'units')
 
-    def _center_window(self, w, h):
-        """Size the window (clamped to the screen) and center it on launch so
-        nothing is clipped off-screen."""
+    def _place_window(self):
+        """Top-anchored, near-full-height, wide — so all 16 cards fit at once
+        without scrolling, and wide enough that long KR numbers aren't clipped."""
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w  = min(w, sw - 40)
-        h  = min(h, sh - 80)
+        w  = min(1980, sw - 20)
+        h  = sh - 70                 # leave room for the taskbar
         x  = max(0, (sw - w) // 2)
-        y  = max(0, (sh - h) // 2 - 20)
-        self.root.geometry(f'{w}x{h}+{x}+{y}')
+        self.root.geometry(f'{w}x{h}+{x}+0')   # y=0: top edge at screen top
 
     # ── Unit cash ────────────────────────────────────────────────────────────
 
@@ -180,67 +179,83 @@ class App:
         except ValueError:
             return 0.0
 
-    def _update_fx_display(self):
-        """Refresh the FX panel: current rate + deviation from the 3-month
-        average, the per-rung target prices and switch amounts, and the marker
-        on the rung the current rate currently sits at."""
+    def _update_fx_header(self):
+        """Compact header FX: rate + deviation from the 3-month average. The
+        full ladder/switch tracker lives in the FX ▸ popup."""
         rate = self._fx_rate
         avg  = self._fx_avg_3m
-
         if not rate:
             self.fx_var.set('N/A')
             self.fx_pct_var.set('')
-            self.fx_avg_var.set('--')
-            self.fx_pool_var.set('')
-            for k in range(-3, 4):
-                self._fx_rung_vars[k].set('')
-                self._fx_amt_vars[k].set('')
             return
-
-        self.fx_var.set(f"{rate:,.2f}")
-
-        if not (avg and avg > 0):
+        self.fx_var.set(f"{rate:,.0f}")
+        if avg and avg > 0:
+            pct = (rate - avg) / avg * 100.0
+            self.fx_pct_var.set(f"({pct:+.1f}%)")
+            self._fx_pct_lbl.config(fg=fx_dev_color(pct))
+        else:
             self.fx_pct_var.set('')
-            self.fx_avg_var.set('--')
-            self.fx_pool_var.set('')
-            for k in range(-3, 4):
-                self._fx_rung_vars[k].set('')
-                self._fx_amt_vars[k].set('')
+
+    def _show_fx_detail(self):
+        """Popup with the 3-month average, the −3%…+3% target ladder, the
+        dollar-switch buttons, and the per-rung trade amounts."""
+        rate = self._fx_rate
+        avg  = self._fx_avg_3m
+        win = tk.Toplevel(self.root)
+        win.title('FX detail')
+        win.geometry('660x250')
+        if not rate:
+            tk.Label(win, text='No FX data yet — refresh first.',
+                     font=_F_HDR).pack(padx=20, pady=20)
+            return
+        head = f"FX Rate: {rate:,.2f}"
+        if avg:
+            head += f"      3-Month Avg: {avg:,.0f}"
+        tk.Label(win, text=head, font=_F_HDR_B).pack(anchor='w', padx=12,
+                                                     pady=(10, 2))
+        if not (avg and avg > 0):
+            tk.Label(win, text='(3-month average unavailable)',
+                     fg='#888').pack(anchor='w', padx=12)
             return
 
-        pct = (rate - avg) / avg * 100.0
-        self.fx_pct_var.set(f"({pct:+.1f}%)")
-        self._fx_pct_lbl.config(fg=fx_dev_color(pct))
-        self.fx_avg_var.set(f"{avg:,.0f}")
+        pool = self._switch_pool_krw()
+        cur  = self._fx_threshold()
+        tk.Label(win, text=f"Switch pool ⅓ ≈ ${pool / avg:,.0f} / ₩{pool:,.0f}"
+                           f"   (each step = |k|/6 of pool)",
+                 font=_F_SM, fg='#888').pack(anchor='w', padx=12)
 
-        pool   = self._switch_pool_krw()         # 1/3 of total capital, in KRW
-        cur    = self._fx_threshold()            # rung the current rate sits at
+        grid = tk.Frame(win)
+        grid.pack(fill='x', padx=12, pady=10)
+        for r, t in enumerate(('Target', 'Switched', 'Amount')):
+            tk.Label(grid, text=t, font=_F_SM, fg='#888', anchor='e'
+                     ).grid(row=r, column=0, sticky='e', padx=(0, 8))
 
-        for k in range(-3, 4):
+        self.fx_switch_btns = {}
+        for col, k in enumerate(range(-3, 4), start=1):
+            grid.grid_columnconfigure(col, weight=1, uniform='fx')
             v   = avg * (1 + k / 100.0)
             tag = '3m avg' if k == 0 else f'{k:+d}%'
-            self._fx_rung_vars[k].set(f"{v:,.0f}\n({tag})")
-            # Mark the rung the live rate currently sits at.
-            if k == cur:
-                self._fx_rung_lbls[k].config(font=_F_FX_BANNER_B, fg='black')
-            else:
-                self._fx_rung_lbls[k].config(font=_F_FX_BANNER, fg='#555')
-
+            tk.Label(grid, text=f"{v:,.0f}\n({tag})",
+                     font=(_F_FX_BANNER_B if k == cur else _F_FX_BANNER),
+                     fg=('black' if k == cur else '#555')
+                     ).grid(row=0, column=col, padx=2)
+            b = tk.Button(grid, text=('0' if k == 0 else f'{k:+d}'),
+                          font=_F_FX_BTN, width=4,
+                          command=lambda kk=k: self._on_fx_switch_click(kk))
+            b.grid(row=1, column=col, padx=2, pady=1)
+            self.fx_switch_btns[k] = b
             if k == 0:
-                self._fx_amt_vars[k].set('reset')
+                amt = 'reset'
             else:
-                # Marginal step = |k|/6 of the pool, sized in USD at the neutral
-                # (3-month average) rate so it stays stable as the rate moves.
                 amt_usd = abs(k) / 6.0 * pool / avg
-                verb = 'sell' if k > 0 else 'buy'
-                self._fx_amt_vars[k].set(f"{verb}\n${amt_usd:,.0f}")
+                amt = f"{'sell' if k > 0 else 'buy'}\n${amt_usd:,.0f}"
+            tk.Label(grid, text=amt, font=_F_SM, fg='#888'
+                     ).grid(row=2, column=col, padx=2)
 
-        if pool > 0:
-            self.fx_pool_var.set(
-                f"(switch pool 1/3 ≈ ${pool / avg:,.0f} / "
-                f"₩{pool:,.0f};  steps = |k|/6 of pool)")
-        else:
-            self.fx_pool_var.set('')
+        self._fx_btn_default_bg = self.fx_switch_btns[0].cget('bg')
+        self._update_fx_buttons()
+        win.protocol('WM_DELETE_WINDOW',
+                     lambda: (self.fx_switch_btns.clear(), win.destroy()))
 
     # ── FX dollar-switch tracker ──────────────────────────────────────────────
 
@@ -343,6 +358,16 @@ class App:
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
         _lbl('1 Unit (USD):');   _val(self.unit_usd_var, width=8, fg='#555')
 
+        # Compact FX: rate + deviation; the ladder/switch detail is a popup.
+        _lbl('FX:')
+        tk.Label(f, textvariable=self.fx_var, font=_F_HDR_B
+                 ).grid(row=0, column=c, padx=(2, 0)); c += 1
+        self._fx_pct_lbl = tk.Label(f, textvariable=self.fx_pct_var,
+                                    font=_F_HDR_B, width=8, anchor='w')
+        self._fx_pct_lbl.grid(row=0, column=c, padx=(0, 2)); c += 1
+        tk.Button(f, text='FX ▸', font=_F_SM, command=self._show_fx_detail
+                  ).grid(row=0, column=c, padx=(0, 4)); c += 1
+
         # Data mode: Toss (auto) = numbers from the Toss account, read-only
         # cards, live orders; Yahoo (manual) = typed CSV workflow.
         _lbl('Data:')
@@ -361,10 +386,6 @@ class App:
 
         tk.Button(f, text='KB acct', font=_F_HDR, command=self._on_kb_info
                   ).grid(row=0, column=c, padx=(8, 2)); c += 1
-
-        tk.Label(f, text=f'Orders: {ORDER_MODE}', font=_F_SM,
-                 fg=('#888' if ORDER_MODE == 'DRY_RUN' else '#CC0000')
-                 ).grid(row=0, column=c, padx=(8, 2)); c += 1
 
         # Second header row: cash + deployed/reserve/total-units banner.
         tk.Label(f, textvariable=self.banner_var, font=_F_SEC_INFO, fg='#333',
@@ -448,61 +469,6 @@ class App:
                  font=_F_SEC_INFO, fg='#333').pack(anchor='w', padx=12,
                                                    pady=(6, 10))
 
-    # ── FX panel ───────────────────────────────────────────────────────────────
-
-    def _build_fx_panel(self):
-        """FX rate, its deviation from the 3-month average, and the dollar-switch
-        tracker: a 7-rung ladder (-3%..+3%) with a clickable button per rung that
-        records how many switch steps have been done, plus the trade amount."""
-        f = tk.Frame(self.root, bd=1, relief='ridge', padx=12, pady=6)
-        f.pack(fill='x', padx=5, pady=(0, 2))
-
-        # Top line: rate, deviation, 3-month average, switch-pool summary.
-        top = tk.Frame(f)
-        top.pack(fill='x')
-        tk.Label(top, text='FX Rate:', font=_F_HDR).pack(side='left', padx=(0, 2))
-        tk.Label(top, textvariable=self.fx_var, font=_F_HDR_B).pack(side='left')
-        self._fx_pct_lbl = tk.Label(top, textvariable=self.fx_pct_var,
-                                    font=_F_HDR_B, width=8, anchor='w')
-        self._fx_pct_lbl.pack(side='left', padx=(4, 12))
-        tk.Label(top, text='3-Month Avg:', font=_F_SM, fg='#888').pack(side='left')
-        tk.Label(top, textvariable=self.fx_avg_var, font=_F_HDR_B
-                 ).pack(side='left', padx=(2, 16))
-        tk.Label(top, textvariable=self.fx_pool_var, font=_F_SM, fg='#888'
-                 ).pack(side='left')
-
-        # Ladder grid: a left label column + 7 rung columns.
-        grid = tk.Frame(f)
-        grid.pack(fill='x', pady=(5, 0))
-        tk.Label(grid, text='Target FX', font=_F_SM, fg='#888', anchor='e'
-                 ).grid(row=0, column=0, sticky='e', padx=(0, 8))
-        tk.Label(grid, text='Switched', font=_F_SM, fg='#888', anchor='e'
-                 ).grid(row=1, column=0, sticky='e', padx=(0, 8))
-        tk.Label(grid, text='Amount', font=_F_SM, fg='#888', anchor='e'
-                 ).grid(row=2, column=0, sticky='e', padx=(0, 8))
-
-        self.fx_switch_btns = {}
-        self._fx_rung_lbls  = {}
-        for col, k in enumerate(range(-3, 4), start=1):
-            grid.grid_columnconfigure(col, weight=1, uniform='fx')
-            rl = tk.Label(grid, textvariable=self._fx_rung_vars[k],
-                          font=_F_FX_BANNER, fg='#555')
-            rl.grid(row=0, column=col, padx=2, pady=(0, 2))
-            self._fx_rung_lbls[k] = rl
-
-            label = '0' if k == 0 else f'{k:+d}'
-            b = tk.Button(grid, text=label, font=_F_FX_BTN, width=4,
-                          command=lambda kk=k: self._on_fx_switch_click(kk))
-            b.grid(row=1, column=col, padx=2, pady=1)
-            self.fx_switch_btns[k] = b
-
-            tk.Label(grid, textvariable=self._fx_amt_vars[k],
-                     font=_F_SM, fg='#888').grid(row=2, column=col,
-                                                 padx=2, pady=(2, 0))
-
-        self._fx_btn_default_bg = self.fx_switch_btns[0].cget('bg')
-        self._update_fx_buttons()
-
     # ── Rebuild ──────────────────────────────────────────────────────────────
 
     def _rebuild_sections(self):
@@ -540,8 +506,35 @@ class App:
         empty.sort(key=lambda p: self._vol_order_key(
             p['ticker'], self._volatility.get(p['ticker'])))
 
-        self._build_deployed(deployed)
-        self._build_empty(empty)
+        # One continuous 2-column grid — no section headers or boundary. Deployed
+        # cards (bold + "DEPLOYED" tag) first by size, then empty by volatility.
+        box = tk.Frame(self.content_frame)
+        box.pack(fill='both', expand=True, padx=2, pady=2)
+        box.grid_columnconfigure(0, weight=1, uniform='col')
+        box.grid_columnconfigure(1, weight=1, uniform='col')
+        for pos in deployed:
+            self.deployed_rows.append(self._make_card(box, pos, True))
+        for pos in empty:
+            row = self._make_card(box, pos, False)
+            self.empty_rows.append(row)
+            row.compute()
+        self._grid_all_cards()
+
+    def _make_card(self, box, pos, deployed):
+        ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
+        return StockRow(
+            parent=box, row_num=0, pos=pos, deployed=deployed,
+            get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
+            on_graph=self._on_graph,
+            on_compute=self._on_row_compute,
+            editable=not self._auto)
+
+    def _grid_all_cards(self):
+        """Deployed cards first, then empty, in one 2-column grid; renumber."""
+        for i, row in enumerate(self.deployed_rows + self.empty_rows):
+            r, c = divmod(i, 2)
+            row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
+            row.set_row_num(i + 1)
 
     def _norm_krw(self, amount, currency):
         """Normalize a cash amount to KRW for cross-currency size comparison.
@@ -550,45 +543,21 @@ class App:
             return amount * self._fx_rate
         return amount
 
-    def _reorder_deployed(self):
-        """Re-grid the deployed cards by size (largest first) once the FX rate
-        is known, so KR and US positions interleave by true value. Skips while
-        the FX rate is unknown so a transient fetch failure can't flip the order
-        back to KR-first (USD sizes can't be normalized without FX)."""
-        if not self.deployed_rows or not self._fx_rate:
-            return
-        ordered = sorted(
-            self.deployed_rows,
-            key=lambda r: self._norm_krw(_cb(r), r.currency), reverse=True)
-        if ordered == self.deployed_rows:
-            return
-        for i, row in enumerate(ordered):
-            r, c = divmod(i, 2)
-            row.frame.grid_configure(row=r, column=c)
-            row.set_row_num(i + 1)
-        self.deployed_rows = ordered
-
     def _vol_order_key(self, ticker, vol):
         """Sort key for empty cards: highest 5-day volatility first, unknown
         volatility last, ties broken by the fixed catalogue order."""
         return (-vol if vol is not None else float('inf'),
                 stock_sort_key(ticker))
 
-    def _reorder_empty(self):
-        """Re-grid the empty cards in place by current volatility so the most
-        volatile sits on top. Avoids a full rebuild (keeps focus/entries)."""
-        if not self.empty_rows:
-            return
-        ordered = sorted(
-            self.empty_rows,
+    def _reorder_cards(self):
+        """Re-sort + re-grid all cards once fresh data is in: deployed by size
+        (FX-normalized, only when FX known), empty by volatility."""
+        if self._fx_rate:
+            self.deployed_rows.sort(
+                key=lambda r: self._norm_krw(_cb(r), r.currency), reverse=True)
+        self.empty_rows.sort(
             key=lambda r: self._vol_order_key(r.ticker, r.volatility))
-        if ordered == self.empty_rows:
-            return
-        for i, row in enumerate(ordered):
-            r, c = divmod(i, 2)
-            row.frame.grid_configure(row=r, column=c)
-            row.set_row_num(i + 1)
-        self.empty_rows = ordered
+        self._grid_all_cards()
 
     # ── Deployed section ─────────────────────────────────────────────────────
 
@@ -627,33 +596,6 @@ class App:
             self.deployed_rows.append(row)
 
     # ── Empty section ────────────────────────────────────────────────────────
-
-    def _build_empty(self, empty):
-        sec = tk.Frame(self.content_frame)
-        sec.pack(fill='x', pady=(0, 6))
-
-        hdr = tk.Frame(sec)
-        hdr.pack(fill='x', pady=(4, 2))
-        tk.Label(hdr, text='EMPTY STOCKS',
-                 font=_F_SECTION).pack(side='left', padx=4)
-
-        box = tk.Frame(sec, bd=1, relief='sunken', padx=4, pady=2)
-        box.pack(fill='x', padx=2)
-
-        box.grid_columnconfigure(0, weight=1, uniform='ecol')
-        box.grid_columnconfigure(1, weight=1, uniform='ecol')
-        for i, pos in enumerate(empty):
-            ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
-            row = StockRow(
-                parent=box, row_num=i + 1, pos=pos, deployed=False,
-                get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
-                on_graph=self._on_graph,
-                on_compute=self._on_row_compute,
-                editable=not self._auto)
-            r, c = divmod(i, 2)
-            row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
-            self.empty_rows.append(row)
-            row.compute()
 
     # ── Footer ───────────────────────────────────────────────────────────────
 
@@ -949,7 +891,7 @@ class App:
             self._reconcile_from_toss(self._last_account)
             self._rebuild_sections()
 
-        self._update_fx_display()
+        self._update_fx_header()
         if fx_rate:
             self._update_unit_usd()
 
@@ -963,10 +905,8 @@ class App:
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
             row.compute()
 
-        # Re-order cards now that fresh data is known: deployed by size (FX
-        # normalized), empty by volatility.
-        self._reorder_deployed()
-        self._reorder_empty()
+        # Re-order all cards now that fresh data is known.
+        self._reorder_cards()
 
         self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)
@@ -1049,9 +989,10 @@ class App:
         def u(x):
             return f"{x / unit_krw:,.1f}u" if unit_krw > 0 else "--"
 
+        dep_pct = (deployed_krw / total_krw * 100) if total_krw > 0 else 0
         self.banner_var.set(
             f"Cash: ₩{cash_krw:,.0f} + ${cash_usd:,.0f}     "
-            f"Deployed: {u(deployed_krw)}     "
+            f"Deployed: {u(deployed_krw)} ({dep_pct:.0f}%)     "
             f"KB: {u(kb_krw)}     "
             f"Reserve: {u(reserve_krw)}     "
             f"Total: ₩{total_krw:,.0f} = {self.N_var.get()} units")

@@ -13,8 +13,8 @@ _BUY_FG = '#3366CC'
 _BUY_SEL = {4: '#3A6EA5', 5: '#2C5C95', 6: '#1F4A85'}
 
 # -- Fonts (1.3x scale for QHD) ----------------------------------------------
-_F_NAME_KR = ('Segoe UI', 13, 'bold')   # Korean stocks are bold
-_F_NAME_US = ('Segoe UI', 13)           # US stocks are plain
+_F_NAME_DEPLOYED = ('Segoe UI', 13, 'bold')  # deployed stocks are bold
+_F_NAME_EMPTY    = ('Segoe UI', 13)          # empty stocks are plain
 _F_LBL  = ('Segoe UI', 12)
 _F_VAL  = ('Segoe UI', 12)
 _F_OUT  = ('Segoe UI', 13, 'bold')
@@ -134,10 +134,15 @@ class StockRow:
         if self.ticker.endswith('.KS'):
             name += ' (KR)'
         self._disp_name = name
-        name_font = _F_NAME_KR if self.ticker.endswith('.KS') else _F_NAME_US
+        # Bold marks DEPLOYED (not KR — KR already shows the (KR) tag).
+        name_font = _F_NAME_DEPLOYED if self.deployed else _F_NAME_EMPTY
         self._name_lbl = tk.Label(r0, text=f"{row_num}. {name}",
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
+
+        if self.deployed:
+            tk.Label(r0, text='DEPLOYED', font=_F_SM_B, fg='#0033AA'
+                     ).pack(side='right', padx=(4, 2))
 
         # Army % (deployed only)
         tk.Label(r0, textvariable=self.army_pct_var,
