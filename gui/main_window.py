@@ -87,6 +87,7 @@ class App:
         self._fx_rate        = None
         self._fx_avg_3m      = None
         self._toss_acct_seq  = None   # cached Toss accountSeq for order/account reads
+        self._full_army_krw  = 0.0     # deployed + KB + cash + reserved buy orders
         # How many dollar-switch steps have been done: + = sold USD (FX high),
         # - = bought USD (FX low). Range -3..+3, tracked manually on the panel.
         self.fx_switch_level = int(self.config.get('fx_switch_level', 0))
@@ -180,6 +181,12 @@ class App:
         except ValueError:
             return 0.0
 
+    def _get_total_units(self) -> float:
+        try:
+            return float(self.N_var.get().replace(',', ''))
+        except ValueError:
+            return 0.0
+
     def _update_fx_header(self):
         """Compact header FX: rate + deviation from the 3-month average. The
         full ladder/switch tracker lives in the FX ▸ popup."""
@@ -268,7 +275,7 @@ class App:
     def _switch_pool_krw(self) -> float:
         """The switchable third of total capital, in KRW (= N × unit_krw / 3)."""
         try:
-            n        = int(self.N_var.get())
+            n        = self._get_total_units()
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
             return n * unit_krw / 3.0
         except (ValueError, ZeroDivisionError):
@@ -358,7 +365,7 @@ class App:
                      anchor='w', **kw).grid(row=0, column=c, padx=2); c += 1
 
         _lbl('Total Units:')
-        self._n_entry = tk.Entry(f, textvariable=self.N_var, width=4,
+        self._n_entry = tk.Entry(f, textvariable=self.N_var, width=7,
                                  justify='right', font=_F_HDR_B)
         self._n_entry.grid(row=0, column=c, padx=2); c += 1
         _lbl('1 Unit (KRW):');   _entry(self.unit_krw_var, 12)
@@ -810,6 +817,52 @@ class App:
                         'status': o.get('status')})
         return out
 
+    def _order_ticker(self, order):
+        sym = order.get('symbol') or ''
+        ccy = order.get('currency')
+        country = order.get('marketCountry')
+        if country == 'KR' or ccy == 'KRW' or sym.isdigit():
+            return sym + '.KS'
+        return sym
+
+    def _order_open_qty(self, order) -> float:
+        def num(v, default=0.0):
+            try:
+                if v in (None, ''):
+                    return default
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        qty = num(order.get('quantity'))
+        execution = order.get('execution') or {}
+        filled = num(execution.get('filledQuantity'))
+        return max(0.0, qty - filled)
+
+    def _buy_orders_krw(self, fx_rate=None) -> float:
+        """Capital reserved by live BUY orders, normalized to KRW."""
+        fx = fx_rate if fx_rate is not None else self._fx_rate
+        total = 0.0
+        for o in (self._last_open_orders or []):
+            if o.get('side') != 'BUY':
+                continue
+            try:
+                price = float(o.get('price')) if o.get('price') not in (None, '') else 0.0
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0:
+                price = self._current_prices.get(self._order_ticker(o)) or 0.0
+            qty = self._order_open_qty(o)
+            if price <= 0 or qty <= 0:
+                continue
+            amount = price * qty
+            ccy = o.get('currency') or ('KRW' if self._order_ticker(o).endswith('.KS') else 'USD')
+            if ccy == 'KRW':
+                total += amount
+            elif fx:
+                total += amount * fx
+        return total
+
     def _on_row_compute(self):
         """Called when any deployed row recomputes — update army% across all."""
         if self._fx_rate:
@@ -980,11 +1033,11 @@ class App:
             cb = _cb(r)
             total += cb * fx_rate if (r.currency == 'USD' and fx_rate) else cb
 
-        # Denominator = full army (deployed + reserved), not just deployed
+        # Denominator = full army (deployed + cash + reserved orders), not just deployed.
         try:
-            n = int(self.N_var.get())
+            n = self._get_total_units()
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
-            full_army = n * unit_krw
+            full_army = self._full_army_krw or (n * unit_krw)
         except (ValueError, ZeroDivisionError):
             full_army = 0.0
 
@@ -997,14 +1050,14 @@ class App:
 
         # Update section header deployed info
         try:
-            n = int(self.N_var.get())
+            n = self._get_total_units()
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
             if total > 0 and unit_krw > 0 and n > 0:
                 units = total / unit_krw
                 pct = units / n * 100
                 self.deploy_info_var.set(
                     f"(Deployed: \u20a9{total:,.0f}    "
-                    f"Ratio: {units:.1f}/{n} = {pct:.1f}%)")
+                    f"Ratio: {units:.2f}/{n:.2f} = {pct:.1f}%)")
             else:
                 self.deploy_info_var.set('')
         except (ValueError, ZeroDivisionError):
@@ -1012,8 +1065,9 @@ class App:
 
     def _update_banner(self):
         """Top-line cash + army summary. In Toss(auto) mode it also computes the
-        total unit count from (deployed + KB + reserve cash) / unit size."""
+        total unit count from deployed + KB + cash + reserved buy orders."""
         if not self._auto:
+            self._full_army_krw = 0.0
             self.banner_var.set('')
             return
         fx = self._fx_rate
@@ -1034,7 +1088,9 @@ class App:
         cash_krw = acct.get('cash_krw') or 0
         cash_usd = acct.get('cash_usd') or 0
         reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
-        total_krw = deployed_krw + kb_krw + reserve_krw
+        ordered_krw = self._buy_orders_krw(fx)
+        total_krw = deployed_krw + kb_krw + reserve_krw + ordered_krw
+        self._full_army_krw = total_krw
 
         try:
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
@@ -1042,16 +1098,17 @@ class App:
             unit_krw = 0.0
 
         if unit_krw > 0 and total_krw > 0:
-            self.N_var.set(str(max(1, round(total_krw / unit_krw))))
+            self.N_var.set(f"{total_krw / unit_krw:.2f}")
 
         def u(x):
-            return f"{x / unit_krw:,.1f}u" if unit_krw > 0 else "--"
+            return f"{x / unit_krw:,.2f}u" if unit_krw > 0 else "--"
 
         dep_pct = (deployed_krw / total_krw * 100) if total_krw > 0 else 0
         self.banner_var.set(
             f"Cash: ₩{cash_krw:,.0f} + ${cash_usd:,.0f}     "
             f"Deployed: {u(deployed_krw)} ({dep_pct:.0f}%)     "
             f"KB: {u(kb_krw)}     "
+            f"Ordered: {u(ordered_krw)}     "
             f"Reserve: {u(reserve_krw)}     "
             f"Total: ₩{total_krw:,.0f} = {self.N_var.get()} units")
 
@@ -1061,7 +1118,7 @@ class App:
         save_positions(self.positions)
         try:
             cfg = {
-                'N':                  int(self.N_var.get()),
+                'N':                  round(self._get_total_units(), 2),
                 'unit_cash_krw':      int(float(self.unit_krw_var.get().replace(',', ''))),
                 'unit_cash_usd':      float(self.unit_usd_var.get().replace(',', '')),
                 'fx_ticker':          self.config.get('fx_ticker', 'USDKRW=X'),
