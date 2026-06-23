@@ -270,8 +270,11 @@ class TossMarketProvider(MarketDataProvider):
                     bars = self.get_candles(t, count=6)
             except Exception:
                 return
-            currency = 'KRW' if t.endswith('.KS') else 'USD'
-            five = self._completed_5(bars, currency)
+            # Most recent 5 sessions including today's (in-progress) candle, so
+            # the chart spans through today and no valid session is dropped.
+            # (Toss labels daily candles by KST date; the current-price override
+            # below keeps the high/low honest for the live/partial bar.)
+            five = bars[-5:]
             if not five:
                 return
             d = data[t]

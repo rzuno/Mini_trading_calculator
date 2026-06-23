@@ -676,7 +676,7 @@ class App:
             'ordered_side': ordered_side,
             'pending_buy':  pend('BUY'),
             'pending_sell': pend('SELL') if row.deployed else [],
-            'place_buy':    lambda r=row: self._graph_place(r, 'BUY'),
+            'place_buy':    lambda sel, r=row: self._graph_place(r, 'BUY', sel),
             'place_sell':   lambda r=row: self._graph_place(r, 'SELL'),
             'cancel':       lambda t=row.ticker: self._graph_cancel(t),
             'refresh':      lambda t=row.ticker: self._toss_open_order_lines(t),
@@ -691,9 +691,10 @@ class App:
             self._toss_acct_seq = accts[0]['accountSeq']
         return self._toss_acct_seq
 
-    def _graph_place(self, row, side):
-        """Place one side (BUY ladder or active SELL tiers) as real Toss
-        LIMIT/DAY orders. Returns (ok, message); per-order errors are reported."""
+    def _graph_place(self, row, side, which=None):
+        """Place one side as real Toss LIMIT/DAY orders. `which` (BUY only) is a
+        list of indices selecting which ladder lines to send. Returns
+        (ok, message); per-order errors are reported."""
         from core.calc import fmt_order_price
         prov = self._toss_provider()
         if prov is None:
@@ -706,6 +707,8 @@ class App:
             return False, 'No Toss account'
 
         intents = list(row.order_intents(side))
+        if which is not None:
+            intents = [intents[i] for i in which if 0 <= i < len(intents)]
         if not intents:
             return False, f'No {side} lines'
 

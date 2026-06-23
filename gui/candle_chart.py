@@ -136,25 +136,34 @@ class CandleChartWindow:
                                   fg=('#0033AA' if os_ else '#666'))
 
     def _do_buy(self):
-        self._place_side('BUY', 'pending_buy', 'place_buy')
+        # Buy is laddered: pick which lines to send (default just the first —
+        # Load/Buy 1), since funding all three at once is usually unaffordable.
+        pend = self.order_actions.get('pending_buy') or []
+        if not pend:
+            messagebox.showinfo('Buy', 'No buy lines to send.', parent=self.win)
+            return
+        sel = self._select_buy_lines(pend)
+        if not sel:                      # cancelled or nothing checked
+            return
+        ok, msg = self.order_actions['place_buy'](sel)
+        self._after_place('BUY', ok, msg)
 
     def _do_sell(self):
-        self._place_side('SELL', 'pending_sell', 'place_sell')
-
-    def _place_side(self, side, pending_key, place_key):
-        pend = self.order_actions.get(pending_key) or []
+        # Sell sends the active tiers together (no per-tier picker).
+        pend = self.order_actions.get('pending_sell') or []
         if not pend:
-            messagebox.showinfo('Order', f'No {side} lines to send.',
-                                parent=self.win)
+            messagebox.showinfo('Sell', 'No sell lines to send.', parent=self.win)
             return
-        body = '\n'.join(f"  {s}  {lbl}:  {q} @ {p}" for s, lbl, p, q in pend)
+        body = '\n'.join(f"  {lbl}:  {q} @ {p}" for _, lbl, p, q in pend)
         if not messagebox.askyesno(
-                f'Confirm {side.lower()}',
-                f"Send these REAL {side} orders to Toss?\n\n{body}\n\n"
-                "(They rest until filled or auto-cleared at session close.)",
+                'Confirm sell',
+                f"Send these REAL SELL orders to Toss?\n\n{body}",
                 parent=self.win):
             return
-        ok, msg = self.order_actions[place_key]()
+        ok, msg = self.order_actions['place_sell']()
+        self._after_place('SELL', ok, msg)
+
+    def _after_place(self, side, ok, msg):
         self._order_status.config(text=msg, fg=('green' if ok else 'red'))
         if ok:
             self._ordered_side = side
@@ -163,6 +172,35 @@ class CandleChartWindow:
             self.order_actions['set_state'](side)
             self._update_order_buttons()
             self._draw()
+
+    def _select_buy_lines(self, pend):
+        """Checkbox picker for the buy ladder; returns selected indices or None.
+        Defaults to only the first line (Load / Buy 1)."""
+        dlg = tk.Toplevel(self.win)
+        dlg.title('Select buy orders')
+        dlg.transient(self.win)
+        tk.Label(dlg, text='Send which BUY orders to Toss?',
+                 font=_F_STAT).pack(anchor='w', padx=14, pady=(12, 6))
+        bvars = []
+        for i, (s, lbl, p, q) in enumerate(pend):
+            v = tk.BooleanVar(value=(i == 0))
+            tk.Checkbutton(dlg, variable=v, font=_F_DAY, anchor='w',
+                           text=f"{lbl}:   {q} @ {p}").pack(anchor='w', padx=18)
+            bvars.append(v)
+        res = {'sel': None}
+        bar = tk.Frame(dlg)
+        bar.pack(fill='x', padx=12, pady=12)
+
+        def _ok():
+            res['sel'] = [i for i, v in enumerate(bvars) if v.get()]
+            dlg.destroy()
+
+        tk.Button(bar, text='Send', width=8, command=_ok).pack(side='right')
+        tk.Button(bar, text='Cancel', width=8,
+                  command=dlg.destroy).pack(side='right', padx=8)
+        dlg.grab_set()
+        dlg.wait_window()
+        return res['sel']
 
     def _do_cancel(self):
         if not messagebox.askyesno(
