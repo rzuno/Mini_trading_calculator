@@ -24,6 +24,7 @@ _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
 _F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
+_F_STATUS = ('Segoe UI', 12, 'bold')
 
 # Greys for a "muted" (state-inactive but informational) gear box
 _MUTE_TITLE = '#C0C0C0'
@@ -69,6 +70,11 @@ class StockRow:
         self._sell_trig     = []      # per active sell tier: current has crossed it
         self._sell_tier_lbls = []     # 'T1'/'T2'/'T3' aligned to _sell_lines
         self._computing     = False
+        self._order_side    = None
+        self._bait_sign     = ''
+        self._bait_sign_fg  = 'black'
+        self._bait_text     = ''
+        self._bait_text_fg  = _STATUS_FG
 
         # Chart data (filled by compute; safe defaults so a graph before the
         # first fetch still opens).
@@ -93,10 +99,10 @@ class StockRow:
             pct_init = 5
         self.buy_pct_var = tk.IntVar(value=pct_init)
 
-        # Default sell-tier activation: only T2 on; others off but clickable.
+        # Default sell-tier activation: all tiers on.
         self.t_active = [
             tk.BooleanVar(value=bool(pos.get(f't{i+1}_active', d)))
-            for i, d in enumerate((False, True, False))]
+            for i, d in enumerate((True, True, True))]
         self.t_pct = [
             tk.IntVar(value=int(pos.get(f't{i+1}_pct', [4, 6, 8][i])))
             for i in range(3)]
@@ -147,17 +153,15 @@ class StockRow:
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
 
-        # Trigger tag: sign keeps direction color; text uses status indigo.
-        self._trigger_sign_lbl = tk.Label(r0, text='', font=_F_SM_B)
-        self._trigger_sign_lbl.pack(side='left', padx=(6, 0))
-        self._trigger_lbl = tk.Label(r0, text='', font=_F_SM_B)
-        self._trigger_lbl.pack(side='left', padx=(2, 0))
-
-        # Right side: "[DEPLOYED] [- buy/sell ordered]". The order-state label is
-        # set by set_order_state from live Toss orders. Pack order-state first so
-        # it sits to the right of DEPLOYED.
-        self._order_state_lbl = tk.Label(r0, text='', font=_F_SM_B)
-        self._order_state_lbl.pack(side='right', padx=(4, 2))
+        # Right side: "[DEPLOYED] [baited/ordered status]".
+        self._status_frame = tk.Frame(r0)
+        self._status_frame.pack(side='right', padx=(6, 2))
+        self._status_sign_lbl = tk.Label(self._status_frame, text='',
+                                         font=_F_STATUS)
+        self._status_sign_lbl.pack(side='left')
+        self._status_lbl = tk.Label(self._status_frame, text='',
+                                    font=_F_STATUS)
+        self._status_lbl.pack(side='left', padx=(2, 0))
         if self.deployed:
             tk.Label(r0, text='DEPLOYED', font=_F_SM_B, fg='#0033AA'
                      ).pack(side='right', padx=(4, 0))
@@ -380,19 +384,27 @@ class StockRow:
         self._refresh_gear_styles()
 
     def set_order_state(self, side):
-        """Reflect live Toss orders on the title: '- buy ordered' (red) /
-        '- sell ordered' (blue) for deployed; 'buy ordered' (red) for empty;
-        blank when none. Also locks the gear while an order rests."""
-        if side == 'BUY':
-            txt = '- buy ordered' if self.deployed else 'buy ordered'
-            self._order_state_lbl.config(text=txt, fg='#CC0000')
-        elif side == 'SELL':
-            self._order_state_lbl.config(
-                text='- sell ordered' if self.deployed else 'sell ordered',
-                fg='#0033AA')
-        else:
-            self._order_state_lbl.config(text='')
+        """Reflect live Toss orders in the title status and lock resting gear."""
+        self._order_side = side
+        self._refresh_status()
         self.set_gear_locked(side is not None)
+
+    def _refresh_status(self):
+        """Show one prominent title status: ordered > baited > blank."""
+        if self._order_side == 'BUY':
+            self._status_sign_lbl.config(text='')
+            self._status_lbl.config(text='buy ordered', fg=_SELL_FG)
+        elif self._order_side == 'SELL':
+            self._status_sign_lbl.config(text='')
+            self._status_lbl.config(text='sell ordered', fg=_BUY_FG)
+        elif self._bait_text:
+            self._status_sign_lbl.config(text=self._bait_sign,
+                                         fg=self._bait_sign_fg)
+            self._status_lbl.config(text=self._bait_text,
+                                    fg=self._bait_text_fg)
+        else:
+            self._status_sign_lbl.config(text='')
+            self._status_lbl.config(text='')
 
     def _refresh_gear_styles(self):
         # While orders are live the projection must not move: lock everything.
@@ -622,16 +634,19 @@ class StockRow:
         sell_hits = [self._sell_tier_lbls[j]
                      for j, t in enumerate(self._sell_trig) if t]
         if buy_hits:
-            self._trigger_sign_lbl.config(text='▼', fg=_BUY_FG)
-            self._trigger_lbl.config(text=', '.join(buy_hits) + ' hit',
-                                     fg=_STATUS_FG)
+            self._bait_sign = '\u25bc'
+            self._bait_sign_fg = _BUY_FG
+            self._bait_text = ', '.join(buy_hits) + ' hit'
+            self._bait_text_fg = _STATUS_FG
         elif sell_hits:
-            self._trigger_sign_lbl.config(text='▲', fg=_SELL_FG)
-            self._trigger_lbl.config(text=', '.join(sell_hits) + ' hit',
-                                     fg=_STATUS_FG)
+            self._bait_sign = '\u25b2'
+            self._bait_sign_fg = _SELL_FG
+            self._bait_text = ', '.join(sell_hits) + ' hit'
+            self._bait_text_fg = _STATUS_FG
         else:
-            self._trigger_sign_lbl.config(text='')
-            self._trigger_lbl.config(text='')
+            self._bait_sign = ''
+            self._bait_text = ''
+        self._refresh_status()
 
     # ── Public API ────────────────────────────────────────────────────────────
 

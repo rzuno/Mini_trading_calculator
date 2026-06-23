@@ -308,11 +308,11 @@ def calc_load_ladder(peak_5d: float, load_pct: int, buy_pct: int,
 # ── Sell tier calculations ───────────────────────────────────────────────────
 def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives: list) -> list:
     """Split the held shares across the active sell tiers as evenly as possible,
-    giving any remainder to the LOWER tiers first (T1 before T2 before T3) — i.e.
-    the lower-profit tier sells the larger lot when it doesn't divide evenly.
+    giving any remainder to the MID tier first, then LOW, then HIGH. This keeps
+    the center tier larger than or equal to the outer tiers when all are active.
 
-    Examples (all three active): 5 -> T1=2,T2=2,T3=1 ; 4 -> T1=2,T2=1,T3=1.
-    Two active: 5 -> T1=3,T2=2."""
+    Examples (all three active): 5 -> T1=2,T2=2,T3=1 ; 4 -> T1=1,T2=2,T3=1 ;
+    1 -> T1=0,T2=1,T3=0."""
     active_idx = [i for i, on in enumerate(tier_actives) if on]
     n = len(active_idx)
 
@@ -321,10 +321,16 @@ def calc_sell_tiers(shares: int, avg_cost: float, tier_pcts: list, tier_actives:
         return result
 
     base, rem = divmod(shares, n)
-    for pos, i in enumerate(active_idx):
-        # active_idx is ascending, so pos 0 is the lowest tier; the first `rem`
-        # (lowest) tiers each get one extra share.
-        q = base + (1 if pos < rem else 0)
+    qty_by_tier = {i: base for i in active_idx}
+    for i in [1, 0, 2]:
+        if rem <= 0:
+            break
+        if i in qty_by_tier:
+            qty_by_tier[i] += 1
+            rem -= 1
+
+    for i in active_idx:
+        q = qty_by_tier[i]
         result[i] = ({'price': avg_cost * (1.0 + tier_pcts[i] / 100.0), 'qty': q}
                      if q > 0 else {'price': None, 'qty': None})
     return result

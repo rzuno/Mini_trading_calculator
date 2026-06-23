@@ -104,10 +104,10 @@ class CandleChartWindow:
                      fg=_STATUS_FG).pack(side='left')
 
         if buy_hits:
-            trigger_status('▼', _DOWN_SIGN_FG,
+            trigger_status('\u25bc', _DOWN_SIGN_FG,
                            'Buy triggered: ' + ', '.join(buy_hits))
         elif sell_hits:
-            trigger_status('▲', _UP_SIGN_FG,
+            trigger_status('\u25b2', _UP_SIGN_FG,
                            'Sell triggered: ' + ', '.join(sell_hits))
 
         # ── Per-day detail ────────────────────────────────────────────────────
@@ -266,20 +266,32 @@ class CandleChartWindow:
     def _select_lines(self, title, prompt, pend):
         """Centered checkbox picker. Only triggered (bitten) lines are checkable
         and checked by default; untriggered lines are shown greyed/unchecked.
-        pend rows are (side, label, price, qty, triggered). Returns selected
-        indices or None."""
+        pend rows are dicts with side/label/price/qty/triggered/selectable/note.
+        Returns selected indices or None."""
         dlg = tk.Toplevel(self.win)
         dlg.title(title)
         dlg.transient(self.win)
         tk.Label(dlg, text=prompt, font=_F_STAT).pack(anchor='w', padx=14,
                                                       pady=(12, 6))
         bvars = []
-        for (s, lbl, p, q, trig) in pend:
-            v = tk.BooleanVar(value=bool(trig))
-            tail = '' if trig else '   (not triggered)'
+        for it in pend:
+            s = it.get('side')
+            lbl = it.get('label')
+            p = it.get('price')
+            q = it.get('qty')
+            trig = bool(it.get('triggered'))
+            selectable = bool(it.get('selectable', trig))
+            note = it.get('note') or ''
+            v = tk.BooleanVar(value=selectable)
+            if not trig:
+                tail = '   (not triggered)'
+            elif not selectable:
+                tail = f"   ({note or 'not selectable'})"
+            else:
+                tail = ''
             tk.Checkbutton(dlg, variable=v, font=_F_DAY, anchor='w',
                            text=f"{lbl}:   {q} @ {p}{tail}",
-                           state=('normal' if trig else 'disabled')
+                           state=('normal' if selectable else 'disabled')
                            ).pack(anchor='w', padx=18)
             bvars.append(v)
         res = {'ok': False}

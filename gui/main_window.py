@@ -13,13 +13,11 @@ ORDER_MODE = 'LIVE'
 # to the full army size. Vanishes later when merged into Toss (then it adds 0
 # but the army total holds because the cash moves into Toss).
 KB_HOLDINGS = [
-    {'ticker': 'GOOGL', 'shares': 5,  'avg': 370.57},
-    {'ticker': 'NVDA',  'shares': 7,  'avg': 207.49},
+    {'ticker': 'GOOGL', 'shares': 8,  'avg': 361.07},
     {'ticker': 'MSFT',  'shares': 15, 'avg': 390.69},
 ]
-# Tickers to hide from the main cards in Toss(auto) mode. Empty now: GOOGL and
-# NVDA are shown as (empty) Toss cards so they can be traded in Toss
-# independently of the KB lot, which still appears in the KB popup.
+# Tickers to hide from the main cards in Toss(auto) mode. Empty now: KB lots are
+# shown separately while their tickers can still be traded in Toss.
 KB_ONLY_TICKERS = set()
 
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
@@ -672,11 +670,23 @@ class App:
         from core.calc import fmt_order_price
 
         def pend(side):
-            # (side, label, price, qty, triggered)
-            return [(it['side'], it['label'],
-                     fmt_order_price(it['ticker'], it['price']), it['qty'],
-                     it['triggered'])
-                    for it in row.order_intents(side)]
+            out = []
+            for it in row.order_intents(side):
+                affordable = True
+                note = ''
+                if side == 'BUY' and not self._buy_intent_affordable(it):
+                    affordable = False
+                    note = 'not enough reserved army'
+                out.append({
+                    'side': it['side'],
+                    'label': it['label'],
+                    'price': fmt_order_price(it['ticker'], it['price']),
+                    'qty': it['qty'],
+                    'triggered': it['triggered'],
+                    'selectable': bool(it['triggered'] and affordable),
+                    'note': note,
+                })
+            return out
 
         sides = {o.get('side') for o in ordered}
         ordered_side = 'BUY' if 'BUY' in sides else ('SELL' if 'SELL' in sides else None)
@@ -688,8 +698,8 @@ class App:
             'pending_buy':  pbuy,
             'pending_sell': psell,
             # Harpoon: a side can only fire when one of its baits is bitten.
-            'buy_trig':     any(t for *_, t in pbuy),
-            'sell_trig':    any(t for *_, t in psell),
+            'buy_trig':     any(it['triggered'] for it in pbuy),
+            'sell_trig':    any(it['triggered'] for it in psell),
             'place_buy':    lambda sel, r=row: self._graph_place(r, 'BUY', sel),
             'place_sell':   lambda sel, r=row: self._graph_place(r, 'SELL', sel),
             'cancel':       lambda t=row.ticker: self._graph_cancel(t),
@@ -709,7 +719,7 @@ class App:
         """Place one side as real Toss LIMIT/DAY orders. `which` (BUY only) is a
         list of indices selecting which ladder lines to send. Returns
         (ok, message); per-order errors are reported."""
-        from core.calc import fmt_order_price
+        from core.calc import fmt_order_price, fmt_price
         prov = self._toss_provider()
         if prov is None:
             return False, 'Toss unavailable'
@@ -725,6 +735,19 @@ class App:
             intents = [intents[i] for i in which if 0 <= i < len(intents)]
         if not intents:
             return False, f'No {side} lines'
+
+        if side == 'BUY':
+            needed = {}
+            for it in intents:
+                ccy = it.get('currency')
+                needed[ccy] = needed.get(ccy, 0.0) + self._buy_intent_cost(it)
+            for ccy, amount in needed.items():
+                available = self._buy_cash_available(ccy)
+                if available + 1e-9 < amount:
+                    return (
+                        False,
+                        f"Not enough reserved army ({ccy}: "
+                        f"{fmt_price(available, ccy)} / {fmt_price(amount, ccy)})")
 
         ok_n, errs = 0, []
         ts = datetime.now().strftime('%H%M%S')
@@ -863,6 +886,24 @@ class App:
                 total += amount * fx
         return total
 
+    def _buy_cash_available(self, currency: str) -> float:
+        acct = self._last_account or {}
+        key = 'cash_krw' if currency == 'KRW' else 'cash_usd'
+        try:
+            return float(acct.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _buy_intent_cost(self, intent) -> float:
+        try:
+            return float(intent.get('price') or 0) * int(intent.get('qty') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _buy_intent_affordable(self, intent) -> bool:
+        return (self._buy_cash_available(intent.get('currency'))
+                + 1e-9 >= self._buy_intent_cost(intent))
+
     def _on_row_compute(self):
         """Called when any deployed row recomputes — update army% across all."""
         if self._fx_rate:
@@ -888,6 +929,9 @@ class App:
                       and pos.get('avg_cost', 0) > 0):
                     pos['is_deployed'] = True
                     pos['cost_basis'] = pos['shares'] * pos['avg_cost']
+                    pos['t1_active'] = True
+                    pos['t2_active'] = True
+                    pos['t3_active'] = True
 
         self._rebuild_sections()
         self._reapply()
@@ -966,10 +1010,15 @@ class App:
         for pos in self.positions:
             it = held.get(pos['ticker'])
             if it:
+                was_deployed = bool(pos.get('is_deployed'))
                 pos['is_deployed'] = True
                 pos['shares'] = int(round(it.get('shares') or 0))
                 pos['avg_cost'] = it.get('avg') or 0.0
                 pos['cost_basis'] = pos['shares'] * pos['avg_cost']
+                if not was_deployed:
+                    pos['t1_active'] = True
+                    pos['t2_active'] = True
+                    pos['t3_active'] = True
             else:
                 pos['is_deployed'] = False
                 pos['shares'] = 0
