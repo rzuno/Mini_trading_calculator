@@ -10,6 +10,8 @@ from gui.stepper import Stepper
 
 # Readable blue for buy-trigger values (matches the chart's rescue lines)
 _BUY_FG = '#3366CC'
+_SELL_FG = '#CC0000'
+_STATUS_FG = '#4B0082'  # indigo
 # Readable, gear-differentiated blues for the selected buy-gear radio text
 _BUY_SEL = {4: '#3A6EA5', 5: '#2C5C95', 6: '#1F4A85'}
 
@@ -145,9 +147,11 @@ class StockRow:
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
 
-        # Trigger tag: which baits are currently bitten (blue buy / red sell).
+        # Trigger tag: sign keeps direction color; text uses status indigo.
+        self._trigger_sign_lbl = tk.Label(r0, text='', font=_F_SM_B)
+        self._trigger_sign_lbl.pack(side='left', padx=(6, 0))
         self._trigger_lbl = tk.Label(r0, text='', font=_F_SM_B)
-        self._trigger_lbl.pack(side='left', padx=(6, 0))
+        self._trigger_lbl.pack(side='left', padx=(2, 0))
 
         # Right side: "[DEPLOYED] [- buy/sell ordered]". The order-state label is
         # set by set_order_state from live Toss orders. Pack order-state first so
@@ -572,8 +576,8 @@ class StockRow:
             self.current_lbl.config(fg='black')
 
         # Fill the ladder. A line is "triggered" once the current price crosses
-        # it (buy: current <= line; sell: current >= line). Triggered buy numbers
-        # turn blue, triggered sell numbers red; untriggered stay black.
+        # it (buy: current <= line; sell: current >= line). Empty-card sells are
+        # projections only, so they stay informational instead of alarming.
         cur = self.current_price
         for i in range(3):
             self._buy_lbl_var[i].set(f'{buy_labels[i]}:')
@@ -588,8 +592,8 @@ class StockRow:
             s = sell_lines[i]
             if s['price'] is not None:
                 self.t_info_var[i].set(f"{fmt_price(s['price'], ccy)} × {s['qty']}")
-                hit = cur is not None and cur >= s['price']
-                self.t_info_lbl[i].config(fg=('#CC0000' if hit else 'black'))
+                hit = self.deployed and cur is not None and cur >= s['price']
+                self.t_info_lbl[i].config(fg=(_SELL_FG if hit else 'black'))
             else:
                 self.t_info_var[i].set('--')
                 self.t_info_lbl[i].config(fg='#CCC')
@@ -618,12 +622,15 @@ class StockRow:
         sell_hits = [self._sell_tier_lbls[j]
                      for j, t in enumerate(self._sell_trig) if t]
         if buy_hits:
-            self._trigger_lbl.config(text='▼ ' + ', '.join(buy_hits) + ' hit',
-                                     fg=_BUY_FG)
+            self._trigger_sign_lbl.config(text='▼', fg=_BUY_FG)
+            self._trigger_lbl.config(text=', '.join(buy_hits) + ' hit',
+                                     fg=_STATUS_FG)
         elif sell_hits:
-            self._trigger_lbl.config(text='▲ ' + ', '.join(sell_hits) + ' hit',
-                                     fg='#CC0000')
+            self._trigger_sign_lbl.config(text='▲', fg=_SELL_FG)
+            self._trigger_lbl.config(text=', '.join(sell_hits) + ' hit',
+                                     fg=_STATUS_FG)
         else:
+            self._trigger_sign_lbl.config(text='')
             self._trigger_lbl.config(text='')
 
     # ── Public API ────────────────────────────────────────────────────────────

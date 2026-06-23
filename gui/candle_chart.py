@@ -14,6 +14,9 @@ _BUY_COLORS  = ['#3366CC', '#284E9E', '#1C3A75']
 _SELL_COLORS = ['#22AA22', '#118811', '#006600']
 _ANCHOR_CLR  = '#FF8C00'
 _CUR_CLR     = '#222222'
+_DOWN_SIGN_FG = '#3366CC'
+_UP_SIGN_FG   = '#CC3333'
+_STATUS_FG    = '#4B0082'  # indigo
 
 
 class CandleChartWindow:
@@ -91,12 +94,21 @@ class CandleChartWindow:
         sell_hits = ([lbl for (lbl, p, q) in self.sell_lines
                       if cur and p and cur >= p]
                      if self.anchor_label == 'Avg' else [])
+
+        def trigger_status(sign, sign_fg, text):
+            row = tk.Frame(stats)
+            row.pack(anchor='w')
+            tk.Label(row, text=sign, font=_F_STAT,
+                     fg=sign_fg).pack(side='left')
+            tk.Label(row, text=' ' + text, font=_F_STAT,
+                     fg=_STATUS_FG).pack(side='left')
+
         if buy_hits:
-            tk.Label(stats, text='▼ Buy triggered: ' + ', '.join(buy_hits),
-                     font=_F_STAT, fg='#0033AA').pack(anchor='w')
+            trigger_status('▼', _DOWN_SIGN_FG,
+                           'Buy triggered: ' + ', '.join(buy_hits))
         elif sell_hits:
-            tk.Label(stats, text='▲ Sell triggered: ' + ', '.join(sell_hits),
-                     font=_F_STAT, fg='#CC0000').pack(anchor='w')
+            trigger_status('▲', _UP_SIGN_FG,
+                           'Sell triggered: ' + ', '.join(sell_hits))
 
         # ── Per-day detail ────────────────────────────────────────────────────
         day_frame = tk.Frame(self.win, padx=12)
@@ -358,22 +370,23 @@ class CandleChartWindow:
                      f'{self.anchor_label}: {fmt_price(self.anchor_price, self.ccy)}',
                      width=2, dash=(2, 4))
 
-        # Projection ladders (dotted) — both hidden once any orders are live, so
-        # only the dashed ordered lines remain (no duplicates).
-        if not self._ordered:
-            for idx, (lbl, price, qty) in enumerate(self.buy_lines):
-                if is_ordered(price):
-                    continue
-                clr = _BUY_COLORS[min(idx, len(_BUY_COLORS) - 1)]
-                qty_txt = f' ×{qty}' if qty else ''
-                ref_line(price, clr,
-                         f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
+        # Projection ladders (dotted). Keep them visible even while gear is
+        # locked by a live order; suppress only near-duplicate ordered prices.
+        for idx, (lbl, price, qty) in enumerate(self.buy_lines):
+            if is_ordered(price):
+                continue
+            clr = _BUY_COLORS[min(idx, len(_BUY_COLORS) - 1)]
+            qty_txt = f' ×{qty}' if qty else ''
+            ref_line(price, clr,
+                     f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
 
-            for idx, (lbl, price, qty) in enumerate(self.sell_lines):
-                clr = _SELL_COLORS[min(idx, len(_SELL_COLORS) - 1)]
-                qty_txt = f' ×{qty}' if qty else ''
-                ref_line(price, clr,
-                         f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
+        for idx, (lbl, price, qty) in enumerate(self.sell_lines):
+            if is_ordered(price):
+                continue
+            clr = _SELL_COLORS[min(idx, len(_SELL_COLORS) - 1)]
+            qty_txt = f' ×{qty}' if qty else ''
+            ref_line(price, clr,
+                     f'{lbl}: {fmt_price(price, self.ccy)}{qty_txt}')
 
         # Live orders on Toss — drawn DASHED and bold (BUY blue / SELL green)
         for o in self.ordered_lines:
