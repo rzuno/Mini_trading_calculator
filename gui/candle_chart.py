@@ -154,11 +154,9 @@ class CandleChartWindow:
         if not pend:
             messagebox.showinfo('Sell', 'No sell lines to send.', parent=self.win)
             return
-        body = '\n'.join(f"  {lbl}:  {q} @ {p}" for _, lbl, p, q in pend)
-        if not messagebox.askyesno(
-                'Confirm sell',
-                f"Send these REAL SELL orders to Toss?\n\n{body}",
-                parent=self.win):
+        lines = ['Send these REAL SELL orders to Toss?', ''] + \
+                [f"{lbl}:   {q} @ {p}" for _, lbl, p, q in pend]
+        if not self._confirm_dialog('Confirm sell', lines):
             return
         ok, msg = self.order_actions['place_sell']()
         self._after_place('SELL', ok, msg)
@@ -173,40 +171,10 @@ class CandleChartWindow:
             self._update_order_buttons()
             self._draw()
 
-    def _select_buy_lines(self, pend):
-        """Checkbox picker for the buy ladder; returns selected indices or None.
-        Defaults to only the first line (Load / Buy 1)."""
-        dlg = tk.Toplevel(self.win)
-        dlg.title('Select buy orders')
-        dlg.transient(self.win)
-        tk.Label(dlg, text='Send which BUY orders to Toss?',
-                 font=_F_STAT).pack(anchor='w', padx=14, pady=(12, 6))
-        bvars = []
-        for i, (s, lbl, p, q) in enumerate(pend):
-            v = tk.BooleanVar(value=(i == 0))
-            tk.Checkbutton(dlg, variable=v, font=_F_DAY, anchor='w',
-                           text=f"{lbl}:   {q} @ {p}").pack(anchor='w', padx=18)
-            bvars.append(v)
-        res = {'sel': None}
-        bar = tk.Frame(dlg)
-        bar.pack(fill='x', padx=12, pady=12)
-
-        def _ok():
-            res['sel'] = [i for i, v in enumerate(bvars) if v.get()]
-            dlg.destroy()
-
-        tk.Button(bar, text='Send', width=8, command=_ok).pack(side='right')
-        tk.Button(bar, text='Cancel', width=8,
-                  command=dlg.destroy).pack(side='right', padx=8)
-        dlg.grab_set()
-        dlg.wait_window()
-        return res['sel']
-
     def _do_cancel(self):
-        if not messagebox.askyesno(
+        if not self._confirm_dialog(
                 'Confirm cancel',
-                f"Cancel ALL live Toss orders for {self.ticker}?",
-                parent=self.win):
+                [f'Cancel ALL live Toss orders for {self.ticker}?']):
             return
         ok, msg = self.order_actions['cancel']()
         self._order_status.config(text=msg, fg=('green' if ok else 'red'))
@@ -217,6 +185,66 @@ class CandleChartWindow:
             self.order_actions['set_state'](None)
             self._update_order_buttons()
             self._draw()
+
+    # ── Shared centered Yes/No dialogs (consistent placement + button order) ───
+    def _center_over(self, dlg):
+        """Place the dialog centered over the chart window."""
+        dlg.update_idletasks()
+        try:
+            px, py = self.win.winfo_rootx(), self.win.winfo_rooty()
+            pw, ph = self.win.winfo_width(), self.win.winfo_height()
+            w, h = dlg.winfo_width(), dlg.winfo_height()
+            dlg.geometry(f'+{max(0, px + (pw - w) // 2)}+{max(0, py + (ph - h) // 2)}')
+        except Exception:
+            pass
+
+    def _dialog_buttons(self, dlg, on_yes):
+        """A centered [Yes] [No] row (same order everywhere)."""
+        bar = tk.Frame(dlg)
+        bar.pack(pady=12)
+        tk.Button(bar, text='Yes', width=8,
+                  command=lambda: (on_yes(), dlg.destroy())).pack(side='left', padx=6)
+        tk.Button(bar, text='No', width=8,
+                  command=dlg.destroy).pack(side='left', padx=6)
+
+    def _confirm_dialog(self, title, lines) -> bool:
+        """Centered Yes/No confirmation. Returns True on Yes."""
+        dlg = tk.Toplevel(self.win)
+        dlg.title(title)
+        dlg.transient(self.win)
+        for i, ln in enumerate(lines):
+            tk.Label(dlg, text=ln, font=(_F_STAT if i == 0 else _F_DAY),
+                     anchor='w').pack(anchor='w', padx=14,
+                                      pady=(12 if i == 0 else 0, 0))
+        res = {'ok': False}
+        self._dialog_buttons(dlg, lambda: res.__setitem__('ok', True))
+        dlg.grab_set()
+        self._center_over(dlg)
+        dlg.wait_window()
+        return res['ok']
+
+    def _select_buy_lines(self, pend):
+        """Centered checkbox picker for the buy ladder (default only the first —
+        Load / Buy 1). Returns selected indices or None."""
+        dlg = tk.Toplevel(self.win)
+        dlg.title('Confirm buy')
+        dlg.transient(self.win)
+        tk.Label(dlg, text='Send which BUY orders to Toss?',
+                 font=_F_STAT).pack(anchor='w', padx=14, pady=(12, 6))
+        bvars = []
+        for i, (s, lbl, p, q) in enumerate(pend):
+            v = tk.BooleanVar(value=(i == 0))
+            tk.Checkbutton(dlg, variable=v, font=_F_DAY, anchor='w',
+                           text=f"{lbl}:   {q} @ {p}").pack(anchor='w', padx=18)
+            bvars.append(v)
+        res = {'ok': False}
+        self._dialog_buttons(dlg, lambda: res.__setitem__('ok', True))
+        dlg.grab_set()
+        self._center_over(dlg)
+        dlg.wait_window()
+        if not res['ok']:
+            return None
+        return [i for i, v in enumerate(bvars) if v.get()]
 
     # ─────────────────────────────────────────────────────────────────────────
     def _draw(self):
