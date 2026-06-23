@@ -665,19 +665,26 @@ class App:
         from core.calc import fmt_order_price
 
         def pend(side):
+            # (side, label, price, qty, triggered)
             return [(it['side'], it['label'],
-                     fmt_order_price(it['ticker'], it['price']), it['qty'])
+                     fmt_order_price(it['ticker'], it['price']), it['qty'],
+                     it['triggered'])
                     for it in row.order_intents(side)]
 
         sides = {o.get('side') for o in ordered}
         ordered_side = 'BUY' if 'BUY' in sides else ('SELL' if 'SELL' in sides else None)
+        pbuy = pend('BUY')
+        psell = pend('SELL') if row.deployed else []
         return {
             'deployed':     row.deployed,        # sell button only for deployed
             'ordered_side': ordered_side,
-            'pending_buy':  pend('BUY'),
-            'pending_sell': pend('SELL') if row.deployed else [],
+            'pending_buy':  pbuy,
+            'pending_sell': psell,
+            # Harpoon: a side can only fire when one of its baits is bitten.
+            'buy_trig':     any(t for *_, t in pbuy),
+            'sell_trig':    any(t for *_, t in psell),
             'place_buy':    lambda sel, r=row: self._graph_place(r, 'BUY', sel),
-            'place_sell':   lambda r=row: self._graph_place(r, 'SELL'),
+            'place_sell':   lambda sel, r=row: self._graph_place(r, 'SELL', sel),
             'cancel':       lambda t=row.ticker: self._graph_cancel(t),
             'refresh':      lambda t=row.ticker: self._toss_open_order_lines(t),
             'set_state':    lambda side, r=row: r.set_order_state(side),

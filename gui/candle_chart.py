@@ -83,6 +83,21 @@ class CandleChartWindow:
                 text="Legend:  ···· projection      ──── ordered (live on Toss)",
                 font=_F_REF, fg='#666').pack(anchor='w')
 
+        # Trigger status: which baits the current price has crossed. Sell only
+        # counts for deployed (anchor 'Avg'); empty sells are pseudo projections.
+        cur = self.current_price
+        buy_hits = [lbl for (lbl, p, q) in self.buy_lines
+                    if cur and p and cur <= p]
+        sell_hits = ([lbl for (lbl, p, q) in self.sell_lines
+                      if cur and p and cur >= p]
+                     if self.anchor_label == 'Avg' else [])
+        if buy_hits:
+            tk.Label(stats, text='▼ Buy triggered: ' + ', '.join(buy_hits),
+                     font=_F_STAT, fg='#0033AA').pack(anchor='w')
+        elif sell_hits:
+            tk.Label(stats, text='▲ Sell triggered: ' + ', '.join(sell_hits),
+                     font=_F_STAT, fg='#CC0000').pack(anchor='w')
+
         # ── Per-day detail ────────────────────────────────────────────────────
         day_frame = tk.Frame(self.win, padx=12)
         day_frame.pack(fill='x')
@@ -125,40 +140,53 @@ class CandleChartWindow:
     # ── Order handlers (Buy / Sell / Cancel) ──────────────────────────────────
     def _update_order_buttons(self):
         os_ = self._ordered_side               # 'BUY' | 'SELL' | None
-        self._buy_btn.config(state='normal' if os_ is None else 'disabled')
+        oa = self.order_actions
+        # Harpoon: a side fires only when one of its baits is bitten and nothing
+        # is already resting on this stock.
+        buy_ok = os_ is None and oa.get('buy_trig')
+        sell_ok = os_ is None and oa.get('sell_trig')
+        self._buy_btn.config(state='normal' if buy_ok else 'disabled')
         if self._sell_btn:
-            self._sell_btn.config(state='normal' if os_ is None else 'disabled')
+            self._sell_btn.config(state='normal' if sell_ok else 'disabled')
         self._cancel_btn.config(state='normal' if os_ is not None else 'disabled')
-        msg = {'BUY':  '● buy orders resting — gear locked',
-               'SELL': '● sell orders resting — gear locked',
-               None:   'no live orders — projection shown'}[os_]
-        self._order_status.config(text=msg,
-                                  fg=('#0033AA' if os_ else '#666'))
+        if os_:
+            self._order_status.config(
+                text=f'● {os_.lower()} orders resting — gear locked', fg='#0033AA')
+        else:
+            hits = []
+            if oa.get('buy_trig'):
+                hits.append('buy bait bitten')
+            if oa.get('sell_trig'):
+                hits.append('sell bait bitten')
+            self._order_status.config(
+                text=('  '.join(hits) if hits
+                      else 'no bait bitten — buttons off until a line is crossed'),
+                fg=('#CC0000' if hits else '#888'))
 
     def _do_buy(self):
-        # Buy is laddered: pick which lines to send (default just the first —
-        # Load/Buy 1), since funding all three at once is usually unaffordable.
+        # Buy is laddered: pick which bitten lines to fire (only triggered lines
+        # are checkable). Funding all three at once is usually unaffordable.
         pend = self.order_actions.get('pending_buy') or []
         if not pend:
-            messagebox.showinfo('Buy', 'No buy lines to send.', parent=self.win)
+            messagebox.showinfo('Buy', 'No buy lines.', parent=self.win)
             return
-        sel = self._select_buy_lines(pend)
-        if not sel:                      # cancelled or nothing checked
+        sel = self._select_lines('Confirm buy',
+                                 'Fire which BUY orders? (only bitten lines)', pend)
+        if not sel:
             return
         ok, msg = self.order_actions['place_buy'](sel)
         self._after_place('BUY', ok, msg)
 
     def _do_sell(self):
-        # Sell sends the active tiers together (no per-tier picker).
         pend = self.order_actions.get('pending_sell') or []
         if not pend:
-            messagebox.showinfo('Sell', 'No sell lines to send.', parent=self.win)
+            messagebox.showinfo('Sell', 'No sell lines.', parent=self.win)
             return
-        lines = ['Send these REAL SELL orders to Toss?', ''] + \
-                [f"{lbl}:   {q} @ {p}" for _, lbl, p, q in pend]
-        if not self._confirm_dialog('Confirm sell', lines):
+        sel = self._select_lines('Confirm sell',
+                                 'Fire which SELL orders? (only bitten tiers)', pend)
+        if not sel:
             return
-        ok, msg = self.order_actions['place_sell']()
+        ok, msg = self.order_actions['place_sell'](sel)
         self._after_place('SELL', ok, msg)
 
     def _after_place(self, side, ok, msg):
@@ -223,19 +251,24 @@ class CandleChartWindow:
         dlg.wait_window()
         return res['ok']
 
-    def _select_buy_lines(self, pend):
-        """Centered checkbox picker for the buy ladder (default only the first —
-        Load / Buy 1). Returns selected indices or None."""
+    def _select_lines(self, title, prompt, pend):
+        """Centered checkbox picker. Only triggered (bitten) lines are checkable
+        and checked by default; untriggered lines are shown greyed/unchecked.
+        pend rows are (side, label, price, qty, triggered). Returns selected
+        indices or None."""
         dlg = tk.Toplevel(self.win)
-        dlg.title('Confirm buy')
+        dlg.title(title)
         dlg.transient(self.win)
-        tk.Label(dlg, text='Send which BUY orders to Toss?',
-                 font=_F_STAT).pack(anchor='w', padx=14, pady=(12, 6))
+        tk.Label(dlg, text=prompt, font=_F_STAT).pack(anchor='w', padx=14,
+                                                      pady=(12, 6))
         bvars = []
-        for i, (s, lbl, p, q) in enumerate(pend):
-            v = tk.BooleanVar(value=(i == 0))
+        for (s, lbl, p, q, trig) in pend:
+            v = tk.BooleanVar(value=bool(trig))
+            tail = '' if trig else '   (not triggered)'
             tk.Checkbutton(dlg, variable=v, font=_F_DAY, anchor='w',
-                           text=f"{lbl}:   {q} @ {p}").pack(anchor='w', padx=18)
+                           text=f"{lbl}:   {q} @ {p}{tail}",
+                           state=('normal' if trig else 'disabled')
+                           ).pack(anchor='w', padx=18)
             bvars.append(v)
         res = {'ok': False}
         self._dialog_buttons(dlg, lambda: res.__setitem__('ok', True))

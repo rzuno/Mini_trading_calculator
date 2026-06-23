@@ -63,6 +63,9 @@ class StockRow:
         self.volatility     = None
         self._army_pct      = None
         self._gap           = None    # current vs anchor (load) %, for ordering
+        self._buy_trig      = []      # per buy line: current has crossed it
+        self._sell_trig     = []      # per active sell tier: current has crossed it
+        self._sell_tier_lbls = []     # 'T1'/'T2'/'T3' aligned to _sell_lines
         self._computing     = False
 
         # Chart data (filled by compute; safe defaults so a graph before the
@@ -141,6 +144,10 @@ class StockRow:
         self._name_lbl = tk.Label(r0, text=f"{row_num}. {name}",
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
+
+        # Trigger tag: which baits are currently bitten (blue buy / red sell).
+        self._trigger_lbl = tk.Label(r0, text='', font=_F_SM_B)
+        self._trigger_lbl.pack(side='left', padx=(6, 0))
 
         # Right side: "[DEPLOYED] [- buy/sell ordered]". The order-state label is
         # set by set_order_state from live Toss orders. Pack order-state first so
@@ -564,32 +571,60 @@ class StockRow:
         else:
             self.current_lbl.config(fg='black')
 
-        # Fill the ladder
+        # Fill the ladder. A line is "triggered" once the current price crosses
+        # it (buy: current <= line; sell: current >= line). Triggered buy numbers
+        # turn blue, triggered sell numbers red; untriggered stay black.
+        cur = self.current_price
         for i in range(3):
             self._buy_lbl_var[i].set(f'{buy_labels[i]}:')
             e = buy_lines[i]
             if e['price'] is not None:
                 self.buy_info_var[i].set(f"{fmt_price(e['price'], ccy)} × {e['qty']}")
-                self.buy_info_lbl[i].config(fg=_BUY_FG)
+                hit = cur is not None and cur <= e['price']
+                self.buy_info_lbl[i].config(fg=(_BUY_FG if hit else 'black'))
             else:
                 self.buy_info_var[i].set('--')
                 self.buy_info_lbl[i].config(fg='#CCC')
             s = sell_lines[i]
             if s['price'] is not None:
                 self.t_info_var[i].set(f"{fmt_price(s['price'], ccy)} × {s['qty']}")
-                self.t_info_lbl[i].config(fg='black')
+                hit = cur is not None and cur >= s['price']
+                self.t_info_lbl[i].config(fg=('#CC0000' if hit else 'black'))
             else:
                 self.t_info_var[i].set('--')
                 self.t_info_lbl[i].config(fg='#CCC')
 
-        # Stash chart data
+        # Stash chart data + per-line trigger state
         self._anchor_label = 'Avg' if self.deployed else 'Load'
         self._anchor_price = anchor_price
         self._buy_lines = [(buy_labels[i], buy_lines[i]['price'],
                             buy_lines[i]['qty']) for i in range(3)]
-        self._sell_lines = [(f"+{pcts[i]}%", sell_lines[i]['price'],
-                             sell_lines[i]['qty'])
-                            for i in range(3) if sell_lines[i]['price'] is not None]
+        self._buy_trig = [(cur is not None and p is not None and cur <= p)
+                          for (_, p, _) in self._buy_lines]
+        self._sell_lines, self._sell_tier_lbls = [], []
+        for i in range(3):
+            if sell_lines[i]['price'] is not None:
+                self._sell_lines.append((f"+{pcts[i]}%", sell_lines[i]['price'],
+                                         sell_lines[i]['qty']))
+                self._sell_tier_lbls.append(f"T{i+1}")
+        # Sell triggers only matter for deployed stocks (empty sells are pseudo).
+        self._sell_trig = [(self.deployed and cur is not None and p is not None
+                            and cur >= p)
+                           for (_, p, _) in self._sell_lines]
+
+        # Title trigger tag: which baits are bitten right now.
+        buy_hits = [self._buy_lines[i][0] for i, t in enumerate(self._buy_trig)
+                    if t and self._buy_lines[i][1] is not None]
+        sell_hits = [self._sell_tier_lbls[j]
+                     for j, t in enumerate(self._sell_trig) if t]
+        if buy_hits:
+            self._trigger_lbl.config(text='▼ ' + ', '.join(buy_hits) + ' hit',
+                                     fg=_BUY_FG)
+        elif sell_hits:
+            self._trigger_lbl.config(text='▲ ' + ', '.join(sell_hits) + ' hit',
+                                     fg='#CC0000')
+        else:
+            self._trigger_lbl.config(text='')
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -601,14 +636,19 @@ class StockRow:
     def order_intents(self, side: str) -> list:
         """The orders this card's current ladder represents on the given side:
         BUY = the 3 buy lines, SELL = the active sell tiers. Each is
-        {ticker, side, label, price, qty, currency}."""
-        lines = self._buy_lines if side == 'BUY' else self._sell_lines
+        {ticker, side, label, price, qty, currency, triggered}. 'triggered' means
+        the current price has crossed that line (the bait is bitten)."""
+        if side == 'BUY':
+            lines, trig = self._buy_lines, self._buy_trig
+        else:
+            lines, trig = self._sell_lines, self._sell_trig
         out = []
-        for label, price, qty in lines:
+        for i, (label, price, qty) in enumerate(lines):
             if price is None or not qty:
                 continue
             out.append({'ticker': self.ticker, 'side': side, 'label': label,
-                        'price': price, 'qty': int(qty), 'currency': self.currency})
+                        'price': price, 'qty': int(qty), 'currency': self.currency,
+                        'triggered': bool(trig[i]) if i < len(trig) else False})
         return out
 
     def current_shares(self) -> int:
