@@ -89,10 +89,12 @@ def normalize_load_pct(value) -> int:
 # ── Buy gear (matching load gear blue tones for −4/−5/−6%) ──────────────────
 BUY_GEAR_PCTS = [4, 5, 6]
 
+# Rescue buy size as a fraction of current shares. Deeper bait buys more:
+# 1/2, 2/3, 3/4 (was 0.5/0.6/0.7, which rounded to nearly the same lot).
 BUY_GEAR_INFO = {
-    4: {'label': '4% drop (\u00d70.5)', 'ratio': 0.5, 'color': '#B0C4DE'},
-    5: {'label': '5% drop (\u00d70.6)', 'ratio': 0.6, 'color': '#88AAC8'},
-    6: {'label': '6% drop (\u00d70.7)', 'ratio': 0.7, 'color': '#6690B2'},
+    4: {'label': '4% drop (1/2)', 'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
+    5: {'label': '5% drop (2/3)', 'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
+    6: {'label': '6% drop (3/4)', 'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
 }
 BUY_GEAR_LABELS = [BUY_GEAR_INFO[p]['label'] for p in BUY_GEAR_PCTS]
 BUY_LABEL_TO_PCT = {v['label']: k for k, v in BUY_GEAR_INFO.items()}

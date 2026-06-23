@@ -264,9 +264,9 @@ class StockRow:
         self._gear_title['buy'].grid(row=0, column=0, sticky='w')
         self._buy_radios = {}
         for disp, pct in enumerate([4, 5, 6]):
-            ratio = BUY_GEAR_INFO[pct]['ratio']
+            frac = BUY_GEAR_INFO[pct]['frac']
             rb = tk.Radiobutton(
-                buy_box, text=f"-{pct}%  ×{ratio}", value=pct,
+                buy_box, text=f"-{pct}%  {frac}", value=pct,
                 variable=self.buy_pct_var, font=_F_SM, anchor='w',
                 takefocus=0, bd=0, pady=0, selectcolor='white',
                 command=self._on_buy_change)
