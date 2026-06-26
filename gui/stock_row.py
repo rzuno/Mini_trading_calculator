@@ -25,6 +25,7 @@ _F_SM   = ('Segoe UI', 10)
 _F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
 _F_STATUS = ('Segoe UI', 12, 'bold')
+_F_GEAR_BADGE = ('Segoe UI', 18, 'bold')
 
 # Greys for a "muted" (state-inactive but informational) gear box
 _MUTE_TITLE = '#C0C0C0'
@@ -275,20 +276,33 @@ class StockRow:
         # -- Unified load/buy gear (compact menu) ------------------------------
         buy_box = tk.Frame(wrap)
         buy_box.pack(side='left', anchor='n', padx=(0, 12))
+        buy_head = tk.Frame(buy_box)
+        buy_head.grid(row=0, column=0, sticky='w')
         self._gear_title['load_buy'] = tk.Label(
-            buy_box, text='Buy' if self.deployed else 'Load',
+            buy_head, text='Buy' if self.deployed else 'Load',
             font=_F_SM, fg='#888')
-        self._gear_title['load_buy'].grid(row=0, column=0, sticky='w')
+        self._gear_title['load_buy'].pack(side='left')
+        menu_row = tk.Frame(buy_box)
+        menu_row.grid(row=1, column=0, sticky='w')
         self.buy_menu = tk.Menubutton(
-            buy_box, textvariable=self.buy_gear_var, font=_F_SM_B,
+            menu_row, textvariable=self.buy_gear_var, font=_F_SM,
             width=12, relief='raised', takefocus=0)
+        self._buy_menu_default_bg = self.buy_menu.cget('bg')
+        self._buy_menu_default_fg = self.buy_menu.cget('fg')
         menu = tk.Menu(self.buy_menu, tearoff=0)
         for gear in sorted(AUTO_GEARS):
             menu.add_command(
                 label=gear_menu_label(gear, self.deployed),
                 command=lambda g=gear: self._on_buy_gear_select(g))
         self.buy_menu.config(menu=menu)
-        self.buy_menu.grid(row=1, column=0, sticky='w')
+        self.buy_menu.pack(side='left')
+        badge_row = tk.Frame(buy_box)
+        badge_row.grid(row=2, column=0, sticky='w', pady=(3, 0))
+        tk.Label(badge_row, text='gear:', font=_F_SM, fg='#888'
+                 ).pack(side='left', padx=(0, 3))
+        self.gear_badge = tk.Canvas(
+            badge_row, width=46, height=46, highlightthickness=0, bd=0)
+        self.gear_badge.pack(side='left')
 
         # -- Sell gear (3 tiers: toggle + stepper, T3 on top) ------------------
         sell_box = tk.Frame(wrap)
@@ -508,13 +522,27 @@ class StockRow:
                             muted=sell_muted)
         self._gear_title['sell'].config(fg=_MUTE_TITLE if sell_muted else '#888')
 
-    def _update_buy_color(self, muted=False):
-        gear = self._current_load_buy_gear()
+    def _draw_gear_badge(self, gear):
+        if not hasattr(self, 'gear_badge'):
+            return
+        gear = clamp_gear(gear)
         bg = gear_button_color(gear)
         fg = gear_button_fg(gear)
+        self.gear_badge.delete('all')
+        self.gear_badge.create_oval(
+            3, 3, 43, 43, fill=bg, outline='#555555', width=1)
+        self.gear_badge.create_text(
+            23, 23, text=str(gear), fill=fg, font=_F_GEAR_BADGE)
+
+    def _update_buy_color(self, muted=False):
+        gear = self._current_load_buy_gear()
+        default_bg = getattr(self, '_buy_menu_default_bg', '#F0F0F0')
+        default_fg = getattr(self, '_buy_menu_default_fg', 'black')
         self.buy_menu.config(
-            fg=fg, bg=bg, activeforeground=fg, activebackground=bg,
-            disabledforeground=fg, font=_F_SM_B)
+            fg=default_fg, bg=default_bg,
+            activeforeground=default_fg, activebackground=default_bg,
+            disabledforeground='#888888', font=_F_SM)
+        self._draw_gear_badge(gear)
 
     def _color_spn(self, stepper, pct, muted=False):
         if muted:

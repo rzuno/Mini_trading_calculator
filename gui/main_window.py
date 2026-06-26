@@ -52,6 +52,7 @@ class App:
         self._place_window()
 
         self.config    = load_config()
+        self.config.setdefault('global_gear_rule_enabled', False)
         self.positions = load_positions()
 
         # Market-data provider. Toss is the default; fall back to Yahoo if Toss
@@ -109,7 +110,8 @@ class App:
         self.deploy_info_var  = tk.StringVar(value='')
         self.banner_var       = tk.StringVar(value='')   # cash / army summary
         self.gear_status_var  = tk.StringVar(value='Gear: normal')
-        self.global_rule_enabled_var = tk.BooleanVar(value=True)
+        self.global_rule_enabled_var = tk.BooleanVar(
+            value=bool(self.config.get('global_gear_rule_enabled', False)))
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -1171,6 +1173,8 @@ class App:
             self._gear_rule_check.config(state='normal' if active else 'disabled')
 
     def _on_global_rule_toggle(self):
+        self.config['global_gear_rule_enabled'] = bool(
+            self.global_rule_enabled_var.get())
         self._update_global_gear_rules()
         for row in self.deployed_rows + self.empty_rows:
             row.compute()
@@ -1268,6 +1272,8 @@ class App:
                 'peak_lookback_days': self.config.get('peak_lookback_days', 5),
                 'fx_switch_level':    self.fx_switch_level,
                 'market_provider':    self.config.get('market_provider', 'yahoo'),
+                'global_gear_rule_enabled': bool(
+                    self.global_rule_enabled_var.get()),
             }
             save_config(cfg)
             self.config = cfg
