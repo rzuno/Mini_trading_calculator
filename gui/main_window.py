@@ -929,9 +929,9 @@ class App:
                       and pos.get('avg_cost', 0) > 0):
                     pos['is_deployed'] = True
                     pos['cost_basis'] = pos['shares'] * pos['avg_cost']
-                    pos['t1_active'] = True
+                    pos['t1_active'] = False
                     pos['t2_active'] = True
-                    pos['t3_active'] = True
+                    pos['t3_active'] = False
 
         self._rebuild_sections()
         self._reapply()
@@ -1016,9 +1016,9 @@ class App:
                 pos['avg_cost'] = it.get('avg') or 0.0
                 pos['cost_basis'] = pos['shares'] * pos['avg_cost']
                 if not was_deployed:
-                    pos['t1_active'] = True
+                    pos['t1_active'] = False
                     pos['t2_active'] = True
-                    pos['t3_active'] = True
+                    pos['t3_active'] = False
             else:
                 pos['is_deployed'] = False
                 pos['shares'] = 0
