@@ -1,10 +1,12 @@
 import tkinter as tk
 from core.calc import (
-    display_name, BUY_GEAR_INFO, LOAD_PCT_MIN, LOAD_PCT_MAX,
-    normalize_load_pct, load_pct_color, sell_pct_color, gap_color,
+    display_name, normalize_load_pct, sell_pct_color, gap_color,
     load_gap_color, fmt_price,
     calc_load_ladder, calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
     auto_gear_params, select_auto_gear,
+    AUTO_GEARS, BUY_GEAR_PCTS, gear_for_buy_pct, gear_for_load_pct,
+    gear_for_sell_pct, gear_label, clamp_gear, gear_button_color,
+    gear_button_fg, buy_gear_detail, load_gear_detail, gear_menu_label,
 )
 from gui.stepper import Stepper
 
@@ -12,8 +14,6 @@ from gui.stepper import Stepper
 _BUY_FG = '#3366CC'
 _SELL_FG = '#CC0000'
 _STATUS_FG = '#4B0082'  # indigo
-# Readable, gear-differentiated blues for the selected buy-gear radio text
-_BUY_SEL = {4: '#3A6EA5', 5: '#2C5C95', 6: '#1F4A85'}
 
 # -- Fonts (1.3x scale for QHD) ----------------------------------------------
 _F_NAME_DEPLOYED = ('Segoe UI', 13, 'bold')  # deployed stocks are bold
@@ -70,11 +70,18 @@ class StockRow:
         self._sell_trig     = []      # per active sell tier: current has crossed it
         self._sell_tier_lbls = []     # 'T1'/'T2'/'T3' aligned to _sell_lines
         self._computing     = False
+        self._syncing_gear  = False
         self._order_side    = None
         self._bait_sign     = ''
         self._bait_sign_fg  = 'black'
         self._bait_text     = ''
         self._bait_text_fg  = _STATUS_FG
+        self._auto_buy_shift = 0
+        self._auto_sell_shift = 0
+        self._base_gear = None
+        self._load_gear = None
+        self._buy_gear = None
+        self._sell_gear = None
 
         # Chart data (filled by compute; safe defaults so a graph before the
         # first fetch still opens).
@@ -92,12 +99,19 @@ class StockRow:
         self.avg_cost_var = tk.StringVar(value=self._fmt_init(pos.get('avg_cost', 0)))
 
         init_load = normalize_load_pct(pos.get('load_gear', 5))
-        self.load_pct_var = tk.IntVar(value=-init_load)
+        load_gear = gear_for_load_pct(init_load)
 
         pct_init = pos.get('buy_pct', 5)
-        if pct_init not in (4, 5, 6):
+        if pct_init not in BUY_GEAR_PCTS:
             pct_init = 5
-        self.buy_pct_var = tk.IntVar(value=pct_init)
+        buy_gear = gear_for_buy_pct(pct_init)
+        init_gear = buy_gear if self.deployed else load_gear
+        self.load_pct_var = tk.IntVar(
+            value=-AUTO_GEARS[init_gear]['load_pct'])
+        self.buy_pct_var = tk.IntVar(
+            value=AUTO_GEARS[init_gear]['buy_pct'])
+        self.buy_gear_var = tk.StringVar(
+            value=self._gear_button_text(init_gear))
 
         # Default sell-tier activation: only T2 on; others off but clickable.
         self.t_active = [
@@ -250,7 +264,7 @@ class StockRow:
             slbl.pack(side='left')
             self.t_info_lbl.append(slbl)
 
-        # Gear boxes on the right: Load | Buy | Sell
+        # Gear boxes on the right: unified Load/Buy | Sell
         self._build_gear_boxes(body)
 
     def _build_gear_boxes(self, body):
@@ -258,35 +272,23 @@ class StockRow:
         wrap.pack(side='left', anchor='n', padx=(16, 0))
         self._gear_title = {}
 
-        # -- Load gear (single stepper) ----------------------------------------
-        load_box = tk.Frame(wrap)
-        load_box.pack(side='left', anchor='n', padx=(0, 12))
-        self._gear_title['load'] = tk.Label(load_box, text='Load',
-                                            font=_F_SM, fg='#888')
-        self._gear_title['load'].grid(row=0, column=0, columnspan=2)
-        self.load_step = Stepper(load_box, self.load_pct_var,
-                                 -LOAD_PCT_MAX, -LOAD_PCT_MIN,
-                                 entry_width=4, value_font=_F_SM, btn_font=_F_SM)
-        self.load_step.grid(row=1, column=0)
-        tk.Label(load_box, text='%', font=_F_SM, fg='#888'
-                 ).grid(row=1, column=1)
-
-        # -- Buy gear (3 radios) -----------------------------------------------
+        # -- Unified load/buy gear (compact menu) ------------------------------
         buy_box = tk.Frame(wrap)
         buy_box.pack(side='left', anchor='n', padx=(0, 12))
-        self._gear_title['buy'] = tk.Label(buy_box, text='Buy',
-                                           font=_F_SM, fg='#888')
-        self._gear_title['buy'].grid(row=0, column=0, sticky='w')
-        self._buy_radios = {}
-        for disp, pct in enumerate([4, 5, 6]):
-            frac = BUY_GEAR_INFO[pct]['frac']
-            rb = tk.Radiobutton(
-                buy_box, text=f"-{pct}%  {frac}", value=pct,
-                variable=self.buy_pct_var, font=_F_SM, anchor='w',
-                takefocus=0, bd=0, pady=0, selectcolor='white',
-                command=self._on_buy_change)
-            rb.grid(row=disp + 1, column=0, sticky='w', pady=0)
-            self._buy_radios[pct] = rb
+        self._gear_title['load_buy'] = tk.Label(
+            buy_box, text='Buy' if self.deployed else 'Load',
+            font=_F_SM, fg='#888')
+        self._gear_title['load_buy'].grid(row=0, column=0, sticky='w')
+        self.buy_menu = tk.Menubutton(
+            buy_box, textvariable=self.buy_gear_var, font=_F_SM_B,
+            width=12, relief='raised', takefocus=0)
+        menu = tk.Menu(self.buy_menu, tearoff=0)
+        for gear in sorted(AUTO_GEARS):
+            menu.add_command(
+                label=gear_menu_label(gear, self.deployed),
+                command=lambda g=gear: self._on_buy_gear_select(g))
+        self.buy_menu.config(menu=menu)
+        self.buy_menu.grid(row=1, column=0, sticky='w')
 
         # -- Sell gear (3 tiers: toggle + stepper, T3 on top) ------------------
         sell_box = tk.Frame(wrap)
@@ -331,14 +333,47 @@ class StockRow:
             v = abs(self.load_pct_var.get())
         except tk.TclError:
             v = 5
-        return max(LOAD_PCT_MIN, min(LOAD_PCT_MAX, v))
+        gear = gear_for_load_pct(v)
+        return AUTO_GEARS[gear]['load_pct']
 
     def _get_buy_pct(self) -> int:
         try:
             v = int(self.buy_pct_var.get())
         except (tk.TclError, ValueError):
             v = 5
-        return v if v in (4, 5, 6) else 5
+        return v if v in BUY_GEAR_PCTS else 5
+
+    def _gear_button_text(self, gear: int):
+        return buy_gear_detail(gear) if self.deployed else load_gear_detail(gear)
+
+    def _current_load_buy_gear(self):
+        if self.auto_var.get() and self._base_gear:
+            return self._buy_gear if self.deployed else self._load_gear
+        if self.deployed:
+            return gear_for_buy_pct(self._get_buy_pct())
+        return gear_for_load_pct(self._get_load_pct())
+
+    def _set_buy_gear(self, gear: int):
+        gear = clamp_gear(gear)
+        load_pct = AUTO_GEARS[gear]['load_pct']
+        buy_pct = AUTO_GEARS[gear]['buy_pct']
+        self._syncing_gear = True
+        try:
+            try:
+                current_load = int(self.load_pct_var.get())
+            except tk.TclError:
+                current_load = 0
+            if current_load != -load_pct:
+                self.load_pct_var.set(-load_pct)
+            if self._get_buy_pct() != buy_pct:
+                self.buy_pct_var.set(buy_pct)
+        finally:
+            self._syncing_gear = False
+        self.buy_gear_var.set(self._gear_button_text(gear))
+
+    def _sync_buy_menu(self):
+        self.buy_gear_var.set(
+            self._gear_button_text(self._current_load_buy_gear()))
 
     # ── Auto / manual ─────────────────────────────────────────────────────────
 
@@ -367,14 +402,44 @@ class StockRow:
         if self._order_locked:
             return
         if self.auto_var.get() and self.volatility is not None:
-            g = auto_gear_params(self.volatility)
-            if self._get_load_pct() != g['load_pct']:
+            g = auto_gear_params(
+                self.volatility, self._auto_buy_shift, self._auto_sell_shift)
+            self._base_gear = g['base_gear']
+            self._load_gear = g['load_gear']
+            self._buy_gear = g['buy_gear']
+            self._sell_gear = g['sell_gear']
+            try:
+                current_load = int(self.load_pct_var.get())
+            except tk.TclError:
+                current_load = 0
+            if current_load != -g['load_pct']:
                 self.load_pct_var.set(-g['load_pct'])
             if self._get_buy_pct() != g['buy_pct']:
                 self.buy_pct_var.set(g['buy_pct'])
+            self._sync_buy_menu()
             for i in range(3):
                 if self.t_pct[i].get() != g['tiers'][i]:
                     self.t_pct[i].set(g['tiers'][i])
+
+    def set_global_gear_shifts(self, buy_shift=0, sell_shift=0):
+        self._auto_buy_shift = int(buy_shift or 0)
+        self._auto_sell_shift = int(sell_shift or 0)
+
+    def _current_gear_labels(self):
+        if self.auto_var.get() and self._base_gear:
+            load_buy_gear = self._buy_gear if self.deployed else self._load_gear
+            sell_gear = self._sell_gear
+        else:
+            load_buy_gear = self._current_load_buy_gear()
+            sell_gear = gear_for_sell_pct(self.t_pct[1].get())
+        return load_buy_gear, sell_gear
+
+    def _refresh_gear_title_text(self):
+        load_buy_gear, sell_gear = self._current_gear_labels()
+        title = 'Buy' if self.deployed else 'Load'
+        self._gear_title['load_buy'].config(
+            text=f"{title} ({gear_label(load_buy_gear)})")
+        self._gear_title['sell'].config(text=f"Sell ({gear_label(sell_gear)})")
 
     # ── Gear styling (enabled + state muting) ─────────────────────────────────
 
@@ -407,19 +472,20 @@ class StockRow:
             self._status_lbl.config(text='')
 
     def _refresh_gear_styles(self):
+        self._sync_buy_menu()
+        self._refresh_gear_title_text()
         # While orders are live the projection must not move: lock everything.
         if self._order_locked:
             self.auto_btn.config(state='disabled')   # can't flip AUTO/MANUAL
-            self.load_step.set_enabled(False)
-            for rb in self._buy_radios.values():
-                rb.config(state='disabled')
+            self.buy_menu.config(state='disabled')
+            self._update_buy_color()
             for s in self._steppers:
                 s.set_enabled(False)
             for ch in self._tier_checks:
                 if ch:
                     ch.config(state='disabled')
-            for key in ('load', 'buy', 'sell'):
-                self._gear_title[key].config(fg=_MUTE_TITLE)
+            self._gear_title['load_buy'].config(fg='#888')
+            self._gear_title['sell'].config(fg=_MUTE_TITLE)
             return
 
         self.auto_btn.config(state='normal')
@@ -429,24 +495,10 @@ class StockRow:
 
         auto = self.auto_var.get()
 
-        # Load gear: only active for empty stocks; greyed/disabled when deployed.
-        load_active = not self.deployed
-        self.load_step.set_enabled(load_active and not auto)
-        if load_active:
-            pct = self._get_load_pct()
-            self.load_step.set_value_color(load_pct_color(pct),
-                                           'black' if pct <= 5 else 'white')
-            self._gear_title['load'].config(fg='#888')
-        else:
-            self.load_step.set_value_color(_MUTE_BG, _MUTE_FG)
-            self._gear_title['load'].config(fg=_MUTE_TITLE)
-
-        # Buy gear: full color when deployed, muted (but clickable) when empty.
-        buy_muted = not self.deployed
-        for rb in self._buy_radios.values():
-            rb.config(state='disabled' if auto else 'normal')
-        self._update_buy_color(muted=buy_muted)
-        self._gear_title['buy'].config(fg=_MUTE_TITLE if buy_muted else '#888')
+        # Unified load/buy gear: auto drives it; manual can choose G1..G5.
+        self.buy_menu.config(state='disabled' if auto else 'normal')
+        self._update_buy_color()
+        self._gear_title['load_buy'].config(fg='#888')
 
         # Sell gear: same muting rule; tier toggles always editable.
         sell_muted = not self.deployed
@@ -457,32 +509,29 @@ class StockRow:
         self._gear_title['sell'].config(fg=_MUTE_TITLE if sell_muted else '#888')
 
     def _update_buy_color(self, muted=False):
-        sel = self._get_buy_pct()
-        for pct, rb in self._buy_radios.items():
-            if muted:
-                rb.config(fg=_MUTE_FG, disabledforeground='#C8C8C8', font=_F_SM)
-            elif pct == sel:
-                rb.config(fg=_BUY_SEL[pct], disabledforeground=_BUY_SEL[pct],
-                          font=_F_SM_B)
-            else:
-                rb.config(fg='#AAAAAA', disabledforeground='#CCCCCC',
-                          font=_F_SM)
+        gear = self._current_load_buy_gear()
+        bg = gear_button_color(gear)
+        fg = gear_button_fg(gear)
+        self.buy_menu.config(
+            fg=fg, bg=bg, activeforeground=fg, activebackground=bg,
+            disabledforeground=fg, font=_F_SM_B)
 
     def _color_spn(self, stepper, pct, muted=False):
         if muted:
             stepper.set_value_color(_MUTE_BG, _MUTE_FG)
         else:
             c = sell_pct_color(float(pct))
-            stepper.set_value_color(c, 'white' if float(pct) >= 5 else 'black')
+            stepper.set_value_color(c, 'white' if float(pct) >= 7 else 'black')
 
-    def _on_buy_change(self, _=None):
-        self._update_buy_color(muted=not self.deployed)
+    def _on_buy_gear_select(self, gear):
+        self._set_buy_gear(gear)
+        self._update_buy_color()
         self._on_input_change()
 
     # ── Compute ───────────────────────────────────────────────────────────────
 
     def _on_input_change(self):
-        if not self._computing:
+        if not self._computing and not self._syncing_gear:
             self.compute()
             if self._on_compute_cb:
                 self._on_compute_cb()

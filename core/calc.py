@@ -86,34 +86,113 @@ def normalize_load_pct(value) -> int:
     except (ValueError, TypeError):
         return 5
 
-# ── Buy gear (matching load gear blue tones for −4/−5/−6%) ──────────────────
-BUY_GEAR_PCTS = [4, 5, 6]
+# ── Buy gear (G1..G5: shallower -> deeper rescue baits) ─────────────────────
+BUY_GEAR_PCTS = [3, 4, 5, 6, 7]
 
-# Rescue buy size as a fraction of current shares. Deeper bait buys more:
-# 1/2, 2/3, 3/4 (was 0.5/0.6/0.7, which rounded to nearly the same lot).
+# Rescue buy size as a fraction of current shares. Deeper bait buys more.
 BUY_GEAR_INFO = {
+    3: {'label': '3% drop (1/3)', 'frac': '1/3', 'ratio': 1 / 3, 'color': '#D4E0EE'},
     4: {'label': '4% drop (1/2)', 'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
     5: {'label': '5% drop (2/3)', 'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
     6: {'label': '6% drop (3/4)', 'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
+    7: {'label': '7% drop (4/5)', 'frac': '4/5', 'ratio': 4 / 5, 'color': '#5583A7'},
 }
 BUY_GEAR_LABELS = [BUY_GEAR_INFO[p]['label'] for p in BUY_GEAR_PCTS]
 BUY_LABEL_TO_PCT = {v['label']: k for k, v in BUY_GEAR_INFO.items()}
+
+GEAR_BUTTON_COLORS = {
+    1: '#D8ECFF',
+    2: '#9ED0FF',
+    3: '#5FA7EF',
+    4: '#2478D4',
+    5: '#123E8A',
+}
+GEAR_BUTTON_FG = {
+    1: 'black',
+    2: 'black',
+    3: 'black',
+    4: 'white',
+    5: 'white',
+}
 
 
 def buy_pct_color(pct: int) -> str:
     return BUY_GEAR_INFO.get(pct, {}).get('color', '#FFFFFF')
 
 
+def gear_button_color(gear) -> str:
+    return GEAR_BUTTON_COLORS.get(clamp_gear(gear), '#FFFFFF')
+
+
+def gear_button_fg(gear) -> str:
+    return GEAR_BUTTON_FG.get(clamp_gear(gear), 'black')
+
+
 def load_pct_color(pct) -> str:
     return LOAD_PCT_COLORS.get(clamp_load_pct(pct), '#FFFFFF')
 
 
+def clamp_gear(gear) -> int:
+    try:
+        gear = int(gear)
+    except (TypeError, ValueError):
+        gear = 3
+    return max(1, min(5, gear))
+
+
+def gear_for_buy_pct(pct) -> int:
+    try:
+        pct = int(pct)
+    except (TypeError, ValueError):
+        return 3
+    if pct <= AUTO_GEARS[1]['buy_pct']:
+        return 1
+    if pct >= AUTO_GEARS[5]['buy_pct']:
+        return 5
+    for gear, params in AUTO_GEARS.items():
+        if params['buy_pct'] == pct:
+            return gear
+    return 3
+
+
+def gear_for_load_pct(pct):
+    try:
+        pct = int(abs(pct))
+    except (TypeError, ValueError):
+        return 1
+    if pct <= AUTO_GEARS[1]['load_pct']:
+        return 1
+    if pct >= AUTO_GEARS[5]['load_pct']:
+        return 5
+    for gear, params in AUTO_GEARS.items():
+        if params['load_pct'] == pct:
+            return gear
+    return clamp_gear(round(pct - AUTO_GEARS[1]['load_pct'] + 1))
+
+
+def gear_for_sell_pct(pct):
+    try:
+        pct = int(pct)
+    except (TypeError, ValueError):
+        return None
+    for gear, params in AUTO_GEARS.items():
+        if params['tiers'][1] == pct:
+            return gear
+    return None
+
+
+def gear_label(gear) -> str:
+    return f"G{gear}" if gear else "G?"
+
+
 def sell_pct_color(pct: float) -> str:
-    """Weak red (low profit) -> strong red (high profit)."""
-    if pct <= 3:  return '#FFB0B0'
-    if pct <= 5:  return '#E08080'
-    if pct <= 7:  return '#CC4444'
-    if pct <= 9:  return '#AA2222'
+    """High-contrast sell colors from white/amber to deep red."""
+    if pct <= 1:  return '#FFFFFF'
+    if pct <= 2:  return '#FFF2CC'
+    if pct <= 3:  return '#FFD9A8'
+    if pct <= 4:  return '#FFB199'
+    if pct <= 5:  return '#FF7F7F'
+    if pct <= 7:  return '#D93636'
     return '#880000'
 
 
@@ -155,19 +234,38 @@ def fx_dev_color(pct: float) -> str:
 
 # ── Auto gear (5-day-volatility-driven gear selection) ───────────────────────
 # Each gear bundles a load drop %, a buy/reload gear %, and the three sell-tier
-# percentages. In auto mode the whole bundle is chosen from the 5-day
-# volatility; the buy_pct keys line up with BUY_GEAR_INFO (4->×0.5, 5->×0.6,
-# 6->×0.7), so the reload ratio follows automatically.
+# percentages. In auto mode the base bundle is chosen from 5-day volatility,
+# then optional global shifts can move buy/sell one gear shallower/deeper.
 AUTO_GEARS = {
-    1: {'load_pct': 6, 'buy_pct': 4, 'tiers': (2, 4, 6)},
-    2: {'load_pct': 7, 'buy_pct': 5, 'tiers': (3, 5, 7)},
-    3: {'load_pct': 8, 'buy_pct': 6, 'tiers': (4, 6, 8)},
+    1: {'load_pct': 5, 'buy_pct': 3, 'tiers': (1, 3, 5)},
+    2: {'load_pct': 6, 'buy_pct': 4, 'tiers': (2, 4, 6)},
+    3: {'load_pct': 7, 'buy_pct': 5, 'tiers': (3, 5, 7)},
+    4: {'load_pct': 8, 'buy_pct': 6, 'tiers': (4, 6, 8)},
+    5: {'load_pct': 9, 'buy_pct': 7, 'tiers': (5, 7, 9)},
 }
 
-# 5-day volatility (%) cut points: V < LO -> gear 1, LO <= V < HI -> gear 2,
-# V >= HI -> gear 3.
-VOL_LO = 9.0
-VOL_HI = 14.0
+
+def buy_gear_detail(gear) -> str:
+    gear = clamp_gear(gear)
+    pct = AUTO_GEARS[gear]['buy_pct']
+    frac = BUY_GEAR_INFO[pct]['frac']
+    return f"(-{pct}%, x{frac})"
+
+
+def load_gear_detail(gear) -> str:
+    gear = clamp_gear(gear)
+    pct = AUTO_GEARS[gear]['load_pct']
+    return f"(-{pct}%)"
+
+
+def gear_menu_label(gear, deployed: bool) -> str:
+    detail = buy_gear_detail(gear) if deployed else load_gear_detail(gear)
+    return f"{gear_label(clamp_gear(gear))} {detail}"
+
+# 5-day volatility (%) cut points:
+# G1: V < 8, G2: 8 <= V < 11, G3: 11 <= V < 15,
+# G4: 15 <= V < 20, G5: V >= 20.
+VOL_THRESHOLDS = (8.0, 11.0, 15.0, 20.0)
 
 
 def calc_volatility(high_5d, low_5d):
@@ -179,19 +277,32 @@ def calc_volatility(high_5d, low_5d):
 
 
 def select_auto_gear(volatility) -> int:
-    """Map a 5-day volatility percent to gear 1, 2, or 3. Falls back to gear 1
+    """Map a 5-day volatility percent to gear 1..5. Falls back to gear 1
     when volatility is unknown."""
-    if volatility is None or volatility < VOL_LO:
+    if volatility is None:
         return 1
-    if volatility < VOL_HI:
-        return 2
-    return 3
+    for idx, threshold in enumerate(VOL_THRESHOLDS, start=1):
+        if volatility < threshold:
+            return idx
+    return 5
 
 
-def auto_gear_params(volatility) -> dict:
+def auto_gear_params(volatility, buy_shift: int = 0, sell_shift: int = 0) -> dict:
     """Gear parameter bundle (load_pct, buy_pct, tiers) for the given
-    volatility."""
-    return AUTO_GEARS[select_auto_gear(volatility)]
+    volatility, with optional global load/buy and sell gear shifts."""
+    base = select_auto_gear(volatility)
+    buy_gear = clamp_gear(base + buy_shift)
+    load_gear = buy_gear
+    sell_gear = clamp_gear(base + sell_shift)
+    return {
+        'base_gear': base,
+        'load_gear': load_gear,
+        'buy_gear': buy_gear,
+        'sell_gear': sell_gear,
+        'load_pct': AUTO_GEARS[load_gear]['load_pct'],
+        'buy_pct': AUTO_GEARS[buy_gear]['buy_pct'],
+        'tiers': AUTO_GEARS[sell_gear]['tiers'],
+    }
 
 
 # ── Rounding ─────────────────────────────────────────────────────────────────

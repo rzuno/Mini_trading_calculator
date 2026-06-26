@@ -86,6 +86,8 @@ class App:
         self._fx_avg_3m      = None
         self._toss_acct_seq  = None   # cached Toss accountSeq for order/account reads
         self._full_army_krw  = 0.0     # deployed + KB + cash + reserved buy orders
+        self._global_buy_gear_shift = 0
+        self._global_sell_gear_shift = 0
         # How many dollar-switch steps have been done: + = sold USD (FX high),
         # - = bought USD (FX low). Range -3..+3, tracked manually on the panel.
         self.fx_switch_level = int(self.config.get('fx_switch_level', 0))
@@ -106,6 +108,8 @@ class App:
         self.status_var       = tk.StringVar(value='Initializing...')
         self.deploy_info_var  = tk.StringVar(value='')
         self.banner_var       = tk.StringVar(value='')   # cash / army summary
+        self.gear_status_var  = tk.StringVar(value='Gear: normal')
+        self.global_rule_enabled_var = tk.BooleanVar(value=True)
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -411,6 +415,13 @@ class App:
         info.grid(row=1, column=0, columnspan=span, sticky='ew', pady=(4, 0))
         tk.Label(info, textvariable=self.banner_var, font=_F_SEC_INFO,
                  fg='#333', anchor='w').pack(side='left', padx=(12, 2))
+        self._gear_rule_check = tk.Checkbutton(
+            info, variable=self.global_rule_enabled_var,
+            textvariable=self.gear_status_var,
+            command=self._on_global_rule_toggle,
+            font=_F_SM, fg='#4B0082', disabledforeground='#8A6AAE',
+            anchor='w', takefocus=0)
+        self._gear_rule_check.pack(side='left', padx=(12, 2))
         tk.Label(info, textvariable=self.status_var, font=_F_SM, anchor='e'
                  ).pack(side='right', padx=(6, 2))
         tk.Label(info, textvariable=self.last_refresh_var, font=_F_SM
@@ -1060,6 +1071,11 @@ class App:
                 d.get('5d_high'),
                 d.get('5d_closes', []),
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
+
+        # Apply global auto-gear shifts before cards compute their ladders.
+        self._update_global_gear_rules()
+
+        for row in self.deployed_rows + self.empty_rows:
             row.compute()
 
         # Re-order all cards now that fresh data is known.
@@ -1112,13 +1128,7 @@ class App:
         except (ValueError, ZeroDivisionError):
             self.deploy_info_var.set('')
 
-    def _update_banner(self):
-        """Top-line cash + army summary. In Toss(auto) mode it also computes the
-        total unit count from deployed + KB + cash + reserved buy orders."""
-        if not self._auto:
-            self._full_army_krw = 0.0
-            self.banner_var.set('')
-            return
+    def _army_snapshot(self):
         fx = self._fx_rate
 
         def val_krw(ticker, shares):
@@ -1127,7 +1137,7 @@ class App:
                 return 0.0
             if ticker.endswith('.KS'):
                 return p * shares
-            return p * shares * fx if fx else 0.0   # USD needs FX
+            return p * shares * fx if fx else 0.0
 
         deployed_krw = sum(val_krw(r.ticker, r.current_shares())
                            for r in self.deployed_rows)
@@ -1139,12 +1149,96 @@ class App:
         reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
         ordered_krw = self._buy_orders_krw(fx)
         total_krw = deployed_krw + kb_krw + reserve_krw + ordered_krw
-        self._full_army_krw = total_krw
 
         try:
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
         except ValueError:
             unit_krw = 0.0
+
+        return {
+            'deployed_krw': deployed_krw,
+            'kb_krw': kb_krw,
+            'cash_krw': cash_krw,
+            'cash_usd': cash_usd,
+            'reserve_krw': reserve_krw,
+            'ordered_krw': ordered_krw,
+            'total_krw': total_krw,
+            'unit_krw': unit_krw,
+        }
+
+    def _set_global_rule_ui(self, active: bool):
+        if hasattr(self, '_gear_rule_check'):
+            self._gear_rule_check.config(state='normal' if active else 'disabled')
+
+    def _on_global_rule_toggle(self):
+        self._update_global_gear_rules()
+        for row in self.deployed_rows + self.empty_rows:
+            row.compute()
+        self._reorder_cards()
+
+    def _update_global_gear_rules(self):
+        if not self._auto or self._last_account is None:
+            self._global_buy_gear_shift = 0
+            self._global_sell_gear_shift = 0
+            self.gear_status_var.set('Gear: normal')
+            self._set_global_rule_ui(False)
+            for row in self.deployed_rows + self.empty_rows:
+                row.set_global_gear_shifts(0, 0)
+            return
+
+        snap = self._army_snapshot()
+        total = snap['total_krw']
+        rule_buy_shift = 0
+        rule_sell_shift = 0
+        note = ''
+
+        if total > 0:
+            deployed_pct = snap['deployed_krw'] / total * 100
+            reserve_pct = snap['reserve_krw'] / total * 100
+            if reserve_pct < 20:
+                rule_buy_shift = 1
+                rule_sell_shift = -1
+                note = 'load/buy +1 / sell -1 (reserve<20%)'
+            elif deployed_pct < 20:
+                rule_buy_shift = -1
+                note = 'load/buy -1 (deployed<20%)'
+
+        active_rule = bool(note)
+        self._set_global_rule_ui(active_rule)
+        if active_rule:
+            self.gear_status_var.set('Gear: ' + note)
+        else:
+            self.gear_status_var.set('Gear: normal')
+
+        enabled = active_rule and self.global_rule_enabled_var.get()
+        buy_shift = rule_buy_shift if enabled else 0
+        sell_shift = rule_sell_shift if enabled else 0
+
+        self._global_buy_gear_shift = buy_shift
+        self._global_sell_gear_shift = sell_shift
+
+        for row in self.deployed_rows + self.empty_rows:
+            row.set_global_gear_shifts(buy_shift, sell_shift)
+
+    def _update_banner(self):
+        """Top-line cash + army summary. In Toss(auto) mode it also computes the
+        total unit count from deployed + KB + cash + reserved buy orders."""
+        if not self._auto:
+            self._full_army_krw = 0.0
+            self.banner_var.set('')
+            self.gear_status_var.set('Gear: normal')
+            self._set_global_rule_ui(False)
+            return
+        snap = self._army_snapshot()
+        deployed_krw = snap['deployed_krw']
+        kb_krw = snap['kb_krw']
+        cash_krw = snap['cash_krw']
+        cash_usd = snap['cash_usd']
+        reserve_krw = snap['reserve_krw']
+        ordered_krw = snap['ordered_krw']
+        total_krw = snap['total_krw']
+        unit_krw = snap['unit_krw']
+        self._full_army_krw = total_krw
 
         if unit_krw > 0 and total_krw > 0:
             self.N_var.set(f"{total_krw / unit_krw:.2f}")
