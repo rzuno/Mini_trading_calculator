@@ -9,17 +9,6 @@ from datetime import datetime
 # Toss orders (behind a confirmation dialog). Set to 'DRY_RUN' to disable.
 ORDER_MODE = 'LIVE'
 
-# Hardcoded remnant held at the KB broker — shown only in the KB popup and added
-# to the full army size. Vanishes later when merged into Toss (then it adds 0
-# but the army total holds because the cash moves into Toss).
-KB_HOLDINGS = [
-    {'ticker': 'GOOGL', 'shares': 8,  'avg': 361.07},
-    {'ticker': 'MSFT',  'shares': 15, 'avg': 390.69},
-]
-# Tickers to hide from the main cards in Toss(auto) mode. Empty now: KB lots are
-# shown separately while their tickers can still be traded in Toss.
-KB_ONLY_TICKERS = set()
-
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from providers import get_provider
@@ -70,7 +59,7 @@ class App:
         self.provider_var = tk.StringVar(value=self._mode_label())
 
         # Full watchlist + per-ticker gear preferences (auto mode overlays Toss
-        # shares/avg onto these; KB tickers are priced but not shown as cards).
+        # shares/avg onto these).
         self._catalogue = [p['ticker'] for p in self.positions]
         self._gear_prefs = {
             p['ticker']: {k: p.get(k) for k in (
@@ -86,7 +75,7 @@ class App:
         self._fx_rate        = None
         self._fx_avg_3m      = None
         self._toss_acct_seq  = None   # cached Toss accountSeq for order/account reads
-        self._full_army_krw  = 0.0     # deployed + KB + cash + reserved buy orders
+        self._full_army_krw  = 0.0     # deployed + cash + reserved buy orders
         self._global_buy_gear_shift = 0
         self._global_sell_gear_shift = 0
         # How many dollar-switch steps have been done: + = sold USD (FX high),
@@ -401,9 +390,6 @@ class App:
         self._provider_om.grid(row=0, column=c, padx=2); c += 1
         self._refresh_provider_button()
 
-        tk.Button(f, text='KB acct', font=_F_HDR, command=self._on_kb_info
-                  ).grid(row=0, column=c, padx=(8, 2)); c += 1
-
         # Save & Refresh pinned to the top-right corner (spacer column expands).
         f.grid_columnconfigure(c, weight=1)
         tk.Button(f, text='Save & Refresh', command=self._on_save_refresh,
@@ -465,49 +451,6 @@ class App:
         self.status_var.set(f"Mode → {self._mode_label()}; refreshing…")
         self._on_save_refresh()
 
-    # ── KB account popup (hardcoded remnant, read-only) ─────────────────────────
-
-    def _on_kb_info(self):
-        """Show the hardcoded KB-broker remnant (not in Toss). Valued at the
-        live price when available, else at avg cost."""
-        from core.calc import fmt_price, display_name
-        win = tk.Toplevel(self.root)
-        win.title('KB account — remnant holdings (read-only)')
-        win.geometry('660x320')
-        tk.Label(win, text='KB brokerage holdings  (hardcoded remnant — merges '
-                           'into Toss later; counted in the full army)',
-                 font=_F_HDR_B).pack(anchor='w', padx=12, pady=(10, 4))
-
-        cols = ('name', 'shares', 'avg', 'last', 'value')
-        tv = ttk.Treeview(win, columns=cols, show='headings', height=6)
-        for cid, txt, w, anc in (
-                ('name', 'Stock', 220, 'w'), ('shares', 'Shares', 80, 'e'),
-                ('avg', 'Avg Cost', 110, 'e'), ('last', 'Current', 110, 'e'),
-                ('value', 'Value', 120, 'e')):
-            tv.heading(cid, text=txt)
-            tv.column(cid, width=w, anchor=anc)
-        tv.pack(fill='both', expand=True, padx=12, pady=4)
-
-        total_usd = 0.0
-        for h in KB_HOLDINGS:
-            price = self._current_prices.get(h['ticker'])
-            val = price * h['shares'] if price else None
-            if val:
-                total_usd += val
-            tv.insert('', 'end', values=(
-                f"{display_name(h['ticker'])} ({h['ticker']})",
-                h['shares'], fmt_price(h['avg'], 'USD'),
-                fmt_price(price, 'USD') if price else '--',
-                fmt_price(val, 'USD') if val else '--'))
-
-        fx = self._fx_rate
-        sub = f"Total KB value: ${total_usd:,.0f}"
-        if fx:
-            sub += f"  ≈ ₩{total_usd * fx:,.0f}"
-        tk.Label(win, text=sub + '   (added to the full army size)',
-                 font=_F_SEC_INFO, fg='#333').pack(anchor='w', padx=12,
-                                                   pady=(6, 10))
-
     # ── Rebuild ──────────────────────────────────────────────────────────────
 
     def _rebuild_sections(self):
@@ -520,33 +463,21 @@ class App:
         # Sort positions
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
 
-        # In Toss(auto) mode, KB-only tickers (GOOGL/NVDA) live in the KB popup,
-        # not the main cards.
-        pool = self.positions
-        if self._auto:
-            pool = [p for p in self.positions
-                    if p['ticker'] not in KB_ONLY_TICKERS]
-        deployed = [p for p in pool if p.get('is_deployed')]
-        empty    = [p for p in pool if not p.get('is_deployed')]
+        deployed = [p for p in self.positions if p.get('is_deployed')]
+        empty    = [p for p in self.positions if not p.get('is_deployed')]
 
-        # Deployed: biggest position first, by size in a common currency (USD
-        # cost basis is converted to KRW via the FX rate). KR stocks are no
-        # longer forced to the front — they sit wherever their size lands.
-        # _apply_live re-grids these once the FX rate is known.
-        deployed.sort(key=lambda p: self._norm_krw(
-            p.get('shares', 0) * p.get('avg_cost', 0),
-            'KRW' if p['ticker'].endswith('.KS') else 'USD'),
-            reverse=True)
+        # Until live gaps are computed, keep deployed in the catalogue order.
+        # _apply_live re-grids deployed and empty by gap after row.compute().
+        deployed.sort(key=lambda p: stock_sort_key(p['ticker']))
 
-        # Empty: most volatile first (more volatile = more profitable under the
-        # current strategy). Falls back to the fixed catalogue order for stocks
-        # whose volatility is not yet known (e.g. before the first price fetch).
-        # _apply_live re-grids these once fresh volatility arrives.
+        # Empty rows still get a useful pre-live fallback: most volatile first,
+        # then _apply_live re-grids them by gap once fresh prices compute.
         empty.sort(key=lambda p: self._vol_order_key(
             p['ticker'], self._volatility.get(p['ticker'])))
 
         # One continuous 2-column grid — no section headers or boundary. Deployed
-        # cards (bold + "DEPLOYED" tag) first by size, then empty by volatility.
+        # cards (bold + "DEPLOYED" tag) first, then empty. Live refresh sorts
+        # both groups by gap.
         box = tk.Frame(self.content_frame)
         box.pack(fill='both', expand=True, padx=2, pady=2)
         box.grid_columnconfigure(0, weight=1, uniform='col')
@@ -575,31 +506,21 @@ class App:
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             row.set_row_num(i + 1)
 
-    def _norm_krw(self, amount, currency):
-        """Normalize a cash amount to KRW for cross-currency size comparison.
-        Falls back to the raw amount when the FX rate is not yet known."""
-        if currency == 'USD' and self._fx_rate:
-            return amount * self._fx_rate
-        return amount
-
     def _vol_order_key(self, ticker, vol):
         """Sort key for empty cards: highest 5-day volatility first, unknown
         volatility last, ties broken by the fixed catalogue order."""
         return (-vol if vol is not None else float('inf'),
                 stock_sort_key(ticker))
 
+    def _gap_order_key(self, row):
+        """Highest gap first: +1% above -1%, then -2%, and so on."""
+        return (-row._gap if row._gap is not None else float('inf'),
+                stock_sort_key(row.ticker))
+
     def _reorder_cards(self):
-        """Re-sort + re-grid all cards once fresh data is in: deployed by size
-        (FX-normalized, only when FX known); empty by gap to the load trigger.
-        The gap is negative (load below the live price), so the least-negative
-        (or positive — already at/below the bait) sit on top as the closest to a
-        buy; the deepest-blue (farthest below) sink to the bottom."""
-        if self._fx_rate:
-            self.deployed_rows.sort(
-                key=lambda r: self._norm_krw(_cb(r), r.currency), reverse=True)
-        self.empty_rows.sort(
-            key=lambda r: (-r._gap if r._gap is not None else float('inf'),
-                           stock_sort_key(r.ticker)))
+        """Re-sort + re-grid all cards once fresh gaps are computed."""
+        self.deployed_rows.sort(key=self._gap_order_key)
+        self.empty_rows.sort(key=self._gap_order_key)
         self._grid_all_cards()
 
     # ── Deployed section ─────────────────────────────────────────────────────
@@ -1143,14 +1064,13 @@ class App:
 
         deployed_krw = sum(val_krw(r.ticker, r.current_shares())
                            for r in self.deployed_rows)
-        kb_krw = sum(val_krw(h['ticker'], h['shares']) for h in KB_HOLDINGS)
 
         acct = self._last_account or {}
         cash_krw = acct.get('cash_krw') or 0
         cash_usd = acct.get('cash_usd') or 0
         reserve_krw = cash_krw + (cash_usd * fx if fx else 0)
         ordered_krw = self._buy_orders_krw(fx)
-        total_krw = deployed_krw + kb_krw + reserve_krw + ordered_krw
+        total_krw = deployed_krw + reserve_krw + ordered_krw
 
         try:
             unit_krw = float(self.unit_krw_var.get().replace(',', ''))
@@ -1159,7 +1079,6 @@ class App:
 
         return {
             'deployed_krw': deployed_krw,
-            'kb_krw': kb_krw,
             'cash_krw': cash_krw,
             'cash_usd': cash_usd,
             'reserve_krw': reserve_krw,
@@ -1226,7 +1145,7 @@ class App:
 
     def _update_banner(self):
         """Top-line cash + army summary. In Toss(auto) mode it also computes the
-        total unit count from deployed + KB + cash + reserved buy orders."""
+        total unit count from deployed + cash + reserved buy orders."""
         if not self._auto:
             self._full_army_krw = 0.0
             self.banner_var.set('')
@@ -1235,7 +1154,6 @@ class App:
             return
         snap = self._army_snapshot()
         deployed_krw = snap['deployed_krw']
-        kb_krw = snap['kb_krw']
         cash_krw = snap['cash_krw']
         cash_usd = snap['cash_usd']
         reserve_krw = snap['reserve_krw']
@@ -1254,7 +1172,6 @@ class App:
         self.banner_var.set(
             f"Cash: ₩{cash_krw:,.0f} + ${cash_usd:,.0f}     "
             f"Deployed: {u(deployed_krw)} ({dep_pct:.0f}%)     "
-            f"KB: {u(kb_krw)}     "
             f"Ordered: {u(ordered_krw)}     "
             f"Reserve: {u(reserve_krw)}     "
             f"Total: ₩{total_krw:,.0f} = {self.N_var.get()} units")
