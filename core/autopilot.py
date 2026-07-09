@@ -23,13 +23,20 @@ the next buy. Everything else is the controller's problem (log / backoff).
 from core.calc import trim_buy_price, trim_sell_price
 
 # ── 443 constants ────────────────────────────────────────────────────────────
-LOAD_DROP_PCT  = 4
-CHASE_DROP_PCT = 4
-SELL_GAIN_PCT  = 3
+LOAD_DROP_PCT   = 4
+CHASE_DROP_PCT  = 4
+SELL_GAIN_PCT   = 3
+RELOAD_DROP_PCT = 3      # §30.7: reload after an intraday full sell sits at
+                         # -3% of the sell price (re-enter near the old cost)
 
 POLL_SECONDS   = 15      # per-stock poll interval (§30.3)
 MAX_AUTOPILOT  = 2       # hard cap on simultaneously autopiloted stocks (§30.6)
 FEE_BUFFER     = 1.005   # reserve must cover price*qty*buffer before a buy
+
+# §30.7 test phase: the reserve pre-check is UNLOCKED (dry-run keeps trading
+# on paper; live mode relies on Toss rejecting unaffordable buys — that broker
+# rejection still stops the bot). Flip to True to restore the self-stop gate.
+RESERVE_GATE = False
 
 # US prices come back with float noise; KR prices are ints so exact compare.
 _PRICE_EPS_US = 0.005
@@ -77,12 +84,15 @@ class Daily443Engine:
         self.currency = 'KRW' if ticker.endswith('.KS') else 'USD'
         self.state   = 'ARMING'     # ARMING → EMPTY / DEPLOYED → (STOPPED)
         self.anchor  = anchor       # LOAD reference while EMPTY (§6)
+        self.anchor_source = 'close'   # 'close' (-4% load) | 'sell' (-3% reload)
         self.trading_date = trading_date
         self.stopped_reason = None
         self.chase_count = 0        # chase fills today (log/telemetry only)
-        self.lines = {}             # {'load'|'chase'|'sell': (price, qty)}
+        self.lines = {}             # {'load'|'chase'|'sell'|'psell': (price, qty)}
         self.status = 'arming'      # one-line human status for the UI
+        self.events = []            # today's fills: {ts, kind, qty, price, shares, avg}
         self._prev_shares = None
+        self._prev_avg = 0.0
         self._my_sell_price = None  # anchor source after a full sell (§11)
         self._log = log or (lambda msg: None)
 
@@ -102,23 +112,43 @@ class Daily443Engine:
 
     # ── Fill detection (broker is the source of truth, §17) ──────────────────
 
-    def _detect_fills(self, shares: int):
+    def _event(self, kind, qty, price, shares, avg):
+        from datetime import datetime
+        self.events.append({'ts': datetime.now().strftime('%H:%M:%S'),
+                            'kind': kind, 'qty': qty, 'price': price,
+                            'shares': shares, 'avg': avg})
+        del self.events[:-300]
+
+    def _detect_fills(self, snap, shares: int):
         prev = self._prev_shares
         if prev is None:
             return
+        avg = float(snap.get('avg_cost') or 0)
         if shares > prev:
+            qty = shares - prev
             if prev == 0:
+                # The broker avg IS the actual load fill price.
+                price = avg or (self.lines.get('load') or (None,))[0]
+                self._event('LOAD', qty, price, shares, avg)
                 self._log(f'LOAD filled: 0 → {shares} shares')
             else:
                 self.chase_count += 1
+                # Actual chase fill price backed out of the avg change.
+                price = ((avg * shares - self._prev_avg * prev) / qty
+                         if avg > 0 and self._prev_avg > 0 else None)
+                self._event('CHASE', qty, price, shares, avg)
                 self._log(f'CHASE filled: {prev} → {shares} shares '
                           f'(chase #{self.chase_count} today)')
         elif prev > 0 and shares == 0:
-            # Full sell → reset the anchor to the sell line so the bot does
-            # not immediately rebuy too high (§6/§11).
+            # Full sell → the next load anchors on the sell price, at the
+            # closer -3% reload so a repeated dip re-enters near the old
+            # cost (§30.7). Next day it reverts to prev close / -4%.
+            self._event('SELL', -prev, self._my_sell_price, 0, 0.0)
             if self._my_sell_price:
                 self.anchor = self._my_sell_price
-                self._log(f'SELL filled: anchor reset to {self.anchor:,.0f}')
+                self.anchor_source = 'sell'
+                self._log(f'SELL filled: anchor reset to {self.anchor:,.0f} '
+                          f'(-{RELOAD_DROP_PCT}% reload)')
             else:
                 self._log('SELL filled (external?) — anchor kept')
 
@@ -130,8 +160,10 @@ class Daily443Engine:
             return
         self.trading_date = d
         self.chase_count = 0
+        self.events = []
         if snap['shares'] <= 0 and snap.get('prev_close'):
             self.anchor = snap['prev_close']
+            self.anchor_source = 'close'      # -4% load again (§6/§30.7)
             self._log(f'new day {d}: anchor = prev close {self.anchor:,.0f}')
 
     # ── Main decision cycle ───────────────────────────────────────────────────
@@ -142,8 +174,9 @@ class Daily443Engine:
 
         self._roll_day(snap)
         shares = int(snap.get('shares') or 0)
-        self._detect_fills(shares)
+        self._detect_fills(snap, shares)
         self._prev_shares = shares
+        self._prev_avg = float(snap.get('avg_cost') or 0)
 
         price = snap.get('price')
         acts = (self._poll_deployed(snap, shares, price) if shares > 0
@@ -151,6 +184,8 @@ class Daily443Engine:
         return acts
 
     def _reserve_ok(self, snap, price, qty) -> bool:
+        if not RESERVE_GATE:
+            return True          # §30.7 test phase: gate unlocked
         bp = snap.get('buying_power')
         if bp is None:
             return True          # unknown reserve: let the broker be the judge
@@ -235,15 +270,21 @@ class Daily443Engine:
         if not self.anchor or self.anchor <= 0:
             if snap.get('prev_close'):
                 self.anchor = snap['prev_close']
+                self.anchor_source = 'close'
                 self._log(f'anchor = prev close {self.anchor:,.0f}')
             else:
                 self.status = 'empty — waiting for anchor (prev close)'
                 self.lines = {}
                 return []
 
-        load_p = trim_buy_price(self.ticker, self.anchor * (1 - LOAD_DROP_PCT / 100.0))
+        # -4% from the day anchor; -3% when re-arming off an intraday sell.
+        drop = RELOAD_DROP_PCT if self.anchor_source == 'sell' else LOAD_DROP_PCT
+        load_p = trim_buy_price(self.ticker, self.anchor * (1 - drop / 100.0))
         lq = load_qty(snap.get('unit_cash'), load_p)
-        self.lines = {'load': (load_p, lq)}
+        # 'psell' = the pseudo exit the daily chart draws above the load.
+        self.lines = {'load': (load_p, lq),
+                      'psell': (trim_sell_price(
+                          self.ticker, load_p * (1 + SELL_GAIN_PCT / 100.0)), lq)}
         if lq <= 0:
             self.status = 'empty — unit cash unknown'
             return []
@@ -260,17 +301,17 @@ class Daily443Engine:
                     and (not self._same_price(b0.get('price'), load_p)
                          or int(b0.get('qty_open') or 0) != lq)):
                 acts.append(('cancel', b0['id'], 'stale LOAD'))
-                acts.append(('place', 'BUY', load_p, lq, f'-{LOAD_DROP_PCT}% load'))
+                acts.append(('place', 'BUY', load_p, lq, f'-{drop}% load'))
                 self.status = f'load refreshed: {lq} @ {load_p:,.0f}'
             else:
                 self.status = (f'load resting {lq} @ {b0.get("price"):,.0f} '
-                               f'(anchor {self.anchor:,.0f})')
+                               f'(anchor {self.anchor:,.0f}, -{drop}%)')
             return acts
 
         if not self._reserve_ok(snap, load_p, lq):
             acts.append(('stop', f'reserve cannot fund the load ({lq} @ {load_p:,.0f})'))
             self.stop(f'reserve cannot fund the load ({lq} @ {load_p:,.0f})')
             return acts
-        acts.append(('place', 'BUY', load_p, lq, f'-{LOAD_DROP_PCT}% load'))
+        acts.append(('place', 'BUY', load_p, lq, f'-{drop}% load'))
         self.status = f'placing load {lq} @ {load_p:,.0f}'
         return acts

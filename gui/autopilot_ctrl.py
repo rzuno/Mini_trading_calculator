@@ -32,6 +32,8 @@ _LOG_PATH = os.path.join('logs', 'autopilot443.log')
 
 _BACKOFF_HOURS_CLOSED = 300     # seconds
 _BACKOFF_OTHER = 60
+_TICKS_KEPT = 2400              # ~10h of 15s ticks for the daily chart
+_FAIL_ANNOUNCE = 6              # consecutive bad polls (~90s) → one warning
 
 BADGE = {'DRY': ('443 DRY', '#E08000'),
          'LIVE': ('443 LIVE', '#CC0000'),
@@ -131,6 +133,8 @@ class AutopilotController:
                 'engine': None, 'live': False, 'paper': None,
                 'backoff_until': 0.0, 'stopped': False,
                 'prev_close': None, 'prev_close_date': None,
+                'ticks': [],           # (epoch, price) history for the daily chart
+                'fail_n': 0, 'fail_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING', 'status': 'arming…',
                        'lines': {}, 'mode': 'DRY', 'price': None},
             }
@@ -253,13 +257,49 @@ class AutopilotController:
                     self._cycle(ticker, slot)
                 except Exception as e:
                     self._log(ticker, f'poll error: {type(e).__name__}: {e}')
+                    self._data_failure(ticker, slot, f'{type(e).__name__}')
                     try:
                         self._push_ui(ticker, slot,
-                                      status=f'poll error: {type(e).__name__}')
+                                      status='NO DATA (retrying) — '
+                                             f'{type(e).__name__}')
                     except Exception:
                         pass
             self._wake.wait(POLL_SECONDS)
             self._wake.clear()
+
+    # ── Data-problem announcement (§30.7) ─────────────────────────────────────
+    # The bot never guesses on missing data: a failed poll skips the whole
+    # cycle (no orders placed or cancelled) and retries in POLL_SECONDS.
+    # After _FAIL_ANNOUNCE consecutive failures it warns ONCE; it does not
+    # disable itself — resting orders stay on Toss and die at market close.
+
+    def _data_failure(self, ticker, slot, why):
+        slot['fail_n'] = slot.get('fail_n', 0) + 1
+        if slot['fail_n'] >= _FAIL_ANNOUNCE and not slot.get('fail_warned'):
+            slot['fail_warned'] = True
+            self._log(ticker, f'DATA PROBLEM announced after '
+                              f"{slot['fail_n']} failed polls ({why})")
+
+            def popup():
+                messagebox.showwarning(
+                    '443 Autopilot — data problem',
+                    f'{ticker}: Toss data has been unavailable for '
+                    f"~{slot['fail_n'] * POLL_SECONDS}s ({why}).\n\n"
+                    'The bot is idle and keeps retrying every poll.\n'
+                    'No orders are sent while data is missing; resting '
+                    'orders stay on Toss (DAY orders die at close).')
+            try:
+                self.root.after(0, popup)
+            except (RuntimeError, tk.TclError):
+                pass
+
+    def _data_recovered(self, ticker, slot):
+        if slot.get('fail_n'):
+            if slot.get('fail_warned'):
+                self._log(ticker, f"data recovered after {slot['fail_n']} "
+                                  f'failed polls')
+            slot['fail_n'] = 0
+            slot['fail_warned'] = False
 
     # ── One poll cycle for one stock ──────────────────────────────────────────
 
@@ -332,6 +372,16 @@ class AutopilotController:
 
         real = self._real_snapshot(prov, seq, ticker)
         live = slot['live']
+
+        # Tick history for the daily chart; a missing price counts as a data
+        # failure (the engine still runs — it is safe without a price, it just
+        # cannot check triggers).
+        if real['price'] is not None:
+            slot['ticks'].append((time.time(), real['price']))
+            del slot['ticks'][:-_TICKS_KEPT]
+            self._data_recovered(ticker, slot)
+        else:
+            self._data_failure(ticker, slot, 'no price from Toss')
 
         if not live:
             # DRY RUN: seed the paper account from reality once, then let the
@@ -447,19 +497,25 @@ class AutopilotController:
         engine = slot.get('engine')
         stopped = slot.get('stopped')
         badge_key = 'STOP' if stopped else ('LIVE' if slot['live'] else 'DRY')
+        ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         ui = {
             'ticker': ticker,
             'state': engine.state if engine else 'ARMING',
             'status': status or (engine.status if engine else 'arming…'),
             'lines': dict(engine.lines) if engine else {},
             'anchor': engine.anchor if engine else None,
+            'anchor_source': engine.anchor_source if engine else 'close',
             'chase_count': engine.chase_count if engine else 0,
+            'events': list(engine.events) if engine else [],
             'mode': 'LIVE' if slot['live'] else 'DRY',
             'badge_key': badge_key,
             'price': (snap or {}).get('price'),
             'shares': (snap or {}).get('shares'),
             'avg_cost': (snap or {}).get('avg_cost'),
+            'buying_power': (snap or {}).get('buying_power'),
+            'unit_cash': self._units.get(ccy) or 0.0,
             'orders': list((snap or {}).get('orders') or []),
+            'ticks': list(slot.get('ticks') or []),
             'ts': datetime.now().strftime('%H:%M:%S'),
         }
         slot['ui'] = ui

@@ -177,14 +177,18 @@ class CandleChartWindow:
         self._ap_mode_btn = tk.Button(ap, text='DRY RUN', font=_F_STAT,
                                       width=9, state='disabled',
                                       command=self._ap_on_mode)
-        self._ap_mode_btn.grid(row=0, column=2, padx=(0, 12))
+        self._ap_mode_btn.grid(row=0, column=2, padx=(0, 6))
+        self._ap_daily_btn = tk.Button(ap, text='Daily ▸', font=_F_STAT,
+                                       width=8, state='disabled',
+                                       command=self._ap_open_daily)
+        self._ap_daily_btn.grid(row=0, column=3, padx=(0, 12))
         self._ap_state_lbl = tk.Label(ap, text='off', font=_F_STAT,
                                       fg='#666', anchor='w')
-        self._ap_state_lbl.grid(row=0, column=3, sticky='w')
-        ap.grid_columnconfigure(3, weight=1)
+        self._ap_state_lbl.grid(row=0, column=4, sticky='w')
+        ap.grid_columnconfigure(4, weight=1)
         self._ap_lines_lbl = tk.Label(ap, text='', font=_F_REF, fg='#333',
                                       anchor='w', justify='left')
-        self._ap_lines_lbl.grid(row=1, column=0, columnspan=4, sticky='w',
+        self._ap_lines_lbl.grid(row=1, column=0, columnspan=5, sticky='w',
                                 pady=(2, 0))
 
         # Live updates from the controller; detach when the window closes.
@@ -209,6 +213,12 @@ class CandleChartWindow:
             ok, msg = self.autopilot['enable']()
             if not ok:
                 messagebox.showwarning('443 Autopilot', msg, parent=self.win)
+
+    def _ap_open_daily(self):
+        """Pop the dedicated Daily 443 live chart — the only tick-reactive
+        window (this 5-day chart stays refresh-driven)."""
+        from gui.daily443_chart import Daily443ChartWindow
+        Daily443ChartWindow(self.win, self.ticker, self.ccy, self.autopilot)
 
     def _ap_on_mode(self):
         ui = self.autopilot['ui_state']() or {}
@@ -238,6 +248,7 @@ class CandleChartWindow:
                                    fg='black')
             self._ap_mode_btn.config(state='disabled', text='DRY RUN',
                                      bg=self._ap_default_bg, fg='black')
+            self._ap_daily_btn.config(state='disabled')
             self._ap_state_lbl.config(text='off', fg='#666')
             self._ap_lines_lbl.config(text='')
             self.ap_lines = {}
@@ -246,6 +257,7 @@ class CandleChartWindow:
             return
 
         self._ap_toggle.config(text='ON', bg=_AP_ON_BG, fg='white')
+        self._ap_daily_btn.config(state='normal')
         live = ui.get('mode') == 'LIVE'
         self._ap_mode_btn.config(
             state='normal', text=('LIVE' if live else 'DRY RUN'),
@@ -272,11 +284,16 @@ class CandleChartWindow:
         parts.append(f"poll {ui.get('ts', '--')}")
         self._ap_lines_lbl.config(text='    '.join(parts))
 
-        self.ap_lines = dict(ui.get('lines') or {})
-        if ui.get('price'):
-            self.current_price = ui['price']
+        # The 5-day chart is refresh-driven (§30.7): it does NOT follow the
+        # live tick price. Only a structural change of the 443 lines (a fill
+        # moved the avg / anchor) triggers a redraw of the overlay; the live
+        # movement lives in the Daily ▸ window.
+        new_lines = {k: v for k, v in (ui.get('lines') or {}).items()
+                     if k in _AP_COLORS}
         self._update_order_buttons()
-        self._redraw()
+        if new_lines != self.ap_lines:
+            self.ap_lines = new_lines
+            self._redraw()
 
     def _redraw(self):
         """Redraw only once the canvas exists (the 443 panel is built first)."""

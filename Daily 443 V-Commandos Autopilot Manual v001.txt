@@ -936,3 +936,38 @@ going LIVE requires a confirm dialog listing the orders it will manage.
 Maximum autopiloted stocks: 2 (a third is blocked).
 KR stocks first; US possible later (computer on overnight).
 ```
+
+### 30.7 v002 refinements (2026-07-09, second pass)
+
+Reload rule: after an intraday full sell, the new LOAD sits at
+-3% of the sell price (not -4%), so a repeat dip re-enters near the
+old cost (sell at 103 → reload near 100). At the next trading day the
+anchor returns to the previous close and the -4% load applies again.
+
+```text
+anchor from prev close  → LOAD = anchor × 0.96
+anchor from a sell      → LOAD = anchor × 0.97
+```
+
+Daily 443 live chart: a dedicated window ("Daily ▸" in the 443 panel
+of the 5-day chart, active while autopilot is on). It shows the
+intraday tick path inside the shaded 7% commando zone (chase/load
+line → sell line), plus avg/anchor, today's campaign fill log
+(what was bought at how much until all sold) and the deployed size.
+It is the ONLY window that follows the 15-second ticks — the 5-day
+chart and the main panel stay refresh-button-driven. While the path
+stays inside the zone, the autopilot is working the plan.
+
+Data problems: a failed poll (network, Toss outage, missing price)
+skips the whole cycle — nothing is placed or cancelled on stale or
+missing data — and retries in 15 s. After ~6 consecutive failures
+(~90 s) a one-time warning popup announces the outage; the bot stays
+enabled, idles, and recovers by itself. Resting orders stay on Toss
+(DAY orders die at market close anyway).
+
+Reserve gate: UNLOCKED for the test phase (RESERVE_GATE=False in
+core/autopilot.py) while the KB proceeds have not landed. Dry-run
+keeps trading on paper regardless of reserve; live mode relies on
+Toss rejecting unaffordable buys (that broker rejection still stops
+the bot with the popup). Flip RESERVE_GATE=True to restore the
+self-stop once real cash is back.
