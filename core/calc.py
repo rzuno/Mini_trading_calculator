@@ -336,6 +336,24 @@ def round_kr_tick(price: float) -> int:
     return int(round(price / t) * t)
 
 
+def trim_buy_price(ticker: str, price: float) -> float:
+    """Trim a BUY line DOWN to a clean orderable number: KR floored to its tick
+    (never bids above the strategy line), US floored to the cent."""
+    if ticker.endswith('.KS'):
+        t = kr_tick_size(price)
+        return int(math.floor(price / t) * t)
+    return math.floor(price * 100) / 100.0
+
+
+def trim_sell_price(ticker: str, price: float) -> float:
+    """Trim a SELL line UP to a clean orderable number: KR ceiled to its tick
+    (never asks below the strategy line), US ceiled to the cent."""
+    if ticker.endswith('.KS'):
+        t = kr_tick_size(price)
+        return int(math.ceil(price / t) * t)
+    return math.ceil(price * 100) / 100.0
+
+
 def fmt_order_price(ticker: str, price: float) -> str:
     """Format a limit price for the order API: KR snapped to its tick grid (int),
     US to 2 decimals (>= $1) or 4 decimals (< $1)."""

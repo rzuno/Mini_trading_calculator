@@ -14,6 +14,7 @@ from core.csv_io import load_config, save_config, load_positions, save_positions
 from providers import get_provider
 from gui.stock_row import StockRow
 from gui.candle_chart import CandleChartWindow
+from gui.autopilot_ctrl import AutopilotController
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
 _F_SECTION = ('Segoe UI', 16, 'bold')
@@ -101,6 +102,11 @@ class App:
         self.gear_status_var  = tk.StringVar(value='Gear: normal')
         self.global_rule_enabled_var = tk.BooleanVar(
             value=bool(self.config.get('global_gear_rule_enabled', False)))
+
+        # Daily 443 autopilot (always OFF at launch; armed from the graph).
+        self.deployed_rows = []
+        self.empty_rows    = []
+        self.autopilot = AutopilotController(self)
 
         # ── Build layout ────────────────────────────────────────────────────
         self._build_header()
@@ -588,7 +594,9 @@ class App:
                     sell_lines=cd['sell_lines'],
                     current_price=current_price,
                     ordered_lines=ordered,
-                    order_actions=actions)
+                    order_actions=actions,
+                    autopilot=(self.autopilot.graph_context(ticker)
+                               if self._auto else None))
                 return
 
         # Fallback (ticker has no row yet)
@@ -1009,6 +1017,9 @@ class App:
 
         self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)
+
+        # Cards were rebuilt — re-apply 443 badges and refresh cached units.
+        self.autopilot.on_rows_rebuilt()
 
         if not quiet:
             self.last_refresh_var.set(

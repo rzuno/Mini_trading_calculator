@@ -168,7 +168,7 @@ class StockRow:
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
 
-        # Right side: "[DEPLOYED] [baited/ordered status]".
+        # Right side: "[443 banner] [DEPLOYED] [baited/ordered status]".
         self._status_frame = tk.Frame(r0)
         self._status_frame.pack(side='right', padx=(6, 2))
         self._status_sign_lbl = tk.Label(self._status_frame, text='',
@@ -180,6 +180,9 @@ class StockRow:
         if self.deployed:
             tk.Label(r0, text='DEPLOYED', font=_F_SM_B, fg='#0033AA'
                      ).pack(side='right', padx=(4, 0))
+        # Autopilot banner (set via set_autopilot; blank when off).
+        self._ap_lbl = tk.Label(r0, text='', font=_F_STATUS)
+        self._ap_lbl.pack(side='right', padx=(4, 0))
 
         # Army % (deployed only)
         tk.Label(r0, textvariable=self.army_pct_var,
@@ -729,6 +732,13 @@ class StockRow:
 
     def set_row_num(self, n: int):
         self._name_lbl.config(text=f"{n}. {self._disp_name}")
+
+    def set_autopilot(self, text, color='#E08000'):
+        """Show (or clear, text=None) the 443 autopilot banner on the card."""
+        if text:
+            self._ap_lbl.config(text=f'⚡ {text}', fg=color)
+        else:
+            self._ap_lbl.config(text='')
 
     # -- Order intents (used by the graph order/cancel flow) ------------------
 

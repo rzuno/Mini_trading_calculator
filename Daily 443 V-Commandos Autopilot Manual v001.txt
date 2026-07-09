@@ -1,0 +1,938 @@
+# Daily 443 V-Commandos Autopilot Manual v001
+
+## 1. Purpose
+
+Daily 443 V-Commandos is a short-cycle automated trading mode for highly volatile Korean stocks.
+
+The purpose is not to predict the long-term direction of the stock. The purpose is to exploit repeated short rebounds inside a volatile chart.
+
+Core idea:
+
+```text
+Enter after a daily pullback.
+If the stock falls more, chase the average cost downward.
+When the stock rebounds slightly, sell everything.
+After selling, reset and prepare the next entry.
+```
+
+The strategy should usually finish within the same day, one or two days, or at most five trading days. If it remains trapped longer than that, the position is no longer in normal V-Commandos mode and should be treated as a recovery/manual case.
+
+---
+
+## 2. Relationship to Existing Strategy
+
+This is a separate mode from the older 5D bait system.
+
+### Old mode: 5D bait / manual calculator
+
+Uses 5-day high, volatility gears, sell tiers, and wider swing logic.
+
+Good for:
+
+```text
+manual trading
+US stocks
+sleeping computer
+slower campaigns
+bait-style trading
+```
+
+### New mode: Daily 443 V-Commandos Autopilot
+
+Uses daily anchor, one load point, one chase point, and one exit point.
+
+Good for:
+
+```text
+KR stocks
+active Korean market hours
+one or two selected stocks
+high-volatility stocks
+short-cycle automated trading
+```
+
+The new mode should not delete the old system. It should exist as a selectable strategy mode.
+
+---
+
+## 3. Strategy Name
+
+Recommended names:
+
+```text
+Daily 443 Autopilot
+Daily V-Commandos
+443 V-Commandos
+```
+
+Working name:
+
+```text
+Daily 443 V-Commandos Autopilot
+```
+
+---
+
+## 4. Core Constants
+
+Default test-period constants:
+
+```text
+LOAD drop  = -4%
+CHASE drop = -4%
+SELL gain  = +3%
+CHASE size = 0.5 × current shares
+```
+
+This gives the name:
+
+```text
+443 rule
+```
+
+Meaning:
+
+```text
+4% load
+4% chase
+3% exit
+```
+
+---
+
+## 5. Stock Selection Rule
+
+Autopilot should be enabled only for selected battlefronts.
+
+Default rule:
+
+```text
+Maximum active autopilot stocks: 1 or 2
+Market: Korean stocks first
+Preferred volatility: V5 > 20%
+```
+
+The bot may monitor many stocks, but it should not trade many stocks automatically.
+
+Recommended initial use:
+
+```text
+Only 1 stock in real-money test
+Only KR stock
+Small capital
+Dry-run first
+```
+
+---
+
+## 6. Vantage Point / Anchor Rule
+
+The daily anchor is the reference point from which the LOAD price is calculated.
+
+### First anchor of the day
+
+At the beginning of each trading day:
+
+```text
+anchor = previous trading day close
+```
+
+Then:
+
+```text
+LOAD price = anchor × 0.96
+```
+
+### Intraday reset after full sell
+
+If the bot sells the entire position during the same day:
+
+```text
+anchor = last sell price
+```
+
+Then the new LOAD price becomes:
+
+```text
+new LOAD price = last sell price × 0.96
+```
+
+This prevents the bot from selling and then immediately rebuying too high.
+
+### Next day reset
+
+At the next trading day:
+
+```text
+anchor = previous trading day close
+```
+
+The previous intraday sell anchor does not carry into the next day.
+
+---
+
+## 7. State Machine
+
+The autopilot has five states.
+
+```text
+OFF
+ARMED_EMPTY
+DEPLOYED
+TRAPPED
+PAUSED
+```
+
+---
+
+## 8. OFF State
+
+Autopilot is disabled.
+
+The program may still show calculated values, but it must not place, cancel, or modify orders.
+
+Allowed behavior:
+
+```text
+show price
+show anchor
+show suggested LOAD
+show suggested SELL/CHASE if manually entered
+```
+
+Forbidden behavior:
+
+```text
+no order placement
+no automatic cancellation
+no automatic modification
+```
+
+---
+
+## 9. ARMED_EMPTY State
+
+The stock is selected for autopilot, but there are no shares currently held.
+
+Condition:
+
+```text
+shares == 0
+autopilot enabled
+```
+
+The bot should maintain one BUY order:
+
+```text
+LOAD price = anchor × 0.96
+LOAD quantity = 1 unit worth of shares
+```
+
+Only one LOAD order should exist.
+
+If the LOAD order fills:
+
+```text
+state → DEPLOYED
+avg_cost = actual average cost from Toss
+shares = actual shares from Toss
+chase_count += 0
+```
+
+Then the bot creates:
+
+```text
+SELL order at avg_cost × 1.03
+CHASE order at avg_cost × 0.96
+```
+
+---
+
+## 10. DEPLOYED State
+
+The stock is currently held.
+
+Condition:
+
+```text
+shares > 0
+```
+
+The bot should maintain exactly two intended orders:
+
+```text
+1. SELL order
+2. CHASE BUY order
+```
+
+### SELL order
+
+```text
+sell_price = avg_cost × 1.03
+sell_quantity = all shares
+```
+
+The SELL order is the exit door. It sells the entire position.
+
+### CHASE BUY order
+
+```text
+chase_price = avg_cost × 0.96
+chase_quantity = round(current_shares × 0.5)
+```
+
+If the CHASE order fills, the bot must update from Toss account data:
+
+```text
+new shares
+new avg_cost
+new cost basis
+```
+
+Then it must renew both orders:
+
+```text
+cancel/replace old SELL
+cancel/replace old CHASE
+
+new SELL = new avg_cost × 1.03
+new CHASE = new avg_cost × 0.96
+```
+
+The bot must never assume the fill price. Toss account data is the source of truth.
+
+---
+
+## 11. Full Sell Handling
+
+If the SELL order fills and shares become zero:
+
+```text
+state → ARMED_EMPTY
+last_sell_price = actual sell fill price
+anchor = last_sell_price
+new LOAD price = anchor × 0.96
+```
+
+The bot may then place a new LOAD order from the last sell price.
+
+This allows multiple same-day cycles:
+
+```text
+load
+chase if needed
+sell
+reset anchor from sell price
+load again if price drops enough
+```
+
+---
+
+## 12. TRAPPED State
+
+A position enters TRAPPED state when normal V-Commandos logic has failed to exit quickly.
+
+Suggested trap conditions:
+
+```text
+holding_days > 5
+or chase_count_today >= max_chase_per_day
+or total deployed units in this stock >= max_stock_units
+or reserve_units < reserve_safety_limit
+or price falls too far without rebound
+```
+
+Initial conservative defaults:
+
+```text
+max_chase_per_day = 3
+max_holding_days = 5
+max_autopilot_stocks = 1 or 2
+reserve safety threshold = 20%
+```
+
+In TRAPPED state:
+
+```text
+do not place new CHASE buys
+do not place new LOAD buys
+keep or revise SELL order
+notify user
+require manual decision
+```
+
+TRAPPED means:
+
+```text
+This is no longer daily commandos.
+This is now recovery/manual mode.
+```
+
+---
+
+## 13. PAUSED State
+
+The bot must pause when it is uncertain.
+
+Pause conditions:
+
+```text
+Toss account data unavailable
+market data stale
+order status unknown
+API timeout after order request
+unexpected manual/app order detected
+more than one unmanaged order exists
+position does not match local state
+reserve safety violated
+user presses kill switch
+market closed or order not allowed
+```
+
+In PAUSED state:
+
+```text
+do not send new orders
+do not repeat unknown orders
+show reason for pause
+wait for user confirmation or reconciliation
+```
+
+---
+
+## 14. Polling Loop
+
+The autopilot should poll Toss regularly.
+
+Suggested interval:
+
+```text
+10–15 seconds
+```
+
+Each loop should do this:
+
+```text
+1. Fetch current price / quote
+2. Fetch account holdings
+3. Fetch open orders
+4. Reconcile local state with Toss state
+5. Detect fills
+6. Decide desired orders
+7. Cancel/replace only if necessary
+8. Log the cycle
+```
+
+The bot should not blindly send orders every 10 seconds.
+
+It should maintain the desired orders.
+
+---
+
+## 15. Order Policy
+
+For one autopilot stock:
+
+### EMPTY
+
+Allowed orders:
+
+```text
+one BUY LOAD order
+```
+
+Forbidden:
+
+```text
+no SELL
+no CHASE
+no duplicate BUY
+```
+
+### DEPLOYED
+
+Allowed orders:
+
+```text
+one SELL order
+one CHASE BUY order
+```
+
+Forbidden:
+
+```text
+no duplicate SELL
+no duplicate CHASE
+no multiple ladder orders
+```
+
+This mode is intentionally simpler than the old calculator.
+
+---
+
+## 16. Order Replacement Rule
+
+Replace orders only when the desired order differs meaningfully from the existing order.
+
+Examples:
+
+```text
+avg_cost changed after CHASE fill
+shares changed
+anchor changed after full sell
+old order missing
+old order wrong price
+old order wrong quantity
+```
+
+Avoid unnecessary cancel/replace spam.
+
+---
+
+## 17. Source of Truth
+
+Toss account data is the source of truth for:
+
+```text
+actual shares
+actual average cost
+actual open orders
+actual filled orders
+actual buying power
+actual sellable quantity
+```
+
+Local program state is only the strategy memory:
+
+```text
+autopilot enabled or disabled
+selected stock
+current strategy mode
+anchor
+last sell price
+chase count
+holding start date
+trap status
+logs
+```
+
+If Toss and local state disagree, pause and reconcile.
+
+---
+
+## 18. Risk Limits
+
+Initial safety rules:
+
+```text
+Autopilot stocks: max 1 or 2
+Real-money test: start with 1 stock
+Max units per stock: user-defined
+Max chase fills per day: 3
+Max holding days: 5
+Reserve safety: pause new buy if reserve < 20%
+Kill switch: always available
+Dry-run mode: required before real orders
+```
+
+If reserve is low:
+
+```text
+no new LOAD
+no new CHASE
+only SELL / exit management
+```
+
+---
+
+## 19. Tactical Interpretation
+
+The tactic is not trying to buy the absolute bottom.
+
+The tactic is trying to pull the average cost close enough to the current battlefield that a normal volatile bounce can extract the position.
+
+Main sequence:
+
+```text
+LOAD at -4%
+CHASE at -4% below average
+SELL all at +3% above average
+```
+
+The motto:
+
+```text
+Stack lower, escape on the bounce, reset.
+```
+
+---
+
+## 20. Why +3% Exit
+
+The +3% exit is chosen because:
+
+```text
++2% may be too small after fees, taxes, spread, and opportunity cost.
++4% may be profitable but can delay escape.
++3% is the first baseline for test-period automation.
+```
+
+Future candidates:
+
+```text
+442 = emergency extraction
+443 = standard commandos
+444 = patient high-volatility version
+443H = +4% before chase, +3% after chase
+```
+
+For the first autopilot test:
+
+```text
+Use 443 only.
+Do not mix multiple variants yet.
+```
+
+---
+
+## 21. Graph Panel Behavior
+
+The graph window should allow the user to choose autopilot for one stock.
+
+Recommended graph controls:
+
+```text
+[Autopilot OFF/ON]
+[Mode: Daily 443]
+[Dry Run / Confirmed / Auto]
+[Anchor: previous close / last sell price]
+[Current state: EMPTY / DEPLOYED / TRAPPED / PAUSED]
+[LOAD price]
+[CHASE price]
+[SELL price]
+[Shares]
+[Avg cost]
+[Chase count]
+[Used units]
+[Reserve units]
+[Kill switch]
+```
+
+Only selected stocks can run autopilot.
+
+If more than the allowed number of stocks is selected:
+
+```text
+block activation
+show warning
+```
+
+---
+
+## 22. Dry-Run First
+
+Before real trading, Daily 443 must support dry-run.
+
+Dry-run behavior:
+
+```text
+calculate desired orders
+display what would be placed
+log simulated decisions
+do not send orders to Toss
+```
+
+Dry-run output example:
+
+```text
+SK Hynix
+State: EMPTY
+Anchor: 280,000
+Would place LOAD BUY at 268,800
+Quantity: 3 shares
+```
+
+After a simulated fill:
+
+```text
+State: DEPLOYED
+Would place SELL at avg × 1.03
+Would place CHASE at avg × 0.96
+```
+
+---
+
+## 23. Confirmed Mode
+
+Confirmed mode means:
+
+```text
+bot calculates orders
+user confirms before sending
+```
+
+This is the intermediate stage between dry-run and real autopilot.
+
+---
+
+## 24. Full Auto Mode
+
+Full auto mode means:
+
+```text
+bot calculates
+bot sends allowed orders
+bot cancels/replaces stale orders
+bot pauses on uncertainty
+```
+
+Full auto should be enabled only after dry-run and confirmed mode are tested.
+
+Initial full-auto limitations:
+
+```text
+KR stock only
+one selected stock
+small capital
+market hours only
+strict kill switch
+no overnight assumption
+no hidden multi-stock deployment
+```
+
+---
+
+## 25. Logs
+
+Every autopilot cycle should be logged.
+
+Minimum log fields:
+
+```text
+timestamp
+ticker
+mode
+state
+current_price
+anchor
+shares
+avg_cost
+open_orders
+desired_load_price
+desired_chase_price
+desired_sell_price
+action_taken
+reason
+reserve_units
+used_units
+chase_count
+```
+
+Important events:
+
+```text
+autopilot enabled
+autopilot disabled
+LOAD order placed
+LOAD filled
+CHASE order placed
+CHASE filled
+SELL order placed
+SELL filled
+anchor reset
+state changed to TRAPPED
+state changed to PAUSED
+manual override detected
+kill switch pressed
+```
+
+Logs are essential because later strategy optimization depends on actual records.
+
+---
+
+## 26. First Implementation Target
+
+The first version should not implement everything.
+
+Minimum viable Daily 443:
+
+```text
+1. Select one KR stock in graph
+2. Enable Daily 443 dry-run
+3. Show anchor, LOAD, CHASE, SELL
+4. Detect EMPTY / DEPLOYED from account state
+5. Print desired orders
+6. Log state transitions
+```
+
+Next:
+
+```text
+7. Confirmed order placement
+8. Real order reconciliation
+9. Full auto mode
+```
+
+---
+
+## 27. Non-Goals for First Version
+
+Do not include these in the first version:
+
+```text
+no volatility gearbox
+no 5D high bait logic
+no sell tiers
+no multiple chase ladder
+no many-stock autopilot
+no adaptive 442/443/444 switching
+no machine learning
+no complex prediction
+```
+
+The first version should be simple:
+
+```text
+one stock
+one LOAD
+one CHASE
+one SELL
+443 only
+```
+
+---
+
+## 28. Final Rule Sheet
+
+```text
+Daily 443 V-Commandos
+
+Market:
+    KR stocks first
+
+Selection:
+    1 or 2 stocks maximum
+    preferably V5 > 20%
+
+Constants:
+    LOAD drop  = 4%
+    CHASE drop = 4%
+    SELL gain  = 3%
+    CHASE size = 0.5 × current shares
+
+Anchor:
+    first anchor of day = previous close
+    after full sell = last sell price
+    next day = previous close
+
+EMPTY:
+    maintain one LOAD BUY
+    price = anchor × 0.96
+    size = 1 unit
+
+DEPLOYED:
+    maintain one SELL
+    price = avg_cost × 1.03
+    quantity = all shares
+
+    maintain one CHASE BUY
+    price = avg_cost × 0.96
+    quantity = current shares × 0.5
+
+After CHASE fill:
+    update actual account from Toss
+    recalculate avg_cost
+    replace SELL
+    replace CHASE
+
+After SELL fill:
+    shares = 0
+    anchor = last sell price
+    return to EMPTY
+    prepare new LOAD
+
+Trap:
+    if not escaped within 5 trading days,
+    or reserve is too low,
+    or chase count exceeds limit,
+    pause and require manual decision.
+```
+
+## 29. Core Motto
+
+```text
+Do not predict.
+Enter the pullback.
+Chase the average.
+Escape on the bounce.
+Reset.
+```
+
+---
+
+## 30. Final-Code Remarks (v001 addendum, 2026-07-09)
+
+Program requirements decided for the first implementation.
+
+### 30.1 Resting orders, one line per side
+
+Toss DAY limit orders rest until filled or auto-cancelled at market close,
+so the bot maintains desired orders instead of firing repeatedly.
+Only one BUY line and one SELL line are ever intended (no ladders).
+
+API constraint (verified live): a BUY and a SELL can never rest on the
+same stock at the same time (opposite-pending-order-exists). Resolution:
+
+```text
+The SELL (exit door) is the resting order by default —
+a brief bounce is caught at the exact touch.
+The CHASE/LOAD buy is watched by the polling loop;
+when price touches it: cancel SELL -> place BUY ->
+after the fill, place the new SELL.
+A placed BUY that does not fill stays resting;
+the SELL side is then the watched one (symmetric).
+The ~15s transition window is accepted risk.
+```
+
+### 30.2 Trimmed, conservative numbers
+
+```text
+Prices: snapped to the KR tick grid —
+        BUY lines rounded DOWN, SELL lines rounded UP.
+Chase quantity: max(1, floor(shares / 2))   (conservative half)
+    1 -> buy 1 (total 2)     2 -> buy 1 (total 3)
+    3 -> buy 1 (total 4)     4 -> buy 2 (total 6)
+    6 -> buy 3 (total 9)     9 -> buy 4 (total 13)
+Load quantity: floor(1 unit / load price), minimum 1 share.
+```
+
+### 30.3 Polling is per-stock, not global
+
+The Save & Refresh full fetch and the autopilot poll are separate.
+The poll (every ~15 s) touches ONLY the autopiloted ticker:
+price, holdings(symbol), open orders(symbol), buying power.
+The rest of the panel stays as of the last manual refresh.
+The autopiloted card and its graph update live from the poll.
+
+### 30.4 Stop rule (simplified from §12/§13)
+
+The bot stops autopiloting a stock ONLY when the reserve cannot fund
+the next buy (load or chase). It notifies (popup + red card banner +
+log) and leaves the resting SELL in place. Other errors just log,
+back off, and retry (order-hours-closed backs off ~5 minutes).
+
+### 30.5 Interface
+
+Enable/disable lives in the graph window (443 panel: ON/OFF, DRY RUN /
+LIVE, state, anchor, LOAD/CHASE/SELL lines, status). While autopilot is
+ON the manual Buy/Sell/Cancel graph buttons are disabled. The card
+shows a 443 banner (DRY orange / LIVE red / STOPPED dark red).
+Autopilot is always OFF at program start; enabling arms DRY RUN first,
+going LIVE requires a confirm dialog listing the orders it will manage.
+
+### 30.6 Limits
+
+```text
+Maximum autopiloted stocks: 2 (a third is blocked).
+KR stocks first; US possible later (computer on overnight).
+```
