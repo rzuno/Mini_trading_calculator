@@ -971,3 +971,62 @@ keeps trading on paper regardless of reserve; live mode relies on
 Toss rejecting unaffordable buys (that broker rejection still stops
 the bot with the popup). Flip RESERVE_GATE=True to restore the
 self-stop once real cash is back.
+
+### 30.8 v003 — the WATCHER model (2026-07-10)
+
+The autopilot pre-places NOTHING. It watches the price every 10 s and
+fires a real LIMIT order only at the moment a line is crossed:
+
+```text
+EMPTY:     price <= LOAD  -> BUY one unit
+DEPLOYED:  price <= CHASE -> BUY the chase quantity
+           price >= SELL  -> SELL everything
+```
+
+While our just-fired order rests unfilled, the watcher waits (no
+duplicate requests). If the opposite line triggers first, our unfilled
+order is cancelled and the new side fires (exit has priority). Orders
+placed manually in the app/web are NEVER cancelled — external fills
+flow back through the account data and the lines reset, so app and API
+trading coexist without friction and without end-of-day cancel noise.
+
+Modes (buttons live in the Daily 443 window, top right):
+
+```text
+WATCH — bare live info: zone chart + lines, no orders at all.
+        Opening the window arms it; closing the window stops it.
+DRY   — paper simulation (virtual fills, not connected to reality).
+LIVE  — the real watcher. Allowed ONLY during regular market hours
+        (KR 09:00-15:30 KST; US 09:30-16:00 ET, DST-aware).
+        Pre/after market: only WATCH and DRY.
+        When the session ends, LIVE drops back to WATCH by itself.
+```
+
+The card grew a big 443 button (right of the sell gear): its color IS
+the status — grey OFF, blue WATCH, orange DRY, red LIVE, dark-red
+STOP. Clicking it opens the Daily 443 window. The 5-day graph is back
+to the pure 5D bait system (no autopilot overlay); the bait-hit title
+tag is gone too (trigger state shows as ladder-number colors only).
+
+The campaign fill log is campaign-scoped: it records every buy
+(date/time, quantity, actual price backed out of the broker avg) from
+the LOAD on, seeds a HOLD line when armed onto an existing position,
+survives day rollovers, and is cleared the moment the position is
+fully sold. External (app/web) fills appear in it too while the
+watcher is on.
+
+No cap on watched stocks anymore (§18's max-2 is retired) — selection
+is the user's self-rule; empty cards now sort by 5-day volatility to
+make that choice easy. Poll = 10 s.
+
+### 30.9 Pedals
+
+```text
+443 (default):  LOAD -4%   CHASE -4%   SELL +3%   reload -3%
+                chase size = floor(n/2)   (1,1,1,2,2,3,3,4...)
+352 (safe):     LOAD -3%   CHASE -5%   SELL +2%   reload -2%
+                chase size = ceil(n/2) — aggressive: 9->5, 13->7
+```
+
+Same ~7% zone, selectable per stock in the Daily 443 window. In the
+watcher model a pedal change cancels nothing — the lines just move.

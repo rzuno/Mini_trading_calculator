@@ -52,7 +52,8 @@ class StockRow:
     """
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
-                 get_unit_cash, on_graph, on_compute=None, editable=True):
+                 get_unit_cash, on_graph, on_compute=None, editable=True,
+                 on_autopilot=None):
         self.deployed       = deployed
         self.editable       = editable
         self._order_locked  = False   # True while live orders rest (gear frozen)
@@ -61,6 +62,7 @@ class StockRow:
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.get_unit_cash  = get_unit_cash
         self.on_graph       = on_graph
+        self.on_autopilot   = on_autopilot
         self._on_compute_cb = on_compute
         self.current_price  = None
         self.peak_5d        = None
@@ -73,10 +75,6 @@ class StockRow:
         self._computing     = False
         self._syncing_gear  = False
         self._order_side    = None
-        self._bait_sign     = ''
-        self._bait_sign_fg  = 'black'
-        self._bait_text     = ''
-        self._bait_text_fg  = _STATUS_FG
         self._auto_buy_shift = 0
         self._auto_sell_shift = 0
         self._base_gear = None
@@ -168,21 +166,17 @@ class StockRow:
                                   font=name_font, anchor='w')
         self._name_lbl.pack(side='left')
 
-        # Right side: "[443 banner] [DEPLOYED] [baited/ordered status]".
+        # Right side: "[DEPLOYED] [ordered status]" — the bait-hit tag is gone
+        # (§30.8 point 1): triggers show only as ladder-number colors, so the
+        # title keeps room for Avg Cost / Shares.
         self._status_frame = tk.Frame(r0)
         self._status_frame.pack(side='right', padx=(6, 2))
-        self._status_sign_lbl = tk.Label(self._status_frame, text='',
-                                         font=_F_STATUS)
-        self._status_sign_lbl.pack(side='left')
         self._status_lbl = tk.Label(self._status_frame, text='',
                                     font=_F_STATUS)
         self._status_lbl.pack(side='left', padx=(2, 0))
         if self.deployed:
             tk.Label(r0, text='DEPLOYED', font=_F_SM_B, fg='#0033AA'
                      ).pack(side='right', padx=(4, 0))
-        # Autopilot banner (set via set_autopilot; blank when off).
-        self._ap_lbl = tk.Label(r0, text='', font=_F_STATUS)
-        self._ap_lbl.pack(side='right', padx=(4, 0))
 
         # Army % (deployed only)
         tk.Label(r0, textvariable=self.army_pct_var,
@@ -328,6 +322,16 @@ class StockRow:
             step.grid(row=grow, column=2, sticky='w')
             self._steppers[ti] = step
 
+        # -- Big 443 autopilot button (right of the sell gear) -----------------
+        # Opens the Daily 443 live window; its color IS the autopilot status.
+        if self.on_autopilot:
+            self.ap_btn = tk.Button(
+                wrap, text='443\nAUTOPILOT', font=_F_SM_B, width=10,
+                height=3, bd=2, takefocus=0,
+                command=lambda: self.on_autopilot(self.ticker))
+            self._ap_btn_default_bg = self.ap_btn.cget('bg')
+            self.ap_btn.pack(side='left', anchor='n', padx=(12, 0))
+
     # ── Formatting ────────────────────────────────────────────────────────────
 
     def _fmt_init(self, avg):
@@ -472,20 +476,12 @@ class StockRow:
         self.set_gear_locked(side is not None)
 
     def _refresh_status(self):
-        """Show one prominent title status: ordered > baited > blank."""
+        """Title status shows live resting orders only (no bait-hit tag)."""
         if self._order_side == 'BUY':
-            self._status_sign_lbl.config(text='')
             self._status_lbl.config(text='buy ordered', fg=_SELL_FG)
         elif self._order_side == 'SELL':
-            self._status_sign_lbl.config(text='')
             self._status_lbl.config(text='sell ordered', fg=_BUY_FG)
-        elif self._bait_text:
-            self._status_sign_lbl.config(text=self._bait_sign,
-                                         fg=self._bait_sign_fg)
-            self._status_lbl.config(text=self._bait_text,
-                                    fg=self._bait_text_fg)
         else:
-            self._status_sign_lbl.config(text='')
             self._status_lbl.config(text='')
 
     def _refresh_gear_styles(self):
@@ -708,37 +704,30 @@ class StockRow:
                             and cur >= p)
                            for (_, p, _) in self._sell_lines]
 
-        # Title trigger tag: which baits are bitten right now.
-        buy_hits = [self._buy_lines[i][0] for i, t in enumerate(self._buy_trig)
-                    if t and self._buy_lines[i][1] is not None]
-        sell_hits = [self._sell_tier_lbls[j]
-                     for j, t in enumerate(self._sell_trig) if t]
-        if buy_hits:
-            self._bait_sign = '\u25bc'
-            self._bait_sign_fg = _BUY_FG
-            self._bait_text = ', '.join(buy_hits) + ' hit'
-            self._bait_text_fg = _STATUS_FG
-        elif sell_hits:
-            self._bait_sign = '\u25b2'
-            self._bait_sign_fg = _SELL_FG
-            self._bait_text = ', '.join(sell_hits) + ' hit'
-            self._bait_text_fg = _STATUS_FG
-        else:
-            self._bait_sign = ''
-            self._bait_text = ''
-        self._refresh_status()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_row_num(self, n: int):
         self._name_lbl.config(text=f"{n}. {self._disp_name}")
 
-    def set_autopilot(self, text, color='#E08000'):
-        """Show (or clear, text=None) the 443 autopilot banner on the card."""
-        if text:
-            self._ap_lbl.config(text=f'⚡ {text}', fg=color)
-        else:
-            self._ap_lbl.config(text='')
+    # Big 443 button styling per autopilot status (None = off).
+    _AP_STYLES = {
+        None:    ('443\nAUTOPILOT', None,      'black'),
+        'WATCH': ('443\nWATCH',     '#3366CC', 'white'),
+        'DRY':   ('443\nDRY RUN',   '#E08000', 'white'),
+        'LIVE':  ('443\nLIVE',      '#CC0000', 'white'),
+        'STOP':  ('443\nSTOP',      '#880000', 'white'),
+    }
+
+    def set_autopilot(self, key):
+        """Color the big 443 button to the autopilot status
+        (None/'WATCH'/'DRY'/'LIVE'/'STOP')."""
+        if not hasattr(self, 'ap_btn'):
+            return
+        text, bg, fg = self._AP_STYLES.get(key, self._AP_STYLES[None])
+        bg = bg or self._ap_btn_default_bg
+        self.ap_btn.config(text=text, bg=bg, fg=fg,
+                           activebackground=bg, activeforeground=fg)
 
     # -- Order intents (used by the graph order/cancel flow) ------------------
 

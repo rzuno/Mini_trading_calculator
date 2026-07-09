@@ -1,43 +1,88 @@
-"""Daily 443 autopilot controller — the bridge between the pure engine
-(core/autopilot.py) and the running app.
+"""Daily 443 autopilot controller — the bridge between the pure watcher
+engine (core/autopilot.py) and the running app.
 
-Owns ONE background poll thread for all autopiloted stocks (max 2). Each cycle
-touches only the autopiloted ticker (§30.3): price, holdings(symbol), open
-orders(symbol), buying power — the main panel's data stays as of the last
-Save & Refresh. UI updates are marshaled to the tk thread with root.after.
+One background thread polls every watched stock every POLL_SECONDS (10 s),
+touching ONLY that ticker (§30.3): price, holdings(symbol), open
+orders(symbol), buying power. The main panel stays refresh-button-driven;
+only the Daily 443 window (and the card's 443 button color) follow ticks.
 
-Modes per stock:
-    DRY  — real price feed, virtual orders/fills/cash (PaperBroker). Safe.
-    LIVE — real Toss LIMIT/DAY orders. Entered only via a confirm dialog.
+Modes per stock (§30.8):
+    WATCH — bare watching: lines + ticks + fill detection, NO orders at all.
+            This is what opening the Daily window arms; closing the window
+            in WATCH mode stops the polling again.
+    DRY   — real prices, virtual orders/fills/cash (PaperBroker).
+    LIVE  — real Toss LIMIT/DAY orders, fired only when a line is touched.
+            Allowed only while the market is in REGULAR hours (§30.8);
+            when the session ends, LIVE drops back to WATCH automatically.
 
-Error policy (§30.4): insufficient-buying-power stops the stock's autopilot
-(popup + red badge); order-hours-closed backs off placements 5 minutes;
-opposite-pending retries next cycle; other rejections back off 60 s.
+There is no cap on how many stocks can be watched (§30.9) — the user picks
+by self-rule; a watcher that never triggers costs only its polling.
+
+Error policy: a failed poll skips the whole cycle and retries; ~6 straight
+failures announce a data problem once. insufficient-buying-power stops the
+stock's autopilot (popup + STOP badge); order-hours-closed backs off 5 min;
+opposite-pending (a foreign order blocks our side) retries next cycle.
 """
 
 import os
 import re
 import time
+import calendar
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-from core.autopilot import Daily443Engine, POLL_SECONDS, MAX_AUTOPILOT
-from core.calc import fmt_order_price, fmt_price
+from core.autopilot import Daily443Engine, POLL_SECONDS, DEFAULT_PEDAL
+from core.calc import fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
-_TZ_US = timezone(timedelta(hours=-5))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
 
 _BACKOFF_HOURS_CLOSED = 300     # seconds
 _BACKOFF_OTHER = 60
-_TICKS_KEPT = 2400              # ~10h of 15s ticks for the daily chart
-_FAIL_ANNOUNCE = 6              # consecutive bad polls (~90s) → one warning
+_TICKS_KEPT = 3600              # ~10h of 10s ticks for the daily chart
+_FAIL_ANNOUNCE = 6              # consecutive bad polls (~60s) → one warning
 
-BADGE = {'DRY': ('443 DRY', '#E08000'),
-         'LIVE': ('443 LIVE', '#CC0000'),
-         'STOP': ('443 STOP', '#880000')}
+# Card button / banner styling per status key.
+BADGE = {'WATCH': ('443 WATCH', '#3366CC'),
+         'DRY':   ('443 DRY',   '#E08000'),
+         'LIVE':  ('443 LIVE',  '#CC0000'),
+         'STOP':  ('443 STOP',  '#880000')}
+
+
+# ── Market sessions (§30.8) ───────────────────────────────────────────────────
+
+def _us_dst(d: date) -> bool:
+    """US DST: second Sunday of March → first Sunday of November."""
+    sundays_mar = [w[6] for w in calendar.monthcalendar(d.year, 3) if w[6]]
+    sundays_nov = [w[6] for w in calendar.monthcalendar(d.year, 11) if w[6]]
+    return (date(d.year, 3, sundays_mar[1]) <= d
+            < date(d.year, 11, sundays_nov[0]))
+
+
+def market_phase(ticker: str, now_utc=None) -> str:
+    """'REGULAR' | 'PRE' | 'AFTER' | 'CLOSED' for the stock's home market.
+    KR: 09:00–15:30 KST regular (pre 08:00, after →20:00).
+    US: 09:30–16:00 ET regular, DST-aware (pre 04:00, after →20:00)."""
+    now = now_utc or datetime.now(timezone.utc)
+    if ticker.endswith('.KS'):
+        local = now.astimezone(_TZ_KR)
+        pre, op, cl, af = 8 * 60, 9 * 60, 15 * 60 + 30, 20 * 60
+    else:
+        off = -4 if _us_dst((now + timedelta(hours=-5)).date()) else -5
+        local = now.astimezone(timezone(timedelta(hours=off)))
+        pre, op, cl, af = 4 * 60, 9 * 60 + 30, 16 * 60, 20 * 60
+    if local.weekday() >= 5:
+        return 'CLOSED'
+    m = local.hour * 60 + local.minute
+    if op <= m < cl:
+        return 'REGULAR'
+    if pre <= m < op:
+        return 'PRE'
+    if cl <= m < af:
+        return 'AFTER'
+    return 'CLOSED'
 
 
 class PaperBroker:
@@ -82,7 +127,7 @@ class PaperBroker:
 
     def open_orders(self):
         return [{'id': oid, 'side': o['side'], 'price': o['price'],
-                 'qty_open': o['qty'], 'filled': 0}
+                 'qty_open': o['qty'], 'filled': 0, 'mine': True}
                 for oid, o in self.orders.items()]
 
 
@@ -111,80 +156,91 @@ class AutopilotController:
         except OSError:
             pass
 
-    # ── Enable / disable (UI thread) ──────────────────────────────────────────
+    # ── Watch / modes (UI thread) ─────────────────────────────────────────────
 
     def refresh_units(self):
-        """Cache unit cash from the tk vars (tk objects must not be read from
-        the poll thread)."""
         self._units['KRW'] = self.app._get_unit_cash('KRW')
         self._units['USD'] = self.app._get_unit_cash('USD')
 
-    def enable(self, ticker):
+    def watch(self, ticker):
+        """Start (or keep) watching a stock — bare WATCH mode, no orders.
+        Called when the Daily 443 window opens. No stock-count limit (§30.9)."""
         if not self.app._auto:
             return False, 'Switch to Toss (auto) mode first.'
         with self._lock:
             if ticker in self._slots:
-                return True, 'already on'
-            active = [t for t, s in self._slots.items() if not s.get('stopped')]
-            if len(active) >= MAX_AUTOPILOT:
-                return False, (f'Max {MAX_AUTOPILOT} autopilot stocks '
-                               f'({", ".join(active)}). Turn one off first.')
+                return True, 'already watching'
             self._slots[ticker] = {
-                'engine': None, 'live': False, 'paper': None,
+                'engine': None, 'mode': 'WATCH', 'paper': None,
+                'pedal': DEFAULT_PEDAL,
                 'backoff_until': 0.0, 'stopped': False,
                 'prev_close': None, 'prev_close_date': None,
-                'ticks': [],           # (epoch, price) history for the daily chart
+                'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False,
-                'ui': {'ticker': ticker, 'state': 'ARMING', 'status': 'arming…',
-                       'lines': {}, 'mode': 'DRY', 'price': None},
+                'ui': {'ticker': ticker, 'state': 'ARMING',
+                       'status': 'arming…', 'lines': {}, 'mode': 'WATCH',
+                       'pedal': DEFAULT_PEDAL, 'price': None,
+                       'phase': market_phase(ticker)},
             }
         self.refresh_units()
-        self._log(ticker, 'AUTOPILOT ENABLED (DRY RUN)')
+        self._log(ticker, 'WATCH started')
         self._ensure_thread()
         self._wake.set()
-        return True, 'arming (dry run)'
+        return True, 'watching'
 
     def disable(self, ticker):
         with self._lock:
             slot = self._slots.pop(ticker, None)
         if slot:
-            self._log(ticker, 'AUTOPILOT DISABLED (resting orders left as-is)')
+            self._log(ticker, 'autopilot off (watch stopped; any resting '
+                              'orders left as-is)')
         self.root.after(0, self._apply_row_badge, ticker, None)
         self._notify(ticker, None)
 
-    def set_live(self, ticker, live: bool):
-        """Flip DRY↔LIVE. Going LIVE discards the paper account (the next
-        cycle reads the real one); going DRY re-seeds paper from reality."""
+    def set_mode(self, ticker, mode):
+        """WATCH ↔ DRY ↔ LIVE. LIVE only during regular market hours."""
+        slot = self._slots.get(ticker)
+        if not slot:
+            return False, 'not watching'
+        if mode not in ('WATCH', 'DRY', 'LIVE'):
+            return False, f'unknown mode {mode}'
+        if mode == 'LIVE':
+            ph = market_phase(ticker)
+            if ph != 'REGULAR':
+                return False, (f'market is {ph} — LIVE runs only during '
+                               f'regular hours')
         with self._lock:
-            slot = self._slots.get(ticker)
-            if not slot:
-                return False, 'not enabled'
-            slot['live'] = bool(live)
-            slot['paper'] = None          # re-seeded lazily in the poll
-            if slot.get('stopped'):       # re-arm after a stop
+            slot['mode'] = mode
+            slot['paper'] = None          # DRY re-seeds from reality
+            if slot.get('stopped'):
                 slot['stopped'] = False
-                slot['engine'] = None
-        self._log(ticker, f"MODE -> {'LIVE' if live else 'DRY RUN'}")
+                if slot.get('engine'):
+                    slot['engine'].resume()
+        self._log(ticker, f'MODE → {mode}')
         self._wake.set()
-        return True, ('LIVE — real orders' if live else 'dry run')
+        return True, mode
+
+    def set_pedal(self, ticker, pedal):
+        slot = self._slots.get(ticker)
+        if not slot:
+            return
+        slot['pedal'] = pedal
+        if slot.get('engine'):
+            slot['engine'].set_pedal(pedal)
+        self._wake.set()
+
+    def mode_of(self, ticker):
+        slot = self._slots.get(ticker)
+        return slot['mode'] if slot else None
 
     def is_enabled(self, ticker) -> bool:
         return ticker in self._slots
-
-    def is_managing(self, ticker) -> bool:
-        """True while the bot may place/cancel orders (blocks the graph's
-        manual order buttons)."""
-        slot = self._slots.get(ticker)
-        return bool(slot) and not slot.get('stopped')
-
-    def active_tickers(self):
-        return list(self._slots.keys())
 
     def ui_state(self, ticker):
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
 
-    # ── Panel subscriptions (graph windows) ───────────────────────────────────
+    # ── Panel subscriptions (Daily 443 windows) ───────────────────────────────
 
     def subscribe(self, ticker, fn):
         self._listeners.setdefault(ticker, []).append(fn)
@@ -203,20 +259,21 @@ class AutopilotController:
                 self.unsubscribe(ticker, fn)
 
     def graph_context(self, ticker):
-        """Callables for the chart's 443 panel."""
+        """Callables for the Daily 443 window."""
         return {
             'ticker': ticker,
             'is_enabled': lambda: self.is_enabled(ticker),
-            'is_managing': lambda: self.is_managing(ticker),
             'ui_state': lambda: self.ui_state(ticker),
-            'enable': lambda: self.enable(ticker),
+            'mode_of': lambda: self.mode_of(ticker),
+            'set_mode': lambda m: self.set_mode(ticker, m),
+            'set_pedal': lambda p: self.set_pedal(ticker, p),
             'disable': lambda: self.disable(ticker),
-            'set_live': lambda live: self.set_live(ticker, live),
+            'market_phase': lambda: market_phase(ticker),
             'subscribe': lambda fn: self.subscribe(ticker, fn),
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
         }
 
-    # ── Row badge (card banner) ───────────────────────────────────────────────
+    # ── Card button / badge ───────────────────────────────────────────────────
 
     def _find_row(self, ticker):
         for row in self.app.deployed_rows + self.app.empty_rows:
@@ -226,19 +283,14 @@ class AutopilotController:
 
     def _apply_row_badge(self, ticker, badge_key):
         row = self._find_row(ticker)
-        if row is None:
-            return
-        if badge_key is None:
-            row.set_autopilot(None)
-        else:
-            text, color = BADGE[badge_key]
-            row.set_autopilot(text, color)
+        if row is not None:
+            row.set_autopilot(badge_key)
 
     def on_rows_rebuilt(self):
-        """Cards are recreated on every refresh — re-apply badges + units."""
+        """Cards are recreated on every refresh — re-apply statuses + units."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
-            self._apply_row_badge(ticker, slot['ui'].get('badge_key', 'DRY'))
+            self._apply_row_badge(ticker, slot['ui'].get('badge_key', 'WATCH'))
 
     # ── Poll thread ───────────────────────────────────────────────────────────
 
@@ -267,7 +319,7 @@ class AutopilotController:
             self._wake.wait(POLL_SECONDS)
             self._wake.clear()
 
-    # ── Data-problem announcement (§30.7) ─────────────────────────────────────
+    # ── Data-problem announcement ─────────────────────────────────────────────
     # The bot never guesses on missing data: a failed poll skips the whole
     # cycle (no orders placed or cancelled) and retries in POLL_SECONDS.
     # After _FAIL_ANNOUNCE consecutive failures it warns ONCE; it does not
@@ -285,7 +337,7 @@ class AutopilotController:
                     '443 Autopilot — data problem',
                     f'{ticker}: Toss data has been unavailable for '
                     f"~{slot['fail_n'] * POLL_SECONDS}s ({why}).\n\n"
-                    'The bot is idle and keeps retrying every poll.\n'
+                    'The watcher is idle and keeps retrying every poll.\n'
                     'No orders are sent while data is missing; resting '
                     'orders stay on Toss (DAY orders die at close).')
             try:
@@ -304,11 +356,10 @@ class AutopilotController:
     # ── One poll cycle for one stock ──────────────────────────────────────────
 
     def _trading_date(self, ticker):
-        tz = _TZ_KR if ticker.endswith('.KS') else _TZ_US
+        tz = _TZ_KR if ticker.endswith('.KS') else timezone(timedelta(hours=-5))
         return datetime.now(tz).strftime('%Y-%m-%d')
 
     def _prev_close(self, prov, ticker, slot):
-        """Previous completed close, cached per trading date (1 candle call/day)."""
         today = self._trading_date(ticker)
         if slot['prev_close'] is not None and slot['prev_close_date'] == today:
             return slot['prev_close']
@@ -321,7 +372,7 @@ class AutopilotController:
             pass
         return slot['prev_close']
 
-    def _real_snapshot(self, prov, seq, ticker):
+    def _real_snapshot(self, prov, seq, ticker, my_ids):
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         price = prov.get_prices([ticker]).get(ticker)
 
@@ -352,9 +403,10 @@ class AutopilotController:
                 filled = float((o.get('execution') or {}).get('filledQuantity') or 0)
             except (TypeError, ValueError):
                 pass
-            orders.append({'id': o.get('orderId'), 'side': o.get('side'),
+            oid = o.get('orderId')
+            orders.append({'id': oid, 'side': o.get('side'),
                            'price': p, 'qty_open': int(max(0, qty - filled)),
-                           'filled': filled})
+                           'filled': filled, 'mine': oid in my_ids})
 
         bp = prov.get_buying_power(seq, ccy)
         return {'price': price, 'shares': shares, 'avg_cost': avg,
@@ -370,12 +422,14 @@ class AutopilotController:
             self._push_ui(ticker, slot, status='no Toss account')
             return
 
-        real = self._real_snapshot(prov, seq, ticker)
-        live = slot['live']
+        # LIVE runs only during regular hours; drop to WATCH at the close.
+        if slot['mode'] == 'LIVE' and market_phase(ticker) != 'REGULAR':
+            slot['mode'] = 'WATCH'
+            self._log(ticker, 'market left regular hours — LIVE → WATCH')
 
-        # Tick history for the daily chart; a missing price counts as a data
-        # failure (the engine still runs — it is safe without a price, it just
-        # cannot check triggers).
+        real = self._real_snapshot(prov, seq, ticker, slot['my_ids'])
+        mode = slot['mode']
+
         if real['price'] is not None:
             slot['ticks'].append((time.time(), real['price']))
             del slot['ticks'][:-_TICKS_KEPT]
@@ -383,9 +437,7 @@ class AutopilotController:
         else:
             self._data_failure(ticker, slot, 'no price from Toss')
 
-        if not live:
-            # DRY RUN: seed the paper account from reality once, then let the
-            # live price drive virtual fills.
+        if mode == 'DRY':
             if slot['paper'] is None:
                 slot['paper'] = PaperBroker(real['shares'], real['avg_cost'],
                                             real['buying_power'])
@@ -404,10 +456,12 @@ class AutopilotController:
         snap['unit_cash'] = self._units.get(ccy) or 0.0
         snap['trading_date'] = self._trading_date(ticker)
         snap['prev_close'] = self._prev_close(prov, ticker, slot)
+        snap['can_trade'] = mode in ('DRY', 'LIVE')
 
         if slot['engine'] is None:
             slot['engine'] = Daily443Engine(
                 ticker, anchor=None, trading_date=snap['trading_date'],
+                pedal=slot.get('pedal', DEFAULT_PEDAL),
                 log=lambda m, t=ticker: self._log(t, m))
             self._log(ticker, f"engine armed (prev close "
                               f"{snap['prev_close'] or 'unknown'})")
@@ -420,16 +474,19 @@ class AutopilotController:
     # ── Action executor ───────────────────────────────────────────────────────
 
     def _execute(self, ticker, slot, prov, seq, engine, acts):
+        mode = slot['mode']
         now = time.time()
         for act in acts:
             kind = act[0]
             if kind == 'stop':
                 slot['stopped'] = True
                 self._on_stopped(ticker, act[1])
+            elif mode == 'WATCH':
+                continue           # engine emits none in WATCH; safety net
             elif kind == 'cancel':
                 _, oid, label = act
                 self._log(ticker, f'cancel [{label}] {oid}')
-                if slot['live']:
+                if mode == 'LIVE':
                     try:
                         st, body = prov.cancel_order(oid, seq)
                         if st != 200:
@@ -448,8 +505,8 @@ class AutopilotController:
                     continue
                 wire = fmt_order_price(ticker, price)
                 self._log(ticker, f'place [{label}] {side} {qty} @ {wire} '
-                                  f"({'LIVE' if slot['live'] else 'dry'})")
-                if not slot['live']:
+                                  f'({mode})')
+                if mode == 'DRY':
                     slot['paper'].place(side, price, qty)
                     continue
                 coid = re.sub(r'[^A-Za-z0-9_-]', '',
@@ -462,7 +519,9 @@ class AutopilotController:
                     self._log(ticker, f'place error: {e}')
                     slot['backoff_until'] = time.time() + _BACKOFF_OTHER
                     continue
-                if st == 200 and (body.get('result') or {}).get('orderId'):
+                order_id = (body.get('result') or {}).get('orderId')
+                if st == 200 and order_id:
+                    slot['my_ids'].add(order_id)
                     continue
                 code = str((body.get('error') or {}).get('code') or st)
                 self._log(ticker, f'place rejected: {code}')
@@ -473,7 +532,7 @@ class AutopilotController:
                 elif 'hours' in code or 'closed' in code:
                     slot['backoff_until'] = time.time() + _BACKOFF_HOURS_CLOSED
                 elif 'opposite' in code:
-                    pass                      # cancel settling; retry next poll
+                    pass       # a foreign order blocks the side; retry next poll
                 else:
                     slot['backoff_until'] = time.time() + _BACKOFF_OTHER
 
@@ -496,7 +555,7 @@ class AutopilotController:
     def _push_ui(self, ticker, slot, snap=None, status=None):
         engine = slot.get('engine')
         stopped = slot.get('stopped')
-        badge_key = 'STOP' if stopped else ('LIVE' if slot['live'] else 'DRY')
+        badge_key = 'STOP' if stopped else slot['mode']
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         ui = {
             'ticker': ticker,
@@ -507,8 +566,11 @@ class AutopilotController:
             'anchor_source': engine.anchor_source if engine else 'close',
             'chase_count': engine.chase_count if engine else 0,
             'events': list(engine.events) if engine else [],
-            'mode': 'LIVE' if slot['live'] else 'DRY',
+            'pedal': engine.pedal_name if engine else slot.get('pedal',
+                                                               DEFAULT_PEDAL),
+            'mode': slot['mode'],
             'badge_key': badge_key,
+            'phase': market_phase(ticker),
             'price': (snap or {}).get('price'),
             'shares': (snap or {}).get('shares'),
             'avg_cost': (snap or {}).get('avg_cost'),

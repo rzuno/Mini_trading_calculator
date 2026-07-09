@@ -18,12 +18,6 @@ _DOWN_SIGN_FG = '#3366CC'
 _UP_SIGN_FG   = '#CC3333'
 _STATUS_FG    = '#4B0082'  # indigo
 
-# Daily 443 autopilot line colors (solid, distinct from projections/orders)
-_AP_COLORS = {'load': '#E08000', 'chase': '#7E3FBF', 'sell': '#007700'}
-_AP_ON_BG  = '#2E8B57'
-_AP_LIVE_BG = '#CC0000'
-_AP_DRY_BG = '#E08000'
-
 
 class CandleChartWindow:
     """Popup 5-day candle chart with a unified reference overlay.
@@ -37,16 +31,12 @@ class CandleChartWindow:
     def __init__(self, parent, ticker, ohlc_data, currency,
                  anchor_label='Avg', anchor_price=None,
                  buy_lines=None, sell_lines=None, current_price=None,
-                 ordered_lines=None, order_actions=None, autopilot=None):
+                 ordered_lines=None, order_actions=None):
         self.win = tk.Toplevel(parent)
         self.ticker = ticker
         # order_actions (Toss auto mode only): {ordered, pending, place, cancel,
         # refresh, lock_gear}. When present, Order/Cancel buttons are shown.
         self.order_actions = order_actions
-        # autopilot: graph_context() from AutopilotController (Toss auto only).
-        self.autopilot = autopilot
-        self.ap_lines = {}          # {'load'|'chase'|'sell': (price, qty)}
-        self._ap_cb = None
         self._ordered_side = (order_actions or {}).get('ordered_side')
         self._ordered = self._ordered_side is not None
         name = STOCK_NAMES.get(ticker, ticker)
@@ -154,164 +144,14 @@ class CandleChartWindow:
             self._order_status.pack(side='left')
             self._update_order_buttons()
 
-        # ── Daily 443 autopilot panel (Toss auto mode) ────────────────────────
-        if self.autopilot:
-            self._build_ap_panel()
-
         # ── Canvas ────────────────────────────────────────────────────────────
         self.canvas = tk.Canvas(self.win, bg='white', highlightthickness=0)
         self.canvas.pack(fill='both', expand=True, padx=12, pady=(8, 12))
         self.canvas.bind('<Configure>', lambda e: self._draw())
 
-    # ── Daily 443 autopilot panel ─────────────────────────────────────────────
-
-    def _build_ap_panel(self):
-        ap = tk.Frame(self.win, padx=12, pady=4, bd=1, relief='groove')
-        ap.pack(fill='x', padx=12)
-        tk.Label(ap, text='443 Autopilot', font=_F_STAT,
-                 fg=_STATUS_FG).grid(row=0, column=0, sticky='w')
-        self._ap_toggle = tk.Button(ap, text='OFF', font=_F_STAT, width=6,
-                                    command=self._ap_on_toggle)
-        self._ap_toggle.grid(row=0, column=1, padx=(10, 6))
-        self._ap_default_bg = self._ap_toggle.cget('bg')
-        self._ap_mode_btn = tk.Button(ap, text='DRY RUN', font=_F_STAT,
-                                      width=9, state='disabled',
-                                      command=self._ap_on_mode)
-        self._ap_mode_btn.grid(row=0, column=2, padx=(0, 6))
-        self._ap_daily_btn = tk.Button(ap, text='Daily ▸', font=_F_STAT,
-                                       width=8, state='disabled',
-                                       command=self._ap_open_daily)
-        self._ap_daily_btn.grid(row=0, column=3, padx=(0, 12))
-        self._ap_state_lbl = tk.Label(ap, text='off', font=_F_STAT,
-                                      fg='#666', anchor='w')
-        self._ap_state_lbl.grid(row=0, column=4, sticky='w')
-        ap.grid_columnconfigure(4, weight=1)
-        self._ap_lines_lbl = tk.Label(ap, text='', font=_F_REF, fg='#333',
-                                      anchor='w', justify='left')
-        self._ap_lines_lbl.grid(row=1, column=0, columnspan=5, sticky='w',
-                                pady=(2, 0))
-
-        # Live updates from the controller; detach when the window closes.
-        self._ap_cb = self._ap_update
-        self.autopilot['subscribe'](self._ap_cb)
-        self.win.bind('<Destroy>', self._ap_on_destroy)
-        self._ap_update(self.autopilot['ui_state']())
-
-    def _ap_on_destroy(self, event):
-        if event.widget is self.win and self._ap_cb:
-            self.autopilot['unsubscribe'](self._ap_cb)
-            self._ap_cb = None
-
-    def _ap_on_toggle(self):
-        if self.autopilot['is_enabled']():
-            if self._confirm_dialog(
-                    'Turn autopilot off',
-                    [f'Stop autopiloting {self.ticker}?',
-                     'Resting orders are left as they are.']):
-                self.autopilot['disable']()
-        else:
-            ok, msg = self.autopilot['enable']()
-            if not ok:
-                messagebox.showwarning('443 Autopilot', msg, parent=self.win)
-
-    def _ap_open_daily(self):
-        """Pop the dedicated Daily 443 live chart — the only tick-reactive
-        window (this 5-day chart stays refresh-driven)."""
-        from gui.daily443_chart import Daily443ChartWindow
-        Daily443ChartWindow(self.win, self.ticker, self.ccy, self.autopilot)
-
-    def _ap_on_mode(self):
-        ui = self.autopilot['ui_state']() or {}
-        if ui.get('mode') == 'LIVE':
-            self.autopilot['set_live'](False)
-            return
-        lines = ui.get('lines') or {}
-        detail = [f'443 will manage REAL orders for {self.ticker}.']
-        for key, name in (('sell', 'SELL'), ('chase', 'CHASE BUY'),
-                          ('load', 'LOAD BUY')):
-            if lines.get(key):
-                p, q = lines[key]
-                detail.append(f'{name}:  {q} @ {fmt_price(p, self.ccy)}')
-        detail.append('It will keep cancel/replacing them as the 443 lines move.')
-        if self._confirm_dialog('Go LIVE', detail):
-            self.autopilot['set_live'](True)
-
-    def _ap_update(self, ui):
-        """Controller callback (already on the tk thread)."""
-        try:
-            if not self._ap_toggle.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        if ui is None or not self.autopilot['is_enabled']():
-            self._ap_toggle.config(text='OFF', bg=self._ap_default_bg,
-                                   fg='black')
-            self._ap_mode_btn.config(state='disabled', text='DRY RUN',
-                                     bg=self._ap_default_bg, fg='black')
-            self._ap_daily_btn.config(state='disabled')
-            self._ap_state_lbl.config(text='off', fg='#666')
-            self._ap_lines_lbl.config(text='')
-            self.ap_lines = {}
-            self._update_order_buttons()
-            self._redraw()
-            return
-
-        self._ap_toggle.config(text='ON', bg=_AP_ON_BG, fg='white')
-        self._ap_daily_btn.config(state='normal')
-        live = ui.get('mode') == 'LIVE'
-        self._ap_mode_btn.config(
-            state='normal', text=('LIVE' if live else 'DRY RUN'),
-            bg=(_AP_LIVE_BG if live else _AP_DRY_BG), fg='white')
-        state = ui.get('state', '?')
-        color = ('#880000' if state == 'STOPPED'
-                 else '#0033AA' if state == 'DEPLOYED' else '#666')
-        self._ap_state_lbl.config(text=f"{state} — {ui.get('status', '')}",
-                                  fg=color)
-
-        parts = []
-        if ui.get('anchor'):
-            parts.append(f"anchor {fmt_price(ui['anchor'], self.ccy)}")
-        for key, name in (('load', 'LOAD'), ('chase', 'CHASE'),
-                          ('sell', 'SELL')):
-            ln = (ui.get('lines') or {}).get(key)
-            if ln:
-                parts.append(f"{name} {fmt_price(ln[0], self.ccy)} ×{ln[1]}")
-        if ui.get('shares'):
-            parts.append(f"held {ui['shares']} @ "
-                         f"{fmt_price(ui.get('avg_cost'), self.ccy)}")
-        if ui.get('chase_count'):
-            parts.append(f"chase #{ui['chase_count']}")
-        parts.append(f"poll {ui.get('ts', '--')}")
-        self._ap_lines_lbl.config(text='    '.join(parts))
-
-        # The 5-day chart is refresh-driven (§30.7): it does NOT follow the
-        # live tick price. Only a structural change of the 443 lines (a fill
-        # moved the avg / anchor) triggers a redraw of the overlay; the live
-        # movement lives in the Daily ▸ window.
-        new_lines = {k: v for k, v in (ui.get('lines') or {}).items()
-                     if k in _AP_COLORS}
-        self._update_order_buttons()
-        if new_lines != self.ap_lines:
-            self.ap_lines = new_lines
-            self._redraw()
-
-    def _redraw(self):
-        """Redraw only once the canvas exists (the 443 panel is built first)."""
-        if hasattr(self, 'canvas'):
-            self._draw()
-
     # ── Order handlers (Buy / Sell / Cancel) ──────────────────────────────────
     def _update_order_buttons(self):
         if not self.order_actions:
-            return
-        # While 443 autopilot manages this stock, manual ordering is off.
-        if self.autopilot and self.autopilot['is_managing']():
-            self._buy_btn.config(state='disabled')
-            if self._sell_btn:
-                self._sell_btn.config(state='disabled')
-            self._cancel_btn.config(state='disabled')
-            self._order_status.config(
-                text='443 autopilot manages this stock', fg=_STATUS_FG)
             return
         os_ = self._ordered_side               # 'BUY' | 'SELL' | None
         oa = self.order_actions
@@ -493,9 +333,6 @@ class CandleChartWindow:
             prices.append(p)
         for o in self.ordered_lines:
             prices.append(o['price'])
-        for ln in self.ap_lines.values():
-            if ln and ln[0]:
-                prices.append(ln[0])
 
         p_min, p_max = min(prices), max(prices)
         p_range = (p_max - p_min) or 1
@@ -575,22 +412,6 @@ class CandleChartWindow:
             c.create_text(label_x, y,
                           text=f"ORDERED {o.get('side','')}: "
                                f"{fmt_price(o['price'], self.ccy)}{qty_txt}",
-                          anchor='w', font=_F_REF, fill=clr)
-
-        # Daily 443 autopilot lines — SOLID and bold (the bot's actual lines)
-        for key, name in (('load', 'AP LOAD'), ('chase', 'AP CHASE'),
-                          ('sell', 'AP SELL')):
-            ln = self.ap_lines.get(key)
-            if not ln or not ln[0]:
-                continue
-            price, qty = ln
-            clr = _AP_COLORS[key]
-            y = y_of(price)
-            c.create_line(left_pad, y, left_pad + chart_w, y,
-                          fill=clr, width=2.5)
-            c.create_text(label_x, y,
-                          text=f"{name}: {fmt_price(price, self.ccy)}"
-                               f"{f' ×{qty}' if qty else ''}",
                           anchor='w', font=_F_REF, fill=clr)
 
         # Current price — solid line, label on the right

@@ -1,23 +1,36 @@
-"""Daily 443 live chart — the ONLY window that follows the 15-second
-autopilot ticks (§30.7). The 5-day chart stays refresh-driven.
+"""Daily 443 live window — the autopilot's own cockpit (§30.8).
 
-Shows the intraday tick path inside the "7% commando zone":
+Opened by the card's big 443 button. Opening it arms bare WATCH mode:
+the stock is polled every 10 s and this window follows every tick — the
+5-day chart and the main panel stay refresh-button-driven.
 
-    DEPLOYED:  chase line (avg×0.96) … avg … sell line (avg×1.03)
-    EMPTY:     load line (anchor−4%, or −3% after an intraday sell)
-               … pseudo sell (load×1.03)
+Top-right controls select the mode:
 
-As long as the price path stays inside the shaded zone the autopilot is
-working the plan; a fill moves the zone itself (new avg / new anchor).
-The right panel logs today's campaign fills (what was bought at how much,
-until it is all sold) and the currently deployed size.
+    (no button active)  WATCH — bare live info: zone chart + lines, no orders
+    [DRY RUN]           paper simulation (virtual fills, not connected)
+    [LIVE]              real watcher: fires a real order when a line is hit;
+                        allowed only during regular market hours
+
+Closing the window in WATCH mode stops the polling; in DRY/LIVE the
+autopilot keeps running in the background (the card button stays colored).
+
+The chart shows the intraday tick path inside the shaded pedal zone
+(chase/load line → sell line), avg/anchor, the campaign fill log (cleared
+when the position is fully sold), deployed size and the market phase.
 """
 
+import time as _time
+from datetime import datetime as _dt
+
 import tkinter as tk
+from tkinter import messagebox
+
 from core.calc import STOCK_NAMES, fmt_price
+from core.autopilot import PEDALS
 
 _F_TITLE = ('Segoe UI', 17, 'bold')
 _F_STAT  = ('Segoe UI', 13)
+_F_BTN   = ('Segoe UI', 13, 'bold')
 _F_INFO  = ('Segoe UI', 12)
 _F_AXIS  = ('Segoe UI', 10)
 _F_REF   = ('Segoe UI', 11, 'bold')
@@ -36,12 +49,19 @@ _CLR = {
     'state_dep': '#0033AA',
     'state_stop': '#880000',
 }
-_KIND_CLR = {'LOAD': '#E08000', 'CHASE': '#7E3FBF', 'SELL': '#007700'}
+_KIND_CLR = {'LOAD': '#E08000', 'CHASE': '#7E3FBF', 'SELL': '#007700',
+             'HOLD': '#555555'}
+_PHASE_TXT = {'REGULAR': ('OPEN (regular)', '#007700'),
+              'PRE':     ('pre-market', '#B8860B'),
+              'AFTER':   ('after-market', '#B8860B'),
+              'CLOSED':  ('CLOSED', '#888888')}
+_DRY_BG = '#E08000'
+_LIVE_BG = '#CC0000'
 
 
 class Daily443ChartWindow:
-    """Live intraday zone chart for one autopiloted stock. Subscribes to the
-    AutopilotController (via the graph context) and redraws on every tick."""
+    """Live cockpit for one watched stock. Subscribes to the controller and
+    redraws on every 10-second tick."""
 
     def __init__(self, parent, ticker, currency, ap_ctx):
         self.ap = ap_ctx
@@ -53,17 +73,34 @@ class Daily443ChartWindow:
         name = STOCK_NAMES.get(ticker, ticker)
         self.win.title(f'{name} — Daily 443 live')
         self.win.geometry('1180x680')
-        self.win.minsize(760, 480)
+        self.win.minsize(780, 480)
 
         head = tk.Frame(self.win, padx=12, pady=8)
         head.pack(fill='x')
-        self._title_lbl = tk.Label(head, text=f'{name}  — Daily 443',
-                                   font=_F_TITLE)
-        self._title_lbl.pack(side='left')
+        tk.Label(head, text=f'{name}  — Daily 443', font=_F_TITLE
+                 ).pack(side='left')
         self._state_lbl = tk.Label(head, text='', font=_F_TITLE)
         self._state_lbl.pack(side='left', padx=(16, 0))
-        self._mode_lbl = tk.Label(head, text='', font=_F_STAT)
-        self._mode_lbl.pack(side='right')
+
+        # Mode + pedal controls, right-aligned (§30.8 point 5/8).
+        self._live_btn = tk.Button(head, text='LIVE', font=_F_BTN, width=8,
+                                   command=lambda: self._on_mode('LIVE'))
+        self._live_btn.pack(side='right', padx=(6, 0))
+        self._dry_btn = tk.Button(head, text='DRY RUN', font=_F_BTN, width=9,
+                                  command=lambda: self._on_mode('DRY'))
+        self._dry_btn.pack(side='right', padx=(6, 0))
+        self._default_bg = self._dry_btn.cget('bg')
+
+        self._pedal_var = tk.StringVar(value='443')
+        pedal_om = tk.OptionMenu(head, self._pedal_var, *sorted(PEDALS),
+                                 command=self._on_pedal)
+        pedal_om.config(font=_F_STAT, width=4, takefocus=0)
+        pedal_om.pack(side='right', padx=(12, 6))
+        tk.Label(head, text='pedal:', font=_F_INFO, fg='#888'
+                 ).pack(side='right')
+
+        self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
+        self._phase_lbl.pack(side='right', padx=(0, 16))
 
         self._info_lbl = tk.Label(self.win, text='', font=_F_INFO, fg='#333',
                                   anchor='w')
@@ -81,8 +118,7 @@ class Daily443ChartWindow:
 
         side = tk.Frame(body)
         side.pack(side='left', fill='y', padx=(10, 0))
-        tk.Label(side, text="Today's campaign fills", font=_F_STAT
-                 ).pack(anchor='w')
+        tk.Label(side, text='Campaign fills', font=_F_STAT).pack(anchor='w')
         self._log_txt = tk.Text(side, width=38, font=_F_LOG, state='disabled',
                                 bg='#FAFAFA', relief='groove', bd=1)
         self._log_txt.pack(fill='y', expand=True, pady=(4, 0))
@@ -95,9 +131,45 @@ class Daily443ChartWindow:
         self._on_update(self.ap['ui_state']())
 
     def _on_destroy(self, event):
-        if event.widget is self.win and self._cb:
+        if event.widget is not self.win:
+            return
+        if self._cb:
             self.ap['unsubscribe'](self._cb)
             self._cb = None
+        # Bare watching stops with its window; DRY/LIVE keep running in the
+        # background (the card's 443 button stays colored).
+        if self.ap['mode_of']() == 'WATCH':
+            self.ap['disable']()
+
+    # ── Mode / pedal controls ─────────────────────────────────────────────────
+
+    def _on_mode(self, mode):
+        current = self.ap['mode_of']()
+        if current == mode:                    # click active button → WATCH
+            self.ap['set_mode']('WATCH')
+            return
+        if mode == 'LIVE':
+            ui = self.ap['ui_state']() or {}
+            lines = ui.get('lines') or {}
+            detail = [f'Go LIVE on {self.ticker}?', '',
+                      'The watcher fires REAL orders when a line is hit:']
+            for key, tag in (('sell', 'SELL all'), ('chase', 'CHASE BUY'),
+                             ('load', 'LOAD BUY')):
+                if lines.get(key):
+                    p, q = lines[key]
+                    detail.append(f'  {tag}:  {q} @ {fmt_price(p, self.ccy)}')
+            detail.append('')
+            detail.append('Nothing rests before a trigger; LIVE drops back '
+                          'to WATCH when the market closes.')
+            if not messagebox.askyesno('443 LIVE', '\n'.join(detail),
+                                       parent=self.win):
+                return
+        ok, msg = self.ap['set_mode'](mode)
+        if not ok:
+            messagebox.showwarning('443 Autopilot', msg, parent=self.win)
+
+    def _on_pedal(self, value):
+        self.ap['set_pedal'](value)
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -108,7 +180,7 @@ class Daily443ChartWindow:
         except tk.TclError:
             return
         if ui is None or not self.ap['is_enabled']():
-            self._state_lbl.config(text='autopilot off', fg='#888')
+            self._state_lbl.config(text='off', fg='#888')
             self._status_lbl.config(text='')
             self.ui = None
             self._draw()
@@ -119,10 +191,23 @@ class Daily443ChartWindow:
         clr = (_CLR['state_stop'] if state == 'STOPPED'
                else _CLR['state_dep'] if state == 'DEPLOYED' else '#666')
         self._state_lbl.config(text=state, fg=clr)
-        live = ui.get('mode') == 'LIVE'
-        self._mode_lbl.config(text=('LIVE' if live else 'DRY RUN'),
-                              fg=('white' if live else 'black'),
-                              bg=('#CC0000' if live else '#E8C87A'))
+
+        mode = ui.get('mode', 'WATCH')
+        self._dry_btn.config(
+            bg=(_DRY_BG if mode == 'DRY' else self._default_bg),
+            fg=('white' if mode == 'DRY' else 'black'))
+        self._live_btn.config(
+            bg=(_LIVE_BG if mode == 'LIVE' else self._default_bg),
+            fg=('white' if mode == 'LIVE' else 'black'))
+
+        phase = ui.get('phase', 'CLOSED')
+        txt, pclr = _PHASE_TXT.get(phase, (phase, '#888'))
+        mkt = 'KR' if self.ticker.endswith('.KS') else 'US'
+        self._phase_lbl.config(text=f'{mkt} market: {txt}', fg=pclr)
+
+        if self._pedal_var.get() != ui.get('pedal', '443'):
+            self._pedal_var.set(ui.get('pedal', '443'))
+
         self._info_lbl.config(text=self._info_text(ui))
         self._status_lbl.config(
             text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}")
@@ -130,7 +215,7 @@ class Daily443ChartWindow:
         self._draw()
 
     def _info_text(self, ui):
-        parts = []
+        parts = [f"pedal {ui.get('pedal', '443')}"]
         shares = ui.get('shares') or 0
         price = ui.get('price')
         avg = ui.get('avg_cost') or 0
@@ -143,8 +228,8 @@ class Daily443ChartWindow:
             else:
                 parts.append(f'deployed {fmt_price(val, self.ccy)}')
         else:
-            src = '-3% of sell' if ui.get('anchor_source') == 'sell' \
-                else '-4% of close'
+            src = ('sell point' if ui.get('anchor_source') == 'sell'
+                   else 'prev close')
             if ui.get('anchor'):
                 parts.append(f"anchor {fmt_price(ui['anchor'], self.ccy)} "
                              f'({src})')
@@ -160,7 +245,8 @@ class Daily443ChartWindow:
         txt.config(state='normal')
         txt.delete('1.0', 'end')
         if not events:
-            txt.insert('end', '(no fills yet today)\n')
+            txt.insert('end', '(campaign log is empty —\n cleared after '
+                              'each full sell)\n')
         for e in events:
             price = e.get('price')
             p = fmt_price(price, self.ccy) if price else '--'
@@ -219,14 +305,13 @@ class Daily443ChartWindow:
         def y_of(p):
             return top + ch * (1 - (p - p_min) / p_rng)
 
-        # The 7% zone: buy line up to the (pseudo) sell line, shaded.
+        # The pedal zone: buy line up to the (pseudo) sell line, shaded.
         lo = (lines.get('chase') or lines.get('load') or (None,))[0]
         hi = (lines.get('sell') or lines.get('psell') or (None,))[0]
         if lo and hi and hi > lo:
             c.create_rectangle(left, y_of(hi), left + cw, y_of(lo),
                                fill=_CLR['zone'], outline='')
 
-        # Grid + y labels
         for i in range(5):
             p = p_min + p_rng * i / 4
             y = y_of(p)
@@ -236,7 +321,6 @@ class Daily443ChartWindow:
 
         # Time axis from the first tick (min span 30 min so early ticks
         # don't smear across the full width).
-        import time as _time
         now = _time.time()
         t0 = ticks[0][0] if ticks else now
         span = max(now - t0, 1800.0)
@@ -244,7 +328,6 @@ class Daily443ChartWindow:
         def x_of(t):
             return left + cw * (t - t0) / span
 
-        from datetime import datetime as _dt
         for i in range(5):
             t = t0 + span * i / 4
             x = left + cw * i / 4
@@ -261,7 +344,6 @@ class Daily443ChartWindow:
             c.create_text(label_x, y, text=text, anchor='w',
                           font=_F_REF, fill=color)
 
-        # Reference lines: anchor/avg dashed grey-orange, 443 lines solid.
         if deployed and avg > 0:
             ref(avg, _CLR['avg'], f'AVG {fmt_price(avg, self.ccy)}',
                 dash=(5, 4), width=1.6)
@@ -276,7 +358,6 @@ class Daily443ChartWindow:
                 ref(ln[0], _CLR[key],
                     f'{name} {fmt_price(ln[0], self.ccy)} ×{ln[1]}')
 
-        # Tick path + the live point.
         if len(ticks) >= 2:
             pts = []
             for t, p in ticks:

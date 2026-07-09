@@ -503,7 +503,8 @@ class App:
             get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
             on_graph=self._on_graph,
             on_compute=self._on_row_compute,
-            editable=not self._auto)
+            editable=not self._auto,
+            on_autopilot=self._open_autopilot)
 
     def _grid_all_cards(self):
         """Deployed cards first, then empty, in one 2-column grid; renumber."""
@@ -524,9 +525,11 @@ class App:
                 stock_sort_key(row.ticker))
 
     def _reorder_cards(self):
-        """Re-sort + re-grid all cards once fresh gaps are computed."""
+        """Re-sort + re-grid all cards on fresh data: deployed by gap; empty
+        by 5-day volatility (§30.8 — volatility picks the 443 battlefront)."""
         self.deployed_rows.sort(key=self._gap_order_key)
-        self.empty_rows.sort(key=self._gap_order_key)
+        self.empty_rows.sort(key=lambda r: self._vol_order_key(
+            r.ticker, self._volatility.get(r.ticker)))
         self._grid_all_cards()
 
     # ── Deployed section ─────────────────────────────────────────────────────
@@ -594,14 +597,40 @@ class App:
                     sell_lines=cd['sell_lines'],
                     current_price=current_price,
                     ordered_lines=ordered,
-                    order_actions=actions,
-                    autopilot=(self.autopilot.graph_context(ticker)
-                               if self._auto else None))
+                    order_actions=actions)
                 return
 
         # Fallback (ticker has no row yet)
         CandleChartWindow(self.root, ticker, ohlc, ccy,
                           current_price=current_price, ordered_lines=ordered)
+
+    # ── Daily 443 autopilot window (big card button) ─────────────────────────
+
+    def _open_autopilot(self, ticker):
+        """The card's big 443 button: start watching the stock (bare WATCH
+        mode — polling only, no orders) and pop its Daily 443 live window.
+        Reuses an already-open window instead of stacking duplicates."""
+        if not self._auto:
+            self.status_var.set('443 autopilot needs Toss (auto) mode.')
+            return
+        if not hasattr(self, '_ap_windows'):
+            self._ap_windows = {}
+        win = self._ap_windows.get(ticker)
+        if win is not None:
+            try:
+                if win.win.winfo_exists():
+                    win.win.lift()
+                    return
+            except tk.TclError:
+                pass
+        ok, msg = self.autopilot.watch(ticker)
+        if not ok:
+            self.status_var.set(f'443: {msg}')
+            return
+        from gui.daily443_chart import Daily443ChartWindow
+        ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
+        self._ap_windows[ticker] = Daily443ChartWindow(
+            self.root, ticker, ccy, self.autopilot.graph_context(ticker))
 
     # ── Live order placement from the graph ─────────────────────────────────────
 
