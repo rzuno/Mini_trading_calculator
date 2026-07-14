@@ -1,4 +1,13 @@
-# Daily 443 V-Commandos Autopilot Manual v001
+# Daily V-Commandos Autopilot Manual
+
+PART I  — Daily 443 (v001-v003): the original fixed-ratio system and the
+          watcher-model addenda (§30). Kept for history; the fixed 443/352
+          constants and pedals are SUPERSEDED by PART II.
+PART II — Adaptive Gear Autopilot (v004): the current specification.
+
+---
+
+# PART I — Daily 443 V-Commandos Autopilot Manual v001
 
 ## 1. Purpose
 
@@ -1030,3 +1039,182 @@ make that choice easy. Poll = 10 s.
 
 Same ~7% zone, selectable per stock in the Daily 443 window. In the
 watcher model a pedal change cancels nothing — the lines just move.
+
+(§30.9 pedals and the fixed §4 constants are SUPERSEDED by PART II:
+the gears are now chosen automatically from the deployment ratio.)
+
+---
+
+# PART II — Adaptive Gear Autopilot (v004, 2026-07-10)
+
+## II.1 Purpose
+
+Adaptive Gear Autopilot is a short-cycle trading system for a few selected
+volatile stocks. It does not predict direction. It:
+
+```text
+enters after a pullback,
+reinforces the position mechanically,
+keeps the average cost close to the active price zone,
+exits the entire position on a moderate rebound,
+recovers the army,
+and begins a new campaign.
+```
+
+It replaces the fixed 443/352 pedals with independent, automatically
+selected BUY and SELL gears. The effective ratio becomes 443 / 452.5 / 462
+as the position grows (and their fallback variants), instead of one fixed
+pedal. The watcher execution model of PART I §30.8 is unchanged: nothing
+is pre-placed; orders fire only when a line is touched.
+
+## II.2 Architecture
+
+```text
+Adaptive BUY Controller   — next chase distance, integer quantity,
+                            affordability
+Adaptive SELL Controller  — full-exit target from the deployed army
+Global Army Manager       — shared reserve across all watched stocks
+```
+
+BUY and SELL gears are independent (B3/S3, B1/S1, B2/S1 all valid).
+
+## II.3 Unit and Army
+
+```text
+1 unit         = the user-defined standard amount of capital
+total army     = the capital assigned to the system, in units (the auto N)
+deployment     = actual COST BASIS of the stock ÷ total army
+```
+
+Use cost basis, not market value — price moves alone must not change the
+deployment ratio.
+
+## II.4 LOAD and RELOAD anchors
+
+```text
+First LOAD of the day:  anchor = previous close;  LOAD = anchor × 0.96
+Same-day RELOAD:        anchor = final sell fill; RELOAD = anchor × 0.97
+Next trading day:       back to previous close × 0.96
+LOAD quantity:          integer closest to one unit (half-up), minimum 1
+```
+
+## II.5 BUY gears
+
+```text
+B1:  average cost −4%,  quantity = shares × 1/2
+B2:  average cost −5%,  quantity = shares × 2/3
+B3:  average cost −6%,  quantity = shares × 3/4
+```
+
+Higher gear = deeper entry, larger reinforcement, slower army burn.
+
+## II.6 Normal BUY gear selection (by deployment)
+
+```text
+deployment < 25%   → B1
+25% ≤ dep < 50%    → B2
+deployment ≥ 50%   → B3
+```
+
+## II.7 Early integer-quantity exceptions (exact overrides)
+
+```text
+1 share  → B3      (a stock costing more than one unit buys its one
+                    extra share at −6%, not −4% — smaller discrepancy)
+3 shares → B2      (3 × 2/3 = exactly 2)
+5 shares → B2      (3 shares at a safer, deeper price than B1's 2.5)
+```
+
+From ~7 shares onward the integer error is small; the zone rule applies.
+
+## II.8 BUY quantity
+
+```text
+quantity = round_half_up(shares × gear fraction), minimum 1
+7 × 1/2 = 3.5 → 4;   7 × 2/3 = 4.67 → 5;   7 × 3/4 = 5.25 → 5
+```
+
+(No banker's rounding.)
+
+## II.9 SELL gears and selection
+
+```text
+S1 = +2%      deployment ≥ 50%
+S2 = +2.5%    25% ≤ deployment < 50%
+S3 = +3%      deployment < 25%
+```
+
+One full-exit SELL of all sellable shares. No partial tiers. The campaign
+ends only when the position is empty.
+
+## II.10 Actual fills decide the gears
+
+Gears are computed from ACTUAL Toss holdings each poll. A resting,
+unfilled BUY changes nothing until the broker shows the new shares; then
+the refreshed cost basis moves the SELL/BUY gears. Partial fills likewise.
+
+## II.11 Global Army Manager
+
+```text
+tradable army = actual buying power − 0.5-unit permanent safety reserve
+```
+
+(Toss buying power already nets out the cash reserved by resting BUY
+orders, so open-order reservations are accounted for automatically.)
+The 0.5-unit reserve is never spent — it absorbs fees, taxes, slippage
+and rounding.
+
+## II.12 Affordability, B1 fallback, EXHAUSTED
+
+```text
+normal gear affordable            → place the normal quantity
+unaffordable, and max affordable
+shares ≥ 30% of current shares    → B1 fallback at −4% with the
+                                    maximum affordable quantity
+below 30%                         → BUY state = EXHAUSTED:
+                                    no more chase, keep managing the
+                                    SELL, notify the user ONCE,
+                                    resume automatically when army
+                                    returns (cancelled orders, sells,
+                                    new cash, bigger allocation)
+```
+
+The same gate protects the LOAD (reduced load if ≥30% of the one-unit
+target is affordable, else EXHAUSTED).
+
+## II.13 Gear movement
+
+Gears are not locked during a campaign. Every decision re-reads actual
+shares, cost basis, deployment and army, so sequences like B3→B1→B2 are
+normal and intentional.
+
+## II.14 Implementation notes (v004)
+
+```text
+Watcher, modes, market hours, campaign log, data-problem policy:
+  all unchanged from PART I §30.8 (WATCH/DRY/LIVE, 10 s poll,
+  regular-hours-only LIVE, campaign log cleared on full sell).
+
+RESERVE_GATE (core/autopilot.py) is the Global Army Manager's master
+  switch. False (test phase, cash not yet landed): affordability is
+  ignored, gears stay purely deployment-based, and a real Toss
+  insufficient-buying-power rejection announces once and backs off
+  5 minutes (no hard stop — the SELL stays managed).
+  True: §II.11-II.12 fully active.
+
+The card button reads AUTOPILOT (no 443); the live window shows the
+  auto-chosen gear pair, e.g.  B2 (-5% ×2/3)  S2 (+2.5%)  deploy 38%,
+  plus B1-fallback / EXHAUSTED when active.
+```
+
+## II.15 Operating principle
+
+```text
+Use simple deployment zones during normal operation.
+Correct only the severe integer glitches at 1, 3, and 5 shares.
+Buy deeper as the position becomes heavier.
+Lower the exit target as more army is deployed.
+Use meaningful remaining reserves when possible.
+Never consume the final 0.5-unit safety reserve.
+Exit the entire position and redeploy quickly.
+```

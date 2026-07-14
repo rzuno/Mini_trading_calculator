@@ -604,14 +604,14 @@ class App:
         CandleChartWindow(self.root, ticker, ohlc, ccy,
                           current_price=current_price, ordered_lines=ordered)
 
-    # ── Daily 443 autopilot window (big card button) ─────────────────────────
+    # ── Autopilot window (big card button) ────────────────────────────────────
 
     def _open_autopilot(self, ticker):
-        """The card's big 443 button: start watching the stock (bare WATCH
-        mode — polling only, no orders) and pop its Daily 443 live window.
+        """The card's big Autopilot button: start watching the stock (bare
+        WATCH mode — polling only, no orders) and pop its live window.
         Reuses an already-open window instead of stacking duplicates."""
         if not self._auto:
-            self.status_var.set('443 autopilot needs Toss (auto) mode.')
+            self.status_var.set('Autopilot needs Toss (auto) mode.')
             return
         if not hasattr(self, '_ap_windows'):
             self._ap_windows = {}
@@ -625,7 +625,7 @@ class App:
                 pass
         ok, msg = self.autopilot.watch(ticker)
         if not ok:
-            self.status_var.set(f'443: {msg}')
+            self.status_var.set(f'Autopilot: {msg}')
             return
         from gui.daily443_chart import Daily443ChartWindow
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'

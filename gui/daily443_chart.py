@@ -1,6 +1,6 @@
-"""Daily 443 live window — the autopilot's own cockpit (§30.8).
+"""Autopilot live window — the adaptive-gear watcher's cockpit.
 
-Opened by the card's big 443 button. Opening it arms bare WATCH mode:
+Opened by the card's big Autopilot button. Opening it arms bare WATCH mode:
 the stock is polled every 10 s and this window follows every tick — the
 5-day chart and the main panel stay refresh-button-driven.
 
@@ -14,9 +14,12 @@ Top-right controls select the mode:
 Closing the window in WATCH mode stops the polling; in DRY/LIVE the
 autopilot keeps running in the background (the card button stays colored).
 
-The chart shows the intraday tick path inside the shaded pedal zone
-(chase/load line → sell line), avg/anchor, the campaign fill log (cleared
-when the position is fully sold), deployed size and the market phase.
+The gears are NOT chosen here — they are picked automatically from the
+stock's deployment ratio (PART II of the manual) and displayed live:
+B1/B2/B3 set the chase line (−4/−5/−6%, ×1/2, ×2/3, ×3/4) and S1/S2/S3 the
+full-exit line (+2/+2.5/+3%). The chart shows the intraday tick path inside
+that shaded gear zone, avg/anchor, the campaign fill log (cleared when the
+position is fully sold), deployed size and the market phase.
 """
 
 import time as _time
@@ -26,7 +29,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from core.calc import STOCK_NAMES, fmt_price
-from core.autopilot import PEDALS
+from core.autopilot import BUY_GEARS, SELL_GEARS
 
 _F_TITLE = ('Segoe UI', 17, 'bold')
 _F_STAT  = ('Segoe UI', 13)
@@ -71,18 +74,19 @@ class Daily443ChartWindow:
 
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
-        self.win.title(f'{name} — Daily 443 live')
+        self.win.title(f'{name} — Autopilot live')
         self.win.geometry('1180x680')
         self.win.minsize(780, 480)
 
         head = tk.Frame(self.win, padx=12, pady=8)
         head.pack(fill='x')
-        tk.Label(head, text=f'{name}  — Daily 443', font=_F_TITLE
+        tk.Label(head, text=f'{name}  — Autopilot', font=_F_TITLE
                  ).pack(side='left')
         self._state_lbl = tk.Label(head, text='', font=_F_TITLE)
         self._state_lbl.pack(side='left', padx=(16, 0))
 
-        # Mode + pedal controls, right-aligned (§30.8 point 5/8).
+        # Mode controls, right-aligned. Gears are automatic (no selector) —
+        # the current B/S gear pair is displayed next to the market phase.
         self._live_btn = tk.Button(head, text='LIVE', font=_F_BTN, width=8,
                                    command=lambda: self._on_mode('LIVE'))
         self._live_btn.pack(side='right', padx=(6, 0))
@@ -91,16 +95,11 @@ class Daily443ChartWindow:
         self._dry_btn.pack(side='right', padx=(6, 0))
         self._default_bg = self._dry_btn.cget('bg')
 
-        self._pedal_var = tk.StringVar(value='443')
-        pedal_om = tk.OptionMenu(head, self._pedal_var, *sorted(PEDALS),
-                                 command=self._on_pedal)
-        pedal_om.config(font=_F_STAT, width=4, takefocus=0)
-        pedal_om.pack(side='right', padx=(12, 6))
-        tk.Label(head, text='pedal:', font=_F_INFO, fg='#888'
-                 ).pack(side='right')
+        self._gear_lbl = tk.Label(head, text='', font=_F_BTN, fg='#4B0082')
+        self._gear_lbl.pack(side='right', padx=(12, 12))
 
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
-        self._phase_lbl.pack(side='right', padx=(0, 16))
+        self._phase_lbl.pack(side='right', padx=(0, 4))
 
         self._info_lbl = tk.Label(self.win, text='', font=_F_INFO, fg='#333',
                                   anchor='w')
@@ -159,17 +158,15 @@ class Daily443ChartWindow:
                     p, q = lines[key]
                     detail.append(f'  {tag}:  {q} @ {fmt_price(p, self.ccy)}')
             detail.append('')
-            detail.append('Nothing rests before a trigger; LIVE drops back '
+            detail.append('Gears follow the deployed army automatically. '
+                          'Nothing rests before a trigger; LIVE drops back '
                           'to WATCH when the market closes.')
-            if not messagebox.askyesno('443 LIVE', '\n'.join(detail),
+            if not messagebox.askyesno('Autopilot LIVE', '\n'.join(detail),
                                        parent=self.win):
                 return
         ok, msg = self.ap['set_mode'](mode)
         if not ok:
-            messagebox.showwarning('443 Autopilot', msg, parent=self.win)
-
-    def _on_pedal(self, value):
-        self.ap['set_pedal'](value)
+            messagebox.showwarning('Autopilot', msg, parent=self.win)
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -205,8 +202,23 @@ class Daily443ChartWindow:
         mkt = 'KR' if self.ticker.endswith('.KS') else 'US'
         self._phase_lbl.config(text=f'{mkt} market: {txt}', fg=pclr)
 
-        if self._pedal_var.get() != ui.get('pedal', '443'):
-            self._pedal_var.set(ui.get('pedal', '443'))
+        # Auto-chosen gear pair (deployment-driven). Red when exhausted.
+        bg_, sg_ = ui.get('buy_gear'), ui.get('sell_gear')
+        if bg_ and sg_:
+            gear_txt = (f"{BUY_GEARS[bg_]['label']}   "
+                        f"{SELL_GEARS[sg_]['label']}   "
+                        f"deploy {ui.get('deploy_ratio', 0) * 100:.0f}%")
+            if ui.get('buy_state') == 'EXHAUSTED':
+                gear_txt += '   EXHAUSTED'
+            elif ui.get('buy_state') == 'FALLBACK':
+                gear_txt += '   B1 fallback'
+            self._gear_lbl.config(
+                text=gear_txt,
+                fg=('#880000' if ui.get('buy_state') == 'EXHAUSTED'
+                    else '#4B0082'))
+        else:
+            self._gear_lbl.config(text='gears: auto (empty — load -4%)',
+                                  fg='#888')
 
         self._info_lbl.config(text=self._info_text(ui))
         self._status_lbl.config(
@@ -215,7 +227,7 @@ class Daily443ChartWindow:
         self._draw()
 
     def _info_text(self, ui):
-        parts = [f"pedal {ui.get('pedal', '443')}"]
+        parts = []
         shares = ui.get('shares') or 0
         price = ui.get('price')
         avg = ui.get('avg_cost') or 0

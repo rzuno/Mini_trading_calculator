@@ -322,11 +322,11 @@ class StockRow:
             step.grid(row=grow, column=2, sticky='w')
             self._steppers[ti] = step
 
-        # -- Big 443 autopilot button (right of the sell gear) -----------------
-        # Opens the Daily 443 live window; its color IS the autopilot status.
+        # -- Big Autopilot button (right of the sell gear) ---------------------
+        # Opens the Autopilot live window; its color IS the autopilot status.
         if self.on_autopilot:
             self.ap_btn = tk.Button(
-                wrap, text='443\nAUTOPILOT', font=_F_SM_B, width=10,
+                wrap, text='AUTOPILOT', font=_F_SM_B, width=10,
                 height=3, bd=2, takefocus=0,
                 command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
@@ -710,18 +710,17 @@ class StockRow:
     def set_row_num(self, n: int):
         self._name_lbl.config(text=f"{n}. {self._disp_name}")
 
-    # Big 443 button styling per autopilot status (None = off).
+    # Big Autopilot button styling per status (None = off).
     _AP_STYLES = {
-        None:    ('443\nAUTOPILOT', None,      'black'),
-        'WATCH': ('443\nWATCH',     '#3366CC', 'white'),
-        'DRY':   ('443\nDRY RUN',   '#E08000', 'white'),
-        'LIVE':  ('443\nLIVE',      '#CC0000', 'white'),
-        'STOP':  ('443\nSTOP',      '#880000', 'white'),
+        None:    ('AUTOPILOT',           None,      'black'),
+        'WATCH': ('AUTOPILOT\nWATCH',    '#3366CC', 'white'),
+        'DRY':   ('AUTOPILOT\nDRY RUN',  '#E08000', 'white'),
+        'LIVE':  ('AUTOPILOT\nLIVE',     '#CC0000', 'white'),
     }
 
     def set_autopilot(self, key):
-        """Color the big 443 button to the autopilot status
-        (None/'WATCH'/'DRY'/'LIVE'/'STOP')."""
+        """Color the big Autopilot button to the status
+        (None/'WATCH'/'DRY'/'LIVE')."""
         if not hasattr(self, 'ap_btn'):
             return
         text, bg, fg = self._AP_STYLES.get(key, self._AP_STYLES[None])
