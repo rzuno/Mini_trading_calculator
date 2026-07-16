@@ -101,14 +101,6 @@ class Daily443ChartWindow:
         self._state_lbl = tk.Label(head, text='', font=_F_TITLE)
         self._state_lbl.pack(side='left', padx=(16, 0))
 
-        # Strategy toggle: 타짜 (묻고 더블로 가, default) ↔ adaptive gears.
-        self._tz_btn = tk.Button(head, text='타짜', font=_F_BTN, width=6,
-                                 command=lambda: self._on_strategy('TAZZA'))
-        self._tz_btn.pack(side='left', padx=(18, 0))
-        self._ad_btn = tk.Button(head, text='기어', font=_F_BTN, width=6,
-                                 command=lambda: self._on_strategy('ADAPTIVE'))
-        self._ad_btn.pack(side='left', padx=(4, 0))
-
         # Mode controls, right-aligned. Gears are automatic (no selector) —
         # the current B/S gear pair is displayed next to the market phase.
         self._live_btn = tk.Button(head, text='LIVE', font=_F_BTN, width=8,
@@ -124,6 +116,17 @@ class Daily443ChartWindow:
 
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 4))
+
+        # Strategy toggle on its own row (under DRY RUN / LIVE) so it never
+        # crowds the market-phase label: 타짜 (default) ↔ adaptive gears.
+        head2 = tk.Frame(self.win, padx=12)
+        head2.pack(fill='x')
+        self._ad_btn = tk.Button(head2, text='기어', font=_F_BTN, width=6,
+                                 command=lambda: self._on_strategy('ADAPTIVE'))
+        self._ad_btn.pack(side='right')
+        self._tz_btn = tk.Button(head2, text='타짜', font=_F_BTN, width=6,
+                                 command=lambda: self._on_strategy('TAZZA'))
+        self._tz_btn.pack(side='right', padx=(0, 6))
 
         self._info_lbl = tk.Label(self.win, text='', font=_F_INFO, fg='#333',
                                   anchor='w')
@@ -149,6 +152,7 @@ class Daily443ChartWindow:
                                  relief='groove', bd=1)
         self._proj_txt.tag_configure('buy', foreground=_CLR['chase'])
         self._proj_txt.tag_configure('sell', foreground=_CLR['sell'])
+        self._proj_txt.tag_configure('skim', foreground=_CLR['rebuy'])
         self._proj_txt.pack(fill='x', pady=(2, 8))
         tk.Label(side, text='Campaign fills', font=_F_STAT).pack(anchor='w')
         self._log_txt = tk.Text(side, width=38, font=_F_LOG, state='disabled',
@@ -341,12 +345,15 @@ class Daily443ChartWindow:
         if ui.get('chase_count'):
             parts.append(f"chase #{ui['chase_count']}")
         if ui.get('strategy') == 'TAZZA' and (ui.get('campaign_B') or 0) > 0:
-            parts.append(f"campaign B {fmt_price(ui['campaign_B'], self.ccy)}"
-                         f" / S {fmt_price(ui.get('campaign_S'), self.ccy)}"
-                         f" / K {fmt_price(ui.get('campaign_K'), self.ccy)}")
+            # Campaign ledger, plainly: 누적매수(B) 누적매도(S) 최대투입(K) —
+            # the sell tiers aim for +g% on 최대투입.
+            parts.append(
+                f"캠페인: 누적매수 {fmt_price(ui['campaign_B'], self.ccy)}"
+                f"  누적매도 {fmt_price(ui.get('campaign_S'), self.ccy)}"
+                f"  최대투입 {fmt_price(ui.get('campaign_K'), self.ccy)}")
             if ui.get('skim_pending') and ui.get('skim_lock_amount'):
                 lock = fmt_price(ui['skim_lock_amount'], self.ccy)
-                parts.append(f'lock {lock}')
+                parts.append(f'밑장 lock {lock}')
         return '      '.join(parts)
 
     def _fill_proj(self, ui):
@@ -360,9 +367,19 @@ class Daily443ChartWindow:
         if ui.get('strategy') == 'TAZZA':
             self._proj_lbl.config(text='타짜 ladder (manual entry)')
             if proj:
-                for i, (p, q) in enumerate(proj.get('buys') or [], 1):
+                n = 0
+                for p, q, kind in (proj.get('buys') or []):
+                    if kind == 'SKIM':
+                        # The army cannot fund this double — at this line
+                        # the bot would 밑장 빼기 (sell 1/3) instead.
+                        txt.insert('end',
+                                   f' 밑장 1/3 {fmt_price(p, self.ccy):>12}'
+                                   f'  −{q}\n', 'skim')
+                        break
+                    n += 1
+                    name = 'LOAD ' if kind == 'LOAD' else f'더블 {n} '
                     txt.insert('end',
-                               f' BUY {i}   {fmt_price(p, self.ccy):>12}'
+                               f' {name}  {fmt_price(p, self.ccy):>12}'
                                f'  ×{q}\n', 'buy')
                 for i, (p, q) in enumerate(proj.get('sells') or [], 1):
                     txt.insert('end',
@@ -427,7 +444,7 @@ class Daily443ChartWindow:
 
         prices = [p for _, p in ticks]
         prices += [v[0] for v in lines.values()]
-        prices += [p for p, _q in proj_buys]
+        prices += [b[0] for b in proj_buys]
         if deployed and avg > 0:
             prices.append(avg)
         if not deployed and anchor:
@@ -503,14 +520,23 @@ class Daily443ChartWindow:
         for key, name in _LINE_ORDER:
             ln = lines.get(key)
             if ln:
+                if key == 'lower':
+                    # The live lower line IS whatever the army affords.
+                    nda = ui.get('next_down_action')
+                    if nda == 'SKIM':
+                        name = '밑장 빼기 (더블 불가)'
+                    elif nda == 'FINAL':
+                        name = '손절 (더블 불가)'
                 ref(ln[0], _CLR[key],
                     f'{name} {fmt_price(ln[0], self.ccy)} ×{ln[1]}')
 
-        # 타짜: the doubles BEYOND the live lower line, dashed — what the
+        # 타짜: the levels BEYOND the live lower line, dashed — what the
         # chase would look like if the dip keeps going (manual-entry aid).
-        for i, (p, q) in enumerate(proj_buys, 2):
-            ref(p, _CLR['proj'],
-                f'더블 D{i} {fmt_price(p, self.ccy)} ×{q}',
+        for i, b in enumerate(proj_buys, 2):
+            p, q, kind = b
+            name = ('밑장 1/3' if kind == 'SKIM' else f'더블 D{i}')
+            ref(p, _CLR['proj' if kind != 'SKIM' else 'rebuy'],
+                f'{name} {fmt_price(p, self.ccy)} ×{q}',
                 dash=(3, 5), width=1.4)
 
         if len(ticks) >= 2:

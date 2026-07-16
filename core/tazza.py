@@ -7,10 +7,14 @@ The meta (TAZZA manual v0.1.0):
 
     LOAD      empty → BUY 1 unit at anchor −3% (reload after a full exit:
               final sell fill −3%; next day: prev close −3%).
-    DOUBLE    price ≤ Toss avg × (1 − ladder) → add exactly deployed_units
-              more (1→2→4→8…). All or nothing: if the full double is not
-              affordable, 밑장 빼기 instead. A double while in an emergency
-              episode is a RECOVERY_BUY → back to normal 3/6.
+    DOUBLE    price ≤ Toss avg × (1 − ladder) → buy the SAME SHARE COUNT
+              again (6 held → buy 6 → 12; user simplification: value-exact
+              doubling would need slightly more shares as the line is
+              lower, but share-count doubling keeps the intuition and the
+              avg lands a touch better than −ladder). All or nothing: if
+              the full double is not affordable, 밑장 빼기 instead. A double
+              while in an emergency episode is a RECOVERY_BUY → back to
+              normal 3/6.
     밑장 빼기   (SKIM) sell 1/3 of the holding at market, lock the proceeds,
               rebuy the SAME qty at the fill −3%. Success → back to 3/6,
               stage 0. Rebound (upper tier fills first) → failure: lock is
@@ -124,6 +128,7 @@ class TazzaEngine:
         self.final_out = False
         self.double_count = 0
         self.deployed_units = 0
+        self.next_down_action = None   # DOUBLE | SKIM | REBUY | FINAL (UI)
 
         self.dirty = False       # ledger changed since the last save
         self._pending = None     # {'intent','side','price','qty','ts'}
@@ -418,19 +423,31 @@ class TazzaEngine:
 
     # ── Projection: the ladder to type into the Toss app by hand ────────────
 
-    def _project(self, avg, shares, unit, sells):
+    def _project(self, avg, shares, sells, free):
+        """Future double lines (share count doubling: q, 2q, 4q…). Each
+        level is checked against the remaining free army; the first level
+        the army cannot fund is shown as 밑장 빼기 (sell 1/3) and the
+        projection stops there — after a skim the ladder re-forms around
+        the rebuy, so deeper lines would be fiction."""
         d = self.ladder_pct or 0.07
         buys = []
-        a, q_tot, du = avg, shares, max(1, self.deployed_units)
+        a, q_tot = avg, shares
+        cash = free                       # None = unknown → assume funded
         for _ in range(PROJECTION_DEPTH):
             line = trim_buy_price(self.ticker, a * (1 - d))
-            if line <= 0 or unit <= 0:
+            if line <= 0 or q_tot <= 0:
                 break
-            q = max(1, round_half_up(du * unit / line))
-            buys.append((line, q))
+            q = q_tot
+            cost = q * line
+            if cash is not None and cost > cash:
+                skim_q = max(1, round_half_up(q_tot / 3))
+                buys.append((line, skim_q, 'SKIM'))
+                break
+            buys.append((line, q, 'DOUBLE'))
+            if cash is not None:
+                cash -= cost
             a = (a * q_tot + line * q) / (q_tot + q)
             q_tot += q
-            du *= 2
         self.projection = {'buys': buys,
                            'sells': [(p, q) for _k, p, q in sells]}
 
@@ -478,15 +495,28 @@ class TazzaEngine:
 
         sells = self._sell_targets(shares, price)
         lower = trim_buy_price(self.ticker, avg * (1 - d))
-        dq = (max(1, round_half_up(self.deployed_units * unit / lower))
-              if unit > 0 and lower > 0 else 0)
+        dq = shares                       # 더블 = same share count again
+
+        # Affordability is judged every poll (not only on touch) so the UI
+        # can flag 밑장 빼기 BEFORE the price gets there.
+        bp = snap.get('buying_power')
+        locks = snap.get('skim_locks') or 0.0
+        free = None if bp is None else max(0.0, bp - locks)
+        affordable = free is None or dq * lower <= free
+        if self.skim_pending:
+            self.next_down_action = 'REBUY'
+        elif affordable:
+            self.next_down_action = 'DOUBLE'
+        else:
+            self.next_down_action = ('FINAL' if self.emergency_stage >= 2
+                                     else 'SKIM')
 
         self.lines = {k: (p, q) for k, p, q in sells}
         if self.skim_pending:
             self.lines['rebuy'] = (self.skim_rebuy_line, self.skim_rebuy_qty)
         else:
             self.lines['lower'] = (lower, dq)
-        self._project(avg, shares, unit, sells)
+        self._project(avg, shares, sells, free)
 
         m = LADDER_MODES[self.ladder_mode]
         tag = (f"타짜 -{d * 100:.0f}% {m['label']}"
@@ -560,14 +590,11 @@ class TazzaEngine:
                 self.status = (f'[{tag}] LOWER trigger met @ '
                                f'{self._fp(price)} (watching only)')
                 return acts
-            bp = snap.get('buying_power')
-            locks = snap.get('skim_locks') or 0.0
-            free = None if bp is None else max(0.0, bp - locks)
-            if free is None or dq * lower <= free:
+            if affordable:
                 acts += [('cancel', s['id'], 'our sell (double first)')
                          for s in sell_orders if s.get('mine')]
                 self._place(acts, 'DOUBLE', 'BUY', lower, dq,
-                            f'더블 BUY ×{self.deployed_units}u')
+                            f'더블 BUY +{dq} (shares doubled)')
                 self.status = (f'[{tag}] 더블 fired: {dq} @ '
                                f'{self._fp(lower)}')
                 return acts
@@ -649,6 +676,7 @@ class TazzaEngine:
     def _poll_empty(self, snap):
         self.state = 'EMPTY'
         self.deployed_units = 0
+        self.next_down_action = None
         self.projection = None
         if not self.anchor or self.anchor <= 0:
             if snap.get('prev_close'):
@@ -673,7 +701,8 @@ class TazzaEngine:
         # Pseudo exit: a fresh 1-unit campaign sells whole at +r1 (3%).
         psell = trim_sell_price(self.ticker, load_p * 1.03)
         self.lines = {'load': (load_p, lq), 'psell': (psell, lq)}
-        self.projection = {'buys': [(load_p, lq)], 'sells': [(psell, lq)]}
+        self.projection = {'buys': [(load_p, lq, 'LOAD')],
+                           'sells': [(psell, lq)]}
 
         price = snap.get('price')
         if price is None:

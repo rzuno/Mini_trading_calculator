@@ -665,6 +665,7 @@ class AutopilotController:
             'campaign_S': getattr(engine, 'S', None),
             'campaign_K': getattr(engine, 'K', None),
             'projection': getattr(engine, 'projection', None),
+            'next_down_action': getattr(engine, 'next_down_action', None),
             'badge_key': badge_key,
             'phase': market_phase(ticker),
             'price': (snap or {}).get('price'),

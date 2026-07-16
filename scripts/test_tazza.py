@@ -123,7 +123,8 @@ check('single exit at campaign +3%', s.e.lines['tier1'][0] == p_single,
 
 print('-- full DOUBLE chain and the two-tier campaign exit --')
 lower1 = trim_buy_price(T, s.avg * 0.94)
-check('lower = avg -6%', s.e.lines['lower'][0] == lower1, s.e.lines['lower'])
+check('lower = avg -6%, double = same share count',
+      s.e.lines['lower'] == (lower1, s.shares), s.e.lines['lower'])
 q0 = s.shares
 acts = s.poll(lower1)
 check('더블 fires on touch', places(acts) and '더블' in places(acts)[0][4])
@@ -143,10 +144,11 @@ check('tier2 price matches formula',
       s.e.lines['tier2'])
 check('projection: 3 future doubles + 2 sells',
       len(s.e.projection['buys']) == 3 and len(s.e.projection['sells']) == 2)
-check('projection sizes double (x2 then x4)',
-      s.e.projection['buys'][1][1] > s.e.projection['buys'][0][1]
-      and s.e.projection['buys'][2][1] > 1.5 * s.e.projection['buys'][1][1],
-      s.e.projection['buys'])
+check('projection shares double exactly (q, 2q, 4q)',
+      [b[1] for b in s.e.projection['buys']]
+      == [s.shares, 2 * s.shares, 4 * s.shares], s.e.projection['buys'])
+check('projection all 더블 while the army funds it',
+      all(b[2] == 'DOUBLE' for b in s.e.projection['buys']))
 
 t1_price = s.e.lines['tier1'][0]
 acts = s.poll(t1_price)
@@ -178,6 +180,11 @@ s.prev_close = 100_000
 s.poll(99_000)
 s.poll(trim_buy_price(T, 97_000))
 s.poll(97_100)                      # load fill seen; cash now ~530k
+check('projection flags 밑장 before the price gets there',
+      s.e.projection['buys'][0][2] == 'SKIM'
+      and len(s.e.projection['buys']) == 1, s.e.projection['buys'])
+check('next_down_action = SKIM shown to the UI',
+      s.e.next_down_action == 'SKIM')
 lower = s.e.lines['lower'][0]
 q_before = s.shares
 acts = s.poll(lower)
@@ -264,7 +271,7 @@ check('손절 done: flat, campaign cleared',
       s.shares == 0 and not s.e.campaign_active and not s.e.final_out)
 
 print('-- stage 2 + lower touch + unaffordable double -> immediate 손절 --')
-s = Sim(cash=1_400_000)
+s = Sim(cash=1_200_000)
 s.prev_close = 100_000
 s.poll(99_000)
 s.poll(trim_buy_price(T, 97_000))
@@ -280,6 +287,7 @@ s.poll(90_100)                      # fill seen -> stage 2 pending
 check('now stage 2', s.e.emergency_stage == 2
       and s.e.ladder_mode == 'FINAL_1_2')
 s.e._clear_skim()
+s.locks = 400_000                   # another battlefield holds the rest
 acts = s.poll(85_000)               # stage 2 lower touch, no double money
 check('stage 2 lower touch, no double money -> FINAL_OUT',
       notifies(acts) and places(acts) and places(acts)[0][1] == 'SELL',
