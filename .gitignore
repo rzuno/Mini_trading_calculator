@@ -4,8 +4,9 @@ __pycache__/
 *$py.class
 *.so
 
-# Data files (user-specific positions)
+# Data files (user-specific positions / autopilot campaign state)
 data/*.csv
+data/*.json
 /config.json
 
 # Docs for main calculator (separate project)

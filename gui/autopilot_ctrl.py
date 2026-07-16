@@ -28,6 +28,7 @@ blocks our side) retries next cycle.
 
 import os
 import re
+import json
 import time
 import calendar
 import threading
@@ -36,10 +37,17 @@ import tkinter as tk
 from tkinter import messagebox
 
 from core.autopilot import Daily443Engine, POLL_SECONDS
+from core.tazza import TazzaEngine
 from core.calc import fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
+
+# Strategy per stock: 타짜 (묻고 더블로 가) is the preferred default; the
+# verified adaptive-gear watcher stays selectable in the Autopilot window.
+STRATEGIES = ('TAZZA', 'ADAPTIVE')
+DEFAULT_STRATEGY = 'TAZZA'
+_TAZZA_STORE = os.path.join('data', 'tazza_campaigns.json')
 
 _BACKOFF_HOURS_CLOSED = 300     # seconds
 _BACKOFF_INSUFFICIENT = 300     # broker refused the buy: army is out
@@ -142,6 +150,27 @@ class AutopilotController:
             os.makedirs('logs', exist_ok=True)
         except OSError:
             pass
+        self._tazza_store = self._load_tazza_store()
+
+    # ── TAZZA campaign persistence (manual §73: restore across restarts) ─────
+
+    def _load_tazza_store(self):
+        try:
+            with open(_TAZZA_STORE, encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_tazza(self, ticker, engine):
+        self._tazza_store[ticker] = engine.to_dict()
+        try:
+            os.makedirs('data', exist_ok=True)
+            tmp = _TAZZA_STORE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._tazza_store, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, _TAZZA_STORE)
+        except OSError as e:
+            self._log(ticker, f'tazza campaign save failed: {e}')
 
     # ── Logging (§25) ─────────────────────────────────────────────────────────
 
@@ -172,12 +201,14 @@ class AutopilotController:
                 return True, 'already watching'
             self._slots[ticker] = {
                 'engine': None, 'mode': 'WATCH', 'paper': None,
+                'strategy': DEFAULT_STRATEGY,
                 'backoff_until': 0.0,
                 'prev_close': None, 'prev_close_date': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
                        'status': 'arming…', 'lines': {}, 'mode': 'WATCH',
+                       'strategy': DEFAULT_STRATEGY,
                        'price': None, 'phase': market_phase(ticker)},
             }
         self.refresh_units()
@@ -210,6 +241,11 @@ class AutopilotController:
         with self._lock:
             slot['mode'] = mode
             slot['paper'] = None          # DRY re-seeds from reality
+            if slot['strategy'] == 'TAZZA':
+                # The tazza ledger must never mix paper and real fills:
+                # re-arm the engine on the new mode's reality (LIVE/WATCH
+                # restore the saved campaign; DRY starts a scratch one).
+                slot['engine'] = None
         self._log(ticker, f'MODE → {mode}')
         self._wake.set()
         return True, mode
@@ -217,6 +253,28 @@ class AutopilotController:
     def mode_of(self, ticker):
         slot = self._slots.get(ticker)
         return slot['mode'] if slot else None
+
+    def set_strategy(self, ticker, strategy):
+        """타짜 ↔ adaptive gears. Re-arms the engine; the position and any
+        resting orders are untouched (the new engine adopts them)."""
+        slot = self._slots.get(ticker)
+        if not slot:
+            return False, 'not watching'
+        if strategy not in STRATEGIES:
+            return False, f'unknown strategy {strategy}'
+        with self._lock:
+            if slot['strategy'] == strategy:
+                return True, strategy
+            slot['strategy'] = strategy
+            slot['engine'] = None
+            slot['paper'] = None
+        self._log(ticker, f'STRATEGY → {strategy}')
+        self._wake.set()
+        return True, strategy
+
+    def strategy_of(self, ticker):
+        slot = self._slots.get(ticker)
+        return slot['strategy'] if slot else None
 
     def is_enabled(self, ticker) -> bool:
         return ticker in self._slots
@@ -251,6 +309,8 @@ class AutopilotController:
             'ui_state': lambda: self.ui_state(ticker),
             'mode_of': lambda: self.mode_of(ticker),
             'set_mode': lambda m: self.set_mode(ticker, m),
+            'strategy_of': lambda: self.strategy_of(ticker),
+            'set_strategy': lambda s: self.set_strategy(ticker, s),
             'disable': lambda: self.disable(ticker),
             'market_phase': lambda: market_phase(ticker),
             'subscribe': lambda fn: self.subscribe(ticker, fn),
@@ -441,18 +501,48 @@ class AutopilotController:
         snap['trading_date'] = self._trading_date(ticker)
         snap['prev_close'] = self._prev_close(prov, ticker, slot)
         snap['can_trade'] = mode in ('DRY', 'LIVE')
+        snap['phase'] = market_phase(ticker)
+        snap['skim_locks'] = self._other_skim_locks(ticker, ccy)
 
         if slot['engine'] is None:
-            slot['engine'] = Daily443Engine(
-                ticker, anchor=None, trading_date=snap['trading_date'],
-                log=lambda m, t=ticker: self._log(t, m))
-            self._log(ticker, f"engine armed (prev close "
-                              f"{snap['prev_close'] or 'unknown'})")
+            if slot['strategy'] == 'TAZZA':
+                # DRY runs a scratch campaign; WATCH/LIVE restore the saved
+                # one so the ledger (B/S/K) survives restarts (§73).
+                saved = (None if mode == 'DRY'
+                         else self._tazza_store.get(ticker))
+                slot['engine'] = TazzaEngine(
+                    ticker, trading_date=snap['trading_date'], saved=saved,
+                    log=lambda m, t=ticker: self._log(t, m))
+                self._log(ticker, f'타짜 engine armed '
+                                  f'({"campaign restored" if saved else "fresh"})')
+            else:
+                slot['engine'] = Daily443Engine(
+                    ticker, anchor=None, trading_date=snap['trading_date'],
+                    log=lambda m, t=ticker: self._log(t, m))
+                self._log(ticker, f"engine armed (prev close "
+                                  f"{snap['prev_close'] or 'unknown'})")
         engine = slot['engine']
 
         acts = engine.poll(snap)
         self._execute(ticker, slot, prov, seq, engine, acts)
+        if (slot['strategy'] == 'TAZZA' and slot['mode'] == 'LIVE'
+                and getattr(engine, 'dirty', False)):
+            self._save_tazza(ticker, engine)
+            engine.dirty = False
         self._push_ui(ticker, slot, snap=snap)
+
+    def _other_skim_locks(self, ticker, ccy):
+        """밑장 빼기 proceeds locked by OTHER battlefields in this currency —
+        they are not free army for this stock's double (§46)."""
+        total = 0.0
+        for t, s in list(self._slots.items()):
+            if t == ticker:
+                continue
+            e = s.get('engine')
+            if (e is not None and getattr(e, 'skim_pending', False)
+                    and getattr(e, 'currency', None) == ccy):
+                total += getattr(e, 'skim_lock_amount', 0.0) or 0.0
+        return total
 
     # ── Action executor ───────────────────────────────────────────────────────
 
@@ -551,14 +641,30 @@ class AutopilotController:
             'lines': dict(engine.lines) if engine else {},
             'anchor': engine.anchor if engine else None,
             'anchor_source': engine.anchor_source if engine else 'close',
-            'chase_count': engine.chase_count if engine else 0,
+            'chase_count': getattr(engine, 'chase_count',
+                                   getattr(engine, 'double_count', 0) or 0),
             'events': list(engine.events) if engine else [],
-            'buy_gear': engine.buy_gear if engine else None,
-            'sell_gear': engine.sell_gear if engine else None,
-            'deploy_ratio': engine.deploy_ratio if engine else 0.0,
-            'buy_state': engine.buy_state if engine else 'OK',
+            'buy_gear': getattr(engine, 'buy_gear', None),
+            'sell_gear': getattr(engine, 'sell_gear', None),
+            'deploy_ratio': getattr(engine, 'deploy_ratio', 0.0) or 0.0,
+            'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
             'army_units': self._units.get('army') or 0.0,
             'mode': slot['mode'],
+            'strategy': slot.get('strategy', 'ADAPTIVE'),
+            # 타짜 extras (None/0 for the adaptive engine)
+            'ladder_pct': getattr(engine, 'ladder_pct', None),
+            'ladder_mode': getattr(engine, 'ladder_mode', None),
+            'emergency_stage': getattr(engine, 'emergency_stage', 0) or 0,
+            'tier_progress': getattr(engine, 'tier_progress', None),
+            'skim_pending': getattr(engine, 'skim_pending', False),
+            'skim_rebuy_line': getattr(engine, 'skim_rebuy_line', None),
+            'skim_lock_amount': getattr(engine, 'skim_lock_amount', 0.0) or 0.0,
+            'stage_idle_days': getattr(engine, 'stage_idle_days', 0) or 0,
+            'deployed_units': getattr(engine, 'deployed_units', 0) or 0,
+            'campaign_B': getattr(engine, 'B', None),
+            'campaign_S': getattr(engine, 'S', None),
+            'campaign_K': getattr(engine, 'K', None),
+            'projection': getattr(engine, 'projection', None),
             'badge_key': badge_key,
             'phase': market_phase(ticker),
             'price': (snap or {}).get('price'),
