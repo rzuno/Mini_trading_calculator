@@ -1,4 +1,5 @@
 import threading
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 import yfinance as yf
 
@@ -12,7 +13,7 @@ def _fetch_ticker_data(ticker: str) -> dict:
     live regularMarketPrice from ticker.info.
     """
     result = {'price': None, '5d_high': None, '5d_low': None,
-              '5d_closes': [], '5d_ohlc': []}
+              '5d_closes': [], '5d_ohlc': [], 'prev_close': None}
     try:
         t = yf.Ticker(ticker)
 
@@ -50,6 +51,19 @@ def _fetch_ticker_data(ticker: str) -> dict:
             result['5d_high'] = float(hist['High'].max())
             result['5d_low'] = float(hist['Low'].min())
             result['5d_closes'] = [float(c) for c in hist['Close'].tolist()]
+
+            # Vantage point: the last COMPLETED session's close (drop the
+            # in-progress bar when the latest row is today, market-local).
+            try:
+                tzoff = 9 if ticker.endswith('.KS') else -5
+                tz = timezone(timedelta(hours=tzoff))
+                today = datetime.now(tz).strftime('%Y-%m-%d')
+                comp = [float(c) for idx, c in zip(hist.index, hist['Close'])
+                        if idx.strftime('%Y-%m-%d') != today]
+                if comp:
+                    result['prev_close'] = comp[-1]
+            except Exception:
+                pass
             for idx, row in hist.iterrows():
                 result['5d_ohlc'].append({
                     'date': idx.strftime('%m/%d'),

@@ -40,28 +40,14 @@ def display_name(ticker: str) -> str:
         name = name.split(' ', 1)[0]
     return name
 
-# ── Load gear (continuous -4% ... -15% drop, 1% steps) ──────────────────────
+# ── Unified drop percent (ONE pct drives both the load and the chase) ───────
+# G1 -4% … G5 -8%. The same bait system runs the empty entry (from the
+# vantage point) and the deployed rescue (from the avg cost).
 LOAD_PCT_MIN = 4
-LOAD_PCT_MAX = 15
+LOAD_PCT_MAX = 8
 
-# Blue gradient: light (-4%) -> dark (-15%). The -4/-5/-6% entries match the
-# buy-gear colors for cross-tool consistency; the rest fill the 1% gaps.
-LOAD_PCT_COLORS = {
-    4:  '#B0C4DE',
-    5:  '#88AAC8',
-    6:  '#6690B2',
-    7:  '#5583A7',
-    8:  '#44769C',
-    9:  '#396991',
-    10: '#2E5C86',
-    11: '#28517C',
-    12: '#224773',
-    13: '#1F406B',
-    14: '#1C3A6A',
-    15: '#1A3366',
-}
-
-# Legacy gear keys (L1-L7) -> drop percent, for reading old CSV/config files.
+# Legacy gear keys (L1-L7) -> old drop percents, for reading old CSV/config
+# files; anything outside 4..8 is clamped into the unified range.
 LEGACY_LOAD_GEARS = {'L1': 4, 'L2': 5, 'L3': 6, 'L4': 8,
                      'L5': 10, 'L6': 12, 'L7': 15}
 
@@ -76,7 +62,7 @@ def normalize_load_pct(value) -> int:
     if isinstance(value, str):
         v = value.strip()
         if v in LEGACY_LOAD_GEARS:
-            return LEGACY_LOAD_GEARS[v]
+            return clamp_load_pct(LEGACY_LOAD_GEARS[v])
         try:
             value = float(v)
         except ValueError:
@@ -86,16 +72,17 @@ def normalize_load_pct(value) -> int:
     except (ValueError, TypeError):
         return 5
 
-# ── Buy gear (G1..G5: shallower -> deeper rescue baits) ─────────────────────
-BUY_GEAR_PCTS = [3, 4, 5, 6, 7]
+# ── Buy size per drop percent (G1..G5: shallower -> deeper baits) ───────────
+BUY_GEAR_PCTS = [4, 5, 6, 7, 8]
 
-# Rescue buy size as a fraction of current shares. Deeper bait buys more.
+# Rescue buy size as a fraction of current shares. Deeper bait buys more;
+# -8% buys the WHOLE position again (묻고 더블로 가 — share-count doubling).
 BUY_GEAR_INFO = {
-    3: {'label': '3% drop (1/3)', 'frac': '1/3', 'ratio': 1 / 3, 'color': '#D4E0EE'},
-    4: {'label': '4% drop (1/2)', 'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
-    5: {'label': '5% drop (2/3)', 'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
-    6: {'label': '6% drop (3/4)', 'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
-    7: {'label': '7% drop (4/5)', 'frac': '4/5', 'ratio': 4 / 5, 'color': '#5583A7'},
+    4: {'label': '4% drop (1/2)',    'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
+    5: {'label': '5% drop (2/3)',    'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
+    6: {'label': '6% drop (3/4)',    'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
+    7: {'label': '7% drop (4/5)',    'frac': '4/5', 'ratio': 4 / 5, 'color': '#5583A7'},
+    8: {'label': '8% drop (double)', 'frac': '더블', 'ratio': 1.0,   'color': '#44769C'},
 }
 BUY_GEAR_LABELS = [BUY_GEAR_INFO[p]['label'] for p in BUY_GEAR_PCTS]
 BUY_LABEL_TO_PCT = {v['label']: k for k, v in BUY_GEAR_INFO.items()}
@@ -128,10 +115,6 @@ def gear_button_fg(gear) -> str:
     return GEAR_BUTTON_FG.get(clamp_gear(gear), 'black')
 
 
-def load_pct_color(pct) -> str:
-    return LOAD_PCT_COLORS.get(clamp_load_pct(pct), '#FFFFFF')
-
-
 def clamp_gear(gear) -> int:
     try:
         gear = int(gear)
@@ -140,34 +123,13 @@ def clamp_gear(gear) -> int:
     return max(1, min(5, gear))
 
 
-def gear_for_buy_pct(pct) -> int:
-    try:
-        pct = int(pct)
-    except (TypeError, ValueError):
-        return 3
-    if pct <= AUTO_GEARS[1]['buy_pct']:
-        return 1
-    if pct >= AUTO_GEARS[5]['buy_pct']:
-        return 5
-    for gear, params in AUTO_GEARS.items():
-        if params['buy_pct'] == pct:
-            return gear
-    return 3
-
-
-def gear_for_load_pct(pct):
+def gear_for_pct(pct) -> int:
+    """Drop percent (load or chase — they are the same now) -> gear 1..5."""
     try:
         pct = int(abs(pct))
     except (TypeError, ValueError):
-        return 1
-    if pct <= AUTO_GEARS[1]['load_pct']:
-        return 1
-    if pct >= AUTO_GEARS[5]['load_pct']:
-        return 5
-    for gear, params in AUTO_GEARS.items():
-        if params['load_pct'] == pct:
-            return gear
-    return clamp_gear(round(pct - AUTO_GEARS[1]['load_pct'] + 1))
+        return 3
+    return clamp_gear(pct - AUTO_GEARS[1]['pct'] + 1)
 
 
 def gear_for_sell_pct(pct):
@@ -205,16 +167,18 @@ def gap_color(gap_pct: float) -> str:
     return '#003399'
 
 
-def load_gap_color(gap_pct: float) -> str:
-    """Color for an EMPTY stock's gap to the load trigger (kept distinct from the
-    deployed red/blue P&L colors so a watch-list of empties doesn't read as
-    losses). Purple = load sits below the live price, deeper for farther away;
-    orange when the price is already at or below the load (gap >= 0)."""
-    if gap_pct >= 0:   return '#E08000'   # orange — already at/below the bait
-    if gap_pct > -2:   return '#B084E0'   # light purple — close to a buy
-    if gap_pct > -4:   return '#9A5FD0'
-    if gap_pct > -6:   return '#7E3FBF'
-    return '#5E2CA0'                       # deep purple — far below
+def load_gap_color(gap_pct: float, trigger_pct: float = 4.0) -> str:
+    """Color for an EMPTY stock's gap = current vs the VANTAGE point (kept
+    distinct from the deployed red/blue P&L colors so a watch-list of empties
+    doesn't read as losses). The bait sits at gap = -trigger_pct: orange once
+    the price is at/below the bait, purple above it — deeper purple = farther
+    from the bait (more day left before the battle)."""
+    rem = gap_pct + abs(trigger_pct)      # distance still to fall to the bait
+    if rem <= 0:   return '#E08000'   # orange — already at/below the bait
+    if rem < 2:    return '#B084E0'   # light purple — close to a buy
+    if rem < 4:    return '#9A5FD0'
+    if rem < 6:    return '#7E3FBF'
+    return '#5E2CA0'                   # deep purple — far above the bait
 
 
 def fx_dev_color(pct: float) -> str:
@@ -233,39 +197,36 @@ def fx_dev_color(pct: float) -> str:
 
 
 # ── Auto gear (5-day-volatility-driven gear selection) ───────────────────────
-# Each gear bundles a load drop %, a buy/reload gear %, and the three sell-tier
-# percentages. In auto mode the base bundle is chosen from 5-day volatility,
-# then optional global shifts can move buy/sell one gear shallower/deeper.
+# One gear bundles the unified drop % (load AND chase) and the three sell-tier
+# percentages. The bait ladder sizes come from BUY_GEAR_INFO (…, -8% = double).
 AUTO_GEARS = {
-    1: {'load_pct': 5, 'buy_pct': 3, 'tiers': (1, 3, 5)},
-    2: {'load_pct': 6, 'buy_pct': 4, 'tiers': (2, 4, 6)},
-    3: {'load_pct': 7, 'buy_pct': 5, 'tiers': (3, 5, 7)},
-    4: {'load_pct': 8, 'buy_pct': 6, 'tiers': (4, 6, 8)},
-    5: {'load_pct': 9, 'buy_pct': 7, 'tiers': (5, 7, 9)},
+    1: {'pct': 4, 'tiers': (1, 3, 5)},
+    2: {'pct': 5, 'tiers': (2, 4, 6)},
+    3: {'pct': 6, 'tiers': (3, 5, 7)},
+    4: {'pct': 7, 'tiers': (4, 6, 8)},
+    5: {'pct': 8, 'tiers': (5, 7, 9)},
 }
 
+# The same-day re-bait after a full exit is ALWAYS gear 1 (exit fill −4%),
+# whatever the volatility gear says (exception rule 1).
+RE_BAIT_GEAR = 1
+RE_BAIT_PCT = AUTO_GEARS[RE_BAIT_GEAR]['pct']
 
-def buy_gear_detail(gear) -> str:
+
+def gear_detail(gear) -> str:
     gear = clamp_gear(gear)
-    pct = AUTO_GEARS[gear]['buy_pct']
+    pct = AUTO_GEARS[gear]['pct']
     frac = BUY_GEAR_INFO[pct]['frac']
     return f"(-{pct}%, x{frac})"
 
 
-def load_gear_detail(gear) -> str:
-    gear = clamp_gear(gear)
-    pct = AUTO_GEARS[gear]['load_pct']
-    return f"(-{pct}%)"
+def gear_menu_label(gear, deployed: bool = True) -> str:
+    return f"{gear_label(clamp_gear(gear))} {gear_detail(gear)}"
 
-
-def gear_menu_label(gear, deployed: bool) -> str:
-    detail = buy_gear_detail(gear) if deployed else load_gear_detail(gear)
-    return f"{gear_label(clamp_gear(gear))} {detail}"
-
-# 5-day volatility (%) cut points:
-# G1: V < 8, G2: 8 <= V < 11, G3: 11 <= V < 15,
-# G4: 15 <= V < 20, G5: V >= 20.
-VOL_THRESHOLDS = (8.0, 11.0, 15.0, 20.0)
+# 5-day volatility (%) cut points (upper bound INCLUSIVE):
+# G1: V <= 8, G2: 8 < V <= 12, G3: 12 < V <= 16,
+# G4: 16 < V <= 20, G5: V > 20.
+VOL_THRESHOLDS = (8.0, 12.0, 16.0, 20.0)
 
 
 def calc_volatility(high_5d, low_5d):
@@ -282,27 +243,36 @@ def select_auto_gear(volatility) -> int:
     if volatility is None:
         return 1
     for idx, threshold in enumerate(VOL_THRESHOLDS, start=1):
-        if volatility < threshold:
+        if volatility <= threshold:
             return idx
     return 5
 
 
-def auto_gear_params(volatility, buy_shift: int = 0, sell_shift: int = 0) -> dict:
-    """Gear parameter bundle (load_pct, buy_pct, tiers) for the given
-    volatility, with optional global load/buy and sell gear shifts."""
-    base = select_auto_gear(volatility)
-    buy_gear = clamp_gear(base + buy_shift)
-    load_gear = buy_gear
-    sell_gear = clamp_gear(base + sell_shift)
-    return {
-        'base_gear': base,
-        'load_gear': load_gear,
-        'buy_gear': buy_gear,
-        'sell_gear': sell_gear,
-        'load_pct': AUTO_GEARS[load_gear]['load_pct'],
-        'buy_pct': AUTO_GEARS[buy_gear]['buy_pct'],
-        'tiers': AUTO_GEARS[sell_gear]['tiers'],
-    }
+# ── Heavy-unit entry restriction (exception rule 2) ──────────────────────────
+# A stock whose ONE share already eats a big bite of a unit must not enter on
+# a shallow bait: its auto ENTRY gear is floored by share size. Once loaded it
+# follows the normal volatility gear like everyone else.
+WEIGHT_GEAR_THRESHOLDS = (1.2, 1.6, 2.0, 2.5)
+
+
+def weight_min_gear(share_price, unit_cash) -> int:
+    """Minimum entry gear from single-share chunkiness (share/unit ratio):
+    <=1.2u → G1 ok, >1.2 → G2+, >1.6 → G3+, >2.0 → G4+, >2.5 → G5 only."""
+    if not share_price or not unit_cash or unit_cash <= 0:
+        return 1
+    r = share_price / unit_cash
+    gear = 1
+    for th in WEIGHT_GEAR_THRESHOLDS:
+        if r > th:
+            gear += 1
+    return gear
+
+
+def effective_entry_gear(volatility, share_price=None, unit_cash=None) -> int:
+    """Auto ENTRY gear for an empty stock:
+    max(volatility gear, weight-based minimum gear)."""
+    return max(select_auto_gear(volatility),
+               weight_min_gear(share_price, unit_cash))
 
 
 # ── Rounding ─────────────────────────────────────────────────────────────────
@@ -399,38 +369,41 @@ def calc_buy_cascade(shares: int, avg_cost: float, buy_pct: int,
 
 
 # ── Load (empty stock entry) calculations ────────────────────────────────────
-def calc_load_price(peak_5d: float, load_pct: int) -> float:
-    return peak_5d * (1.0 - load_pct / 100.0)
+# The load hangs off the VANTAGE POINT: the previous session's close, or —
+# after a same-day full exit — the actual sell fill price (re-bait).
+def calc_load_price(vantage: float, pct: int) -> float:
+    return vantage * (1.0 - pct / 100.0)
 
 
-def calc_load_shares(peak_5d: float, load_pct: int, unit_cash: float) -> int:
+def calc_load_shares(vantage: float, pct: int, unit_cash: float) -> int:
     """Shares to buy at the load trigger. Every stock loads a full unit of cash
     (KR and US alike); when one share already costs more than a unit, the
     minimum of 1 share applies."""
-    if peak_5d <= 0 or unit_cash <= 0:
+    if vantage <= 0 or unit_cash <= 0:
         return 0
-    load_price = calc_load_price(peak_5d, load_pct)
+    load_price = calc_load_price(vantage, pct)
     if load_price <= 0:
         return 0
     return max(1, round_half_up(unit_cash / load_price))
 
 
-def calc_load_ladder(peak_5d: float, load_pct: int, buy_pct: int,
+def calc_load_ladder(vantage: float, pct: int,
                      unit_cash: float, rescues: int = 2) -> tuple:
     """Projected buy ladder for an EMPTY stock, treating the LOAD as the first
-    (initial) buy of one unit and cascading `rescues` rescue triggers from it,
-    exactly as a deployed stock would once it owns the load shares.
+    (initial) buy of one unit and cascading `rescues` rescue triggers from it
+    at the SAME pct (load = buy now), exactly as a deployed stock would once
+    it owns the load shares.
 
     Returns (ladder, load_price, load_shares) where ladder is a list of
     {'price', 'qty'} of length 1 + rescues: index 0 is the LOAD, the rest are
     the projected rescues. All-None entries when inputs are unusable."""
-    load_price  = calc_load_price(peak_5d, load_pct) if peak_5d and peak_5d > 0 else 0.0
-    load_shares = calc_load_shares(peak_5d, load_pct, unit_cash)
+    load_price  = calc_load_price(vantage, pct) if vantage and vantage > 0 else 0.0
+    load_shares = calc_load_shares(vantage, pct, unit_cash)
     if load_price <= 0 or load_shares <= 0:
         return ([{'price': None, 'qty': None} for _ in range(1 + rescues)],
                 0.0, 0)
     ladder = [{'price': load_price, 'qty': load_shares}]
-    ladder += calc_buy_cascade(load_shares, load_price, buy_pct, levels=rescues)
+    ladder += calc_buy_cascade(load_shares, load_price, pct, levels=rescues)
     return ladder, load_price, load_shares
 
 

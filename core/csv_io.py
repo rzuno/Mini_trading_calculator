@@ -26,7 +26,6 @@ DEFAULT_CONFIG = {
     "peak_lookback_days": 5,
     "fx_switch_level": 0,
     "market_provider": "toss",
-    "global_gear_rule_enabled": False,
 }
 
 # Every stock loads a full unit now, so the old Major/Minor tier no longer

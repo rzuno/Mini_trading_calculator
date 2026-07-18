@@ -4,11 +4,13 @@ The internal per-stock dict is intentionally identical to what the GUI already
 consumes from ``core.data_feed.fetch_all`` so providers are drop-in:
 
     {
-        'price':     float | None,   # live/last price
-        '5d_high':   float | None,   # high over the 5 completed sessions
-        '5d_low':    float | None,   # low  over the 5 completed sessions
-        '5d_closes': list[float],    # closes of the 5 completed sessions
-        '5d_ohlc':   list[dict],     # [{date, open, high, low, close}, ...]
+        'price':      float | None,   # live/last price
+        '5d_high':    float | None,   # high over the 5 recent sessions
+        '5d_low':     float | None,   # low  over the 5 recent sessions
+        '5d_closes':  list[float],    # closes of the 5 recent sessions
+        '5d_ohlc':    list[dict],     # [{date, open, high, low, close}, ...]
+        'prev_close': float | None,   # last COMPLETED session close (the
+                                      # vantage point the load hangs off)
     }
 """
 
@@ -17,7 +19,7 @@ from typing import Optional
 
 def empty_stock_data() -> dict:
     return {'price': None, '5d_high': None, '5d_low': None,
-            '5d_closes': [], '5d_ohlc': []}
+            '5d_closes': [], '5d_ohlc': [], 'prev_close': None}
 
 
 class MarketDataProvider:

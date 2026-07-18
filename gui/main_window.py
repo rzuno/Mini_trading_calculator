@@ -1,23 +1,14 @@
-import os
-import re
 import tkinter as tk
-from tkinter import ttk
 import threading
 from datetime import datetime
-
-# Order execution mode. LIVE = the graph Order/Cancel buttons place/cancel real
-# Toss orders (behind a confirmation dialog). Set to 'DRY_RUN' to disable.
-ORDER_MODE = 'LIVE'
 
 from core.calc import stock_sort_key, calc_volatility, fx_dev_color
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from providers import get_provider
 from gui.stock_row import StockRow
-from gui.candle_chart import CandleChartWindow
 from gui.autopilot_ctrl import AutopilotController
 
 # ── Fonts (1.3× scale for QHD) ──────────────────────────────────────────────
-_F_SECTION = ('Segoe UI', 16, 'bold')
 _F_SEC_INFO = ('Segoe UI', 13)
 _F_HDR     = ('Segoe UI', 13)
 _F_HDR_B   = ('Segoe UI', 13, 'bold')
@@ -42,7 +33,6 @@ class App:
         self._place_window()
 
         self.config    = load_config()
-        self.config.setdefault('global_gear_rule_enabled', False)
         self.positions = load_positions()
 
         # Market-data provider. Toss is the default; fall back to Yahoo if Toss
@@ -77,8 +67,6 @@ class App:
         self._fx_avg_3m      = None
         self._toss_acct_seq  = None   # cached Toss accountSeq for order/account reads
         self._full_army_krw  = 0.0     # deployed + cash + reserved buy orders
-        self._global_buy_gear_shift = 0
-        self._global_sell_gear_shift = 0
         # How many dollar-switch steps have been done: + = sold USD (FX high),
         # - = bought USD (FX low). Range -3..+3, tracked manually on the panel.
         self.fx_switch_level = int(self.config.get('fx_switch_level', 0))
@@ -99,11 +87,8 @@ class App:
         self.status_var       = tk.StringVar(value='Initializing...')
         self.deploy_info_var  = tk.StringVar(value='')
         self.banner_var       = tk.StringVar(value='')   # cash / army summary
-        self.gear_status_var  = tk.StringVar(value='Gear: normal')
-        self.global_rule_enabled_var = tk.BooleanVar(
-            value=bool(self.config.get('global_gear_rule_enabled', False)))
 
-        # Daily 443 autopilot (always OFF at launch; armed from the graph).
+        # Autopilot (always OFF at launch; armed from the card button).
         self.deployed_rows = []
         self.empty_rows    = []
         self.autopilot = AutopilotController(self)
@@ -409,13 +394,6 @@ class App:
         info.grid(row=1, column=0, columnspan=span, sticky='ew', pady=(4, 0))
         tk.Label(info, textvariable=self.banner_var, font=_F_SEC_INFO,
                  fg='#333', anchor='w').pack(side='left', padx=(12, 2))
-        self._gear_rule_check = tk.Checkbutton(
-            info, variable=self.global_rule_enabled_var,
-            textvariable=self.gear_status_var,
-            command=self._on_global_rule_toggle,
-            font=_F_SM, fg='#4B0082', disabledforeground='#8A6AAE',
-            anchor='w', takefocus=0)
-        self._gear_rule_check.pack(side='left', padx=(12, 2))
         tk.Label(info, textvariable=self.status_var, font=_F_SM, anchor='e'
                  ).pack(side='right', padx=(6, 2))
         tk.Label(info, textvariable=self.last_refresh_var, font=_F_SM
@@ -501,7 +479,6 @@ class App:
         return StockRow(
             parent=box, row_num=0, pos=pos, deployed=deployed,
             get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
-            on_graph=self._on_graph,
             on_compute=self._on_row_compute,
             editable=not self._auto,
             on_autopilot=self._open_autopilot)
@@ -532,78 +509,6 @@ class App:
             r.ticker, self._volatility.get(r.ticker)))
         self._grid_all_cards()
 
-    # ── Deployed section ─────────────────────────────────────────────────────
-
-    def _build_deployed(self, deployed):
-        sec = tk.Frame(self.content_frame)
-        sec.pack(fill='x', pady=(0, 6))
-
-        hdr = tk.Frame(sec)
-        hdr.pack(fill='x', pady=(4, 2))
-        tk.Label(hdr, text='DEPLOYED STOCKS',
-                 font=_F_SECTION).pack(side='left', padx=4)
-        self._deploy_info_lbl = tk.Label(hdr, textvariable=self.deploy_info_var,
-                                         font=_F_SEC_INFO, fg='#555')
-        self._deploy_info_lbl.pack(side='left', padx=(12, 0))
-
-        box = tk.Frame(sec, bd=1, relief='sunken', padx=4, pady=4)
-        box.pack(fill='x', padx=2)
-
-        if not deployed:
-            tk.Label(box, text='(no deployed positions \u2014 fill Avg Cost & Shares below, then Save)',
-                     fg='gray', font=_F_SM, pady=10).pack()
-            return
-
-        box.grid_columnconfigure(0, weight=1, uniform='dcol')
-        box.grid_columnconfigure(1, weight=1, uniform='dcol')
-        for i, pos in enumerate(deployed):
-            ccy = 'KRW' if pos['ticker'].endswith('.KS') else 'USD'
-            row = StockRow(
-                parent=box, row_num=i + 1, pos=pos, deployed=True,
-                get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
-                on_graph=self._on_graph,
-                on_compute=self._on_row_compute,
-                editable=not self._auto)
-            r, c = divmod(i, 2)
-            row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=2)
-            self.deployed_rows.append(row)
-
-    # ── Empty section ────────────────────────────────────────────────────────
-
-    # ── Footer ───────────────────────────────────────────────────────────────
-
-    # ── Graph ────────────────────────────────────────────────────────────────
-
-    def _on_graph(self, ticker):
-        """Open the chart popup using the row's already-computed ladder, so the
-        empty (pseudo) and deployed charts draw through one unified path."""
-        ohlc = self._ohlc_data.get(ticker, [])
-        ccy  = 'KRW' if ticker.endswith('.KS') else 'USD'
-        current_price = self._current_prices.get(ticker)
-
-        ordered = self._toss_open_order_lines(ticker)
-        for row in self.deployed_rows + self.empty_rows:
-            if row.ticker == ticker:
-                cd = row.chart_data()
-                # Order/Cancel only in Toss(auto) mode and when ORDER_MODE=LIVE.
-                actions = None
-                if self._auto and ORDER_MODE == 'LIVE':
-                    actions = self._build_order_actions(row, ordered)
-                CandleChartWindow(
-                    self.root, ticker, ohlc, ccy,
-                    anchor_label=cd['anchor_label'],
-                    anchor_price=cd['anchor_price'],
-                    buy_lines=cd['buy_lines'],
-                    sell_lines=cd['sell_lines'],
-                    current_price=current_price,
-                    ordered_lines=ordered,
-                    order_actions=actions)
-                return
-
-        # Fallback (ticker has no row yet)
-        CandleChartWindow(self.root, ticker, ohlc, ccy,
-                          current_price=current_price, ordered_lines=ordered)
-
     # ── Autopilot window (big card button) ────────────────────────────────────
 
     def _open_autopilot(self, ticker):
@@ -627,56 +532,10 @@ class App:
         if not ok:
             self.status_var.set(f'Autopilot: {msg}')
             return
-        from gui.daily443_chart import Daily443ChartWindow
+        from gui.autopilot_window import AutopilotWindow
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
-        self._ap_windows[ticker] = Daily443ChartWindow(
+        self._ap_windows[ticker] = AutopilotWindow(
             self.root, ticker, ccy, self.autopilot.graph_context(ticker))
-
-    # ── Live order placement from the graph ─────────────────────────────────────
-
-    def _build_order_actions(self, row, ordered):
-        """Build the graph's order context. Buy and Sell can't rest at once
-        (opposite-pending), so the buttons are gated by which side is already
-        live: ordered_side in {'BUY','SELL',None}."""
-        from core.calc import fmt_order_price
-
-        def pend(side):
-            out = []
-            for it in row.order_intents(side):
-                affordable = True
-                note = ''
-                if side == 'BUY' and not self._buy_intent_affordable(it):
-                    affordable = False
-                    note = 'not enough reserved army'
-                out.append({
-                    'side': it['side'],
-                    'label': it['label'],
-                    'price': fmt_order_price(it['ticker'], it['price']),
-                    'qty': it['qty'],
-                    'triggered': it['triggered'],
-                    'selectable': bool(it['triggered'] and affordable),
-                    'note': note,
-                })
-            return out
-
-        sides = {o.get('side') for o in ordered}
-        ordered_side = 'BUY' if 'BUY' in sides else ('SELL' if 'SELL' in sides else None)
-        pbuy = pend('BUY')
-        psell = pend('SELL') if row.deployed else []
-        return {
-            'deployed':     row.deployed,        # sell button only for deployed
-            'ordered_side': ordered_side,
-            'pending_buy':  pbuy,
-            'pending_sell': psell,
-            # Harpoon: a side can only fire when one of its baits is bitten.
-            'buy_trig':     any(it['triggered'] for it in pbuy),
-            'sell_trig':    any(it['triggered'] for it in psell),
-            'place_buy':    lambda sel, r=row: self._graph_place(r, 'BUY', sel),
-            'place_sell':   lambda sel, r=row: self._graph_place(r, 'SELL', sel),
-            'cancel':       lambda t=row.ticker: self._graph_cancel(t),
-            'refresh':      lambda t=row.ticker: self._toss_open_order_lines(t),
-            'set_state':    lambda side, r=row: r.set_order_state(side),
-        }
 
     def _account_seq(self, prov):
         if self._toss_acct_seq is None:
@@ -685,89 +544,6 @@ class App:
                 return None
             self._toss_acct_seq = accts[0]['accountSeq']
         return self._toss_acct_seq
-
-    def _graph_place(self, row, side, which=None):
-        """Place one side as real Toss LIMIT/DAY orders. `which` (BUY only) is a
-        list of indices selecting which ladder lines to send. Returns
-        (ok, message); per-order errors are reported."""
-        from core.calc import fmt_order_price, fmt_price
-        prov = self._toss_provider()
-        if prov is None:
-            return False, 'Toss unavailable'
-        try:
-            seq = self._account_seq(prov)
-        except Exception as e:
-            return False, f'Account error: {e}'
-        if not seq:
-            return False, 'No Toss account'
-
-        intents = list(row.order_intents(side))
-        if which is not None:
-            intents = [intents[i] for i in which if 0 <= i < len(intents)]
-        if not intents:
-            return False, f'No {side} lines'
-
-        if side == 'BUY':
-            needed = {}
-            for it in intents:
-                ccy = it.get('currency')
-                needed[ccy] = needed.get(ccy, 0.0) + self._buy_intent_cost(it)
-            for ccy, amount in needed.items():
-                available = self._buy_cash_available(ccy)
-                if available + 1e-9 < amount:
-                    return (
-                        False,
-                        f"Not enough reserved army ({ccy}: "
-                        f"{fmt_price(available, ccy)} / {fmt_price(amount, ccy)})")
-
-        ok_n, errs = 0, []
-        ts = datetime.now().strftime('%H%M%S')
-        for it in intents:
-            price = fmt_order_price(it['ticker'], it['price'])
-            # clientOrderId allows only [A-Za-z0-9_-]; sell labels ("+6%") have
-            # '+'/'%', so sanitize. Append HHMMSS so a cancel-then-reorder within
-            # the 10-min idempotency window places fresh instead of returning the
-            # stale (cancelled) order.
-            base = re.sub(r'[^A-Za-z0-9_-]', '',
-                          f"g{it['ticker']}{it['side']}{it['label']}")
-            coid = f"{base[:28]}{ts}"
-            try:
-                status, body = prov.place_limit_order(
-                    it['ticker'], it['side'], price, it['qty'], seq,
-                    client_order_id=coid)
-            except Exception as e:
-                errs.append(f"{it['label']}:{type(e).__name__}")
-                continue
-            if status == 200 and (body.get('result') or {}).get('orderId'):
-                ok_n += 1
-            else:
-                code = (body.get('error') or {}).get('code') or status
-                errs.append(f"{it['label']}:{code}")
-
-        msg = f"Placed {ok_n}/{len(intents)}"
-        if errs:
-            msg += "  (" + "; ".join(errs[:4]) + ")"
-        self.status_var.set(msg)
-        return ok_n > 0, msg
-
-    def _graph_cancel(self, ticker):
-        """Cancel every live Toss order for a ticker. Returns (ok, message)."""
-        prov = self._toss_provider()
-        if prov is None:
-            return False, 'Toss unavailable'
-        try:
-            seq = self._account_seq(prov)
-            orders = prov.get_open_orders(seq, ticker)
-            n = 0
-            for o in orders:
-                st, _ = prov.cancel_order(o['orderId'], seq)
-                if st == 200:
-                    n += 1
-            msg = f"Cancelled {n}/{len(orders)} for {ticker}"
-            self.status_var.set(msg)
-            return True, msg
-        except Exception as e:
-            return False, f'Cancel error: {e}'
 
     def _toss_provider(self):
         """A Toss provider for account/order reads (reuses the active provider
@@ -779,37 +555,6 @@ class App:
             return TossMarketProvider.from_env()
         except Exception:
             return None
-
-    def _toss_open_order_lines(self, ticker):
-        """Live working orders for a ticker as chart-ready dicts
-        {side, price, qty, status}. Empty list if Toss is unavailable."""
-        prov = self._toss_provider()
-        if prov is None:
-            return []
-        try:
-            if self._toss_acct_seq is None:
-                accts = prov.get_accounts()
-                if not accts:
-                    return []
-                self._toss_acct_seq = accts[0]['accountSeq']
-            orders = prov.get_open_orders(self._toss_acct_seq, ticker)
-        except Exception:
-            return []
-        out = []
-        for o in orders:
-            try:
-                price = float(o.get('price')) if o.get('price') not in (None, '') else None
-            except (TypeError, ValueError):
-                price = None
-            if price is None:
-                continue
-            try:
-                qty = int(float(o.get('quantity') or 0))
-            except (TypeError, ValueError):
-                qty = 0
-            out.append({'side': o.get('side'), 'price': price, 'qty': qty,
-                        'status': o.get('status')})
-        return out
 
     def _order_ticker(self, order):
         sym = order.get('symbol') or ''
@@ -857,28 +602,26 @@ class App:
                 total += amount * fx
         return total
 
-    def _buy_cash_available(self, currency: str) -> float:
-        acct = self._last_account or {}
-        key = 'cash_krw' if currency == 'KRW' else 'cash_usd'
-        try:
-            return float(acct.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _buy_intent_cost(self, intent) -> float:
-        try:
-            return float(intent.get('price') or 0) * int(intent.get('qty') or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _buy_intent_affordable(self, intent) -> bool:
-        return (self._buy_cash_available(intent.get('currency'))
-                + 1e-9 >= self._buy_intent_cost(intent))
-
     def _on_row_compute(self):
-        """Called when any deployed row recomputes — update army% across all."""
+        """Called when any row recomputes (gear change, tier toggle, typed
+        input) — update army% and hand the fresh line config to the
+        autopilot, so the bot always follows what the cards show."""
         if self._fx_rate:
             self._update_army(self._fx_rate)
+        self._push_card_configs()
+
+    def _push_card_configs(self):
+        for row in self.deployed_rows + self.empty_rows:
+            self.autopilot.set_card_config(row.ticker, row.line_config())
+
+    def _vantage_for(self, ticker, d):
+        """(vantage, source) for a card: the autopilot's same-day sell fill
+        (재입질 — pins the load to G1 -4%) when one exists, otherwise the
+        previous completed session's close."""
+        sell = self.autopilot.sell_anchor(ticker)
+        if sell:
+            return sell, 'sell'
+        return d.get('prev_close'), 'close'
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 
@@ -1023,17 +766,17 @@ class App:
         if fx_rate:
             self._update_unit_usd()
 
-        # Update every row through the one unified signature.
+        # Update every row through the one unified signature. The vantage
+        # point (prev close, or today's sell fill from the autopilot) anchors
+        # the empty cards' load lines.
         for row in self.deployed_rows + self.empty_rows:
             d = data.get(row.ticker, {})
+            vant, vsrc = self._vantage_for(row.ticker, d)
             row.update_live(
                 d.get('price'),
-                d.get('5d_high'),
-                d.get('5d_closes', []),
+                vantage=vant,
+                vantage_src=vsrc,
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
-
-        # Apply global auto-gear shifts before cards compute their ladders.
-        self._update_global_gear_rules()
 
         for row in self.deployed_rows + self.empty_rows:
             row.compute()
@@ -1047,8 +790,10 @@ class App:
         self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)
 
-        # Cards were rebuilt — re-apply 443 badges and refresh cached units.
+        # Cards were rebuilt — re-apply autopilot badges, refresh cached
+        # units, and hand the fresh card configs to the watcher.
         self.autopilot.on_rows_rebuilt()
+        self._push_card_configs()
 
         if not quiet:
             self.last_refresh_var.set(
@@ -1127,70 +872,12 @@ class App:
             'unit_krw': unit_krw,
         }
 
-    def _set_global_rule_ui(self, active: bool):
-        if hasattr(self, '_gear_rule_check'):
-            self._gear_rule_check.config(state='normal' if active else 'disabled')
-
-    def _on_global_rule_toggle(self):
-        self.config['global_gear_rule_enabled'] = bool(
-            self.global_rule_enabled_var.get())
-        self._update_global_gear_rules()
-        for row in self.deployed_rows + self.empty_rows:
-            row.compute()
-        self._reorder_cards()
-
-    def _update_global_gear_rules(self):
-        if not self._auto or self._last_account is None:
-            self._global_buy_gear_shift = 0
-            self._global_sell_gear_shift = 0
-            self.gear_status_var.set('Gear: normal')
-            self._set_global_rule_ui(False)
-            for row in self.deployed_rows + self.empty_rows:
-                row.set_global_gear_shifts(0, 0)
-            return
-
-        snap = self._army_snapshot()
-        total = snap['total_krw']
-        rule_buy_shift = 0
-        rule_sell_shift = 0
-        note = ''
-
-        if total > 0:
-            deployed_pct = snap['deployed_krw'] / total * 100
-            reserve_pct = snap['reserve_krw'] / total * 100
-            if reserve_pct < 20:
-                rule_buy_shift = 1
-                rule_sell_shift = -1
-                note = 'load/buy +1 / sell -1 (reserve<20%)'
-            elif deployed_pct < 20:
-                rule_buy_shift = -1
-                note = 'load/buy -1 (deployed<20%)'
-
-        active_rule = bool(note)
-        self._set_global_rule_ui(active_rule)
-        if active_rule:
-            self.gear_status_var.set('Gear: ' + note)
-        else:
-            self.gear_status_var.set('Gear: normal')
-
-        enabled = active_rule and self.global_rule_enabled_var.get()
-        buy_shift = rule_buy_shift if enabled else 0
-        sell_shift = rule_sell_shift if enabled else 0
-
-        self._global_buy_gear_shift = buy_shift
-        self._global_sell_gear_shift = sell_shift
-
-        for row in self.deployed_rows + self.empty_rows:
-            row.set_global_gear_shifts(buy_shift, sell_shift)
-
     def _update_banner(self):
         """Top-line cash + army summary. In Toss(auto) mode it also computes the
         total unit count from deployed + cash + reserved buy orders."""
         if not self._auto:
             self._full_army_krw = 0.0
             self.banner_var.set('')
-            self.gear_status_var.set('Gear: normal')
-            self._set_global_rule_ui(False)
             return
         snap = self._army_snapshot()
         deployed_krw = snap['deployed_krw']
@@ -1229,8 +916,6 @@ class App:
                 'peak_lookback_days': self.config.get('peak_lookback_days', 5),
                 'fx_switch_level':    self.fx_switch_level,
                 'market_provider':    self.config.get('market_provider', 'yahoo'),
-                'global_gear_rule_enabled': bool(
-                    self.global_rule_enabled_var.get()),
             }
             save_config(cfg)
             self.config = cfg

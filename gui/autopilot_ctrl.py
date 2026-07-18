@@ -1,29 +1,30 @@
-"""Daily V-Commandos autopilot controller — the bridge between the pure
-adaptive-gear watcher engine (core/autopilot.py) and the running app.
+"""Autopilot controller — the bridge between the pure line-watcher engine
+(core/autopilot.py) and the running app.
 
 One background thread polls every watched stock every POLL_SECONDS (10 s),
-touching ONLY that ticker (§30.3): price, holdings(symbol), open
-orders(symbol), buying power. The main panel stays refresh-button-driven;
-only the Autopilot window (and the card's Autopilot button color) follow
-ticks.
+touching ONLY that ticker: price, holdings(symbol), open orders(symbol),
+buying power. The main panel stays refresh-button-driven; only the Autopilot
+window (and the card's button color) follow ticks.
 
-Modes per stock (§30.8):
-    WATCH — bare watching: lines + ticks + fill detection, NO orders at all.
-            This is what opening the Daily window arms; closing the window
-            in WATCH mode stops the polling again.
-    DRY   — real prices, virtual orders/fills/cash (PaperBroker).
+ONE strategy. The engine follows the lines the CARD computes: every card
+pushes its gear config (pct + tiers) into the controller on every compute,
+so whatever the commander sees on the card IS what the bot watches.
+
+Modes per stock:
+    WATCH — lines + ticks + fill detection, NO orders from the bot. The
+            crossed line is exposed as a trigger; the window's Buy/Sell
+            buttons can fire it manually (through this controller).
     LIVE  — real Toss LIMIT/DAY orders, fired only when a line is touched.
-            Allowed only while the market is in REGULAR hours (§30.8);
-            when the session ends, LIVE drops back to WATCH automatically.
-
-There is no cap on how many stocks can be watched (§30.9) — the user picks
-by self-rule; a watcher that never triggers costs only its polling.
+            Allowed only while the market is in REGULAR hours; when the
+            session ends, LIVE drops back to WATCH automatically.
 
 Error policy: a failed poll skips the whole cycle and retries; ~6 straight
 failures announce a data problem once. insufficient-buying-power announces
 once and backs off 5 min (the SELL stays managed — no hard stop);
-order-hours-closed backs off 5 min; opposite-pending (a foreign order
-blocks our side) retries next cycle.
+order-hours-closed backs off 5 min; opposite-pending retries next cycle.
+
+Engine state (vantage anchor, 재입질 pin, tier progress, fills) persists in
+data/autopilot_state.json so a restart re-arms exactly where it left off.
 """
 
 import os
@@ -36,27 +37,21 @@ from datetime import datetime, date, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-from core.autopilot import Daily443Engine, POLL_SECONDS
-from core.tazza import TazzaEngine
+from core.autopilot import WatcherEngine, POLL_SECONDS
 from core.calc import fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
-
-# Strategy per stock: 타짜 (묻고 더블로 가) is the preferred default; the
-# verified adaptive-gear watcher stays selectable in the Autopilot window.
-STRATEGIES = ('TAZZA', 'ADAPTIVE')
-DEFAULT_STRATEGY = 'TAZZA'
-_TAZZA_STORE = os.path.join('data', 'tazza_campaigns.json')
+_STATE_STORE = os.path.join('data', 'autopilot_state.json')
 
 _BACKOFF_HOURS_CLOSED = 300     # seconds
 _BACKOFF_INSUFFICIENT = 300     # broker refused the buy: army is out
 _BACKOFF_OTHER = 60
-_TICKS_KEPT = 3600              # ~10h of 10s ticks for the daily chart
+_TICKS_KEPT = 3600              # ~10h of 10s ticks for the live chart
 _FAIL_ANNOUNCE = 6              # consecutive bad polls (~60s) → one warning
 
 
-# ── Market sessions (§30.8) ───────────────────────────────────────────────────
+# ── Market sessions ───────────────────────────────────────────────────────────
 
 def _us_dst(d: date) -> bool:
     """US DST: second Sunday of March → first Sunday of November."""
@@ -90,52 +85,6 @@ def market_phase(ticker: str, now_utc=None) -> str:
     return 'CLOSED'
 
 
-class PaperBroker:
-    """Virtual per-ticker account for DRY RUN: real prices, simulated orders.
-    A resting order fills fully the moment the live price crosses its line."""
-
-    def __init__(self, shares=0, avg=0.0, cash=None):
-        self.shares = int(shares or 0)
-        self.avg = float(avg or 0.0)
-        self.cash = cash          # None = unknown (reserve gate disabled)
-        self.orders = {}
-        self._next = 1
-
-    def on_price(self, price):
-        if price is None:
-            return
-        for oid, o in list(self.orders.items()):
-            if o['side'] == 'BUY' and price <= o['price']:
-                new = self.shares + o['qty']
-                self.avg = ((self.avg * self.shares + o['price'] * o['qty'])
-                            / new) if new else 0.0
-                self.shares = new
-                if self.cash is not None:
-                    self.cash -= o['price'] * o['qty']
-                del self.orders[oid]
-            elif o['side'] == 'SELL' and price >= o['price']:
-                self.shares = max(0, self.shares - o['qty'])
-                if self.shares == 0:
-                    self.avg = 0.0
-                if self.cash is not None:
-                    self.cash += o['price'] * o['qty']
-                del self.orders[oid]
-
-    def place(self, side, price, qty):
-        oid = f'paper{self._next}'
-        self._next += 1
-        self.orders[oid] = {'side': side, 'price': price, 'qty': int(qty)}
-        return oid
-
-    def cancel(self, oid):
-        self.orders.pop(oid, None)
-
-    def open_orders(self):
-        return [{'id': oid, 'side': o['side'], 'price': o['price'],
-                 'qty_open': o['qty'], 'filled': 0, 'mine': True}
-                for oid, o in self.orders.items()]
-
-
 class AutopilotController:
     def __init__(self, app):
         self.app = app
@@ -150,29 +99,29 @@ class AutopilotController:
             os.makedirs('logs', exist_ok=True)
         except OSError:
             pass
-        self._tazza_store = self._load_tazza_store()
+        self._store = self._load_store()
 
-    # ── TAZZA campaign persistence (manual §73: restore across restarts) ─────
+    # ── Engine-state persistence (restore across restarts) ───────────────────
 
-    def _load_tazza_store(self):
+    def _load_store(self):
         try:
-            with open(_TAZZA_STORE, encoding='utf-8') as f:
+            with open(_STATE_STORE, encoding='utf-8') as f:
                 return json.load(f)
         except (OSError, ValueError):
             return {}
 
-    def _save_tazza(self, ticker, engine):
-        self._tazza_store[ticker] = engine.to_dict()
+    def _save_state(self, ticker, engine):
+        self._store[ticker] = engine.to_dict()
         try:
             os.makedirs('data', exist_ok=True)
-            tmp = _TAZZA_STORE + '.tmp'
+            tmp = _STATE_STORE + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(self._tazza_store, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, _TAZZA_STORE)
+                json.dump(self._store, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, _STATE_STORE)
         except OSError as e:
-            self._log(ticker, f'tazza campaign save failed: {e}')
+            self._log(ticker, f'state save failed: {e}')
 
-    # ── Logging (§25) ─────────────────────────────────────────────────────────
+    # ── Logging ───────────────────────────────────────────────────────────────
 
     def _log(self, ticker, msg):
         line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {ticker}  {msg}"
@@ -187,31 +136,27 @@ class AutopilotController:
     def refresh_units(self):
         self._units['KRW'] = self.app._get_unit_cash('KRW')
         self._units['USD'] = self.app._get_unit_cash('USD')
-        # Total army in units (auto N in Toss mode) — the deployment-ratio
-        # denominator for the adaptive gears.
-        self._units['army'] = self.app._get_total_units()
 
     def watch(self, ticker):
         """Start (or keep) watching a stock — bare WATCH mode, no orders.
-        Called when the Daily 443 window opens. No stock-count limit (§30.9)."""
+        Called when the Autopilot window opens. No stock-count limit."""
         if not self.app._auto:
             return False, 'Switch to Toss (auto) mode first.'
         with self._lock:
             if ticker in self._slots:
                 return True, 'already watching'
             self._slots[ticker] = {
-                'engine': None, 'mode': 'WATCH', 'paper': None,
-                'strategy': DEFAULT_STRATEGY,
+                'engine': None, 'mode': 'WATCH', 'card': None,
                 'backoff_until': 0.0,
                 'prev_close': None, 'prev_close_date': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
                        'status': 'arming…', 'lines': {}, 'mode': 'WATCH',
-                       'strategy': DEFAULT_STRATEGY,
                        'price': None, 'phase': market_phase(ticker)},
             }
         self.refresh_units()
+        self._pull_card_config(ticker)      # UI thread: read the card now
         self._log(ticker, 'WATCH started')
         self._ensure_thread()
         self._wake.set()
@@ -227,11 +172,11 @@ class AutopilotController:
         self._notify(ticker, None)
 
     def set_mode(self, ticker, mode):
-        """WATCH ↔ DRY ↔ LIVE. LIVE only during regular market hours."""
+        """WATCH ↔ LIVE. LIVE only during regular market hours."""
         slot = self._slots.get(ticker)
         if not slot:
             return False, 'not watching'
-        if mode not in ('WATCH', 'DRY', 'LIVE'):
+        if mode not in ('WATCH', 'LIVE'):
             return False, f'unknown mode {mode}'
         if mode == 'LIVE':
             ph = market_phase(ticker)
@@ -240,12 +185,6 @@ class AutopilotController:
                                f'regular hours')
         with self._lock:
             slot['mode'] = mode
-            slot['paper'] = None          # DRY re-seeds from reality
-            if slot['strategy'] == 'TAZZA':
-                # The tazza ledger must never mix paper and real fills:
-                # re-arm the engine on the new mode's reality (LIVE/WATCH
-                # restore the saved campaign; DRY starts a scratch one).
-                slot['engine'] = None
         self._log(ticker, f'MODE → {mode}')
         self._wake.set()
         return True, mode
@@ -254,28 +193,6 @@ class AutopilotController:
         slot = self._slots.get(ticker)
         return slot['mode'] if slot else None
 
-    def set_strategy(self, ticker, strategy):
-        """타짜 ↔ adaptive gears. Re-arms the engine; the position and any
-        resting orders are untouched (the new engine adopts them)."""
-        slot = self._slots.get(ticker)
-        if not slot:
-            return False, 'not watching'
-        if strategy not in STRATEGIES:
-            return False, f'unknown strategy {strategy}'
-        with self._lock:
-            if slot['strategy'] == strategy:
-                return True, strategy
-            slot['strategy'] = strategy
-            slot['engine'] = None
-            slot['paper'] = None
-        self._log(ticker, f'STRATEGY → {strategy}')
-        self._wake.set()
-        return True, strategy
-
-    def strategy_of(self, ticker):
-        slot = self._slots.get(ticker)
-        return slot['strategy'] if slot else None
-
     def is_enabled(self, ticker) -> bool:
         return ticker in self._slots
 
@@ -283,7 +200,88 @@ class AutopilotController:
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
 
-    # ── Panel subscriptions (Daily 443 windows) ───────────────────────────────
+    # ── Card config: the card IS the strategy (UI thread) ────────────────────
+
+    def set_card_config(self, ticker, cfg):
+        """The card pushes {'gear','pct','tier_pcts','tier_actives'} on every
+        compute. The poll thread reads it under the lock."""
+        slot = self._slots.get(ticker)
+        if not slot or not cfg:
+            return
+        with self._lock:
+            slot['card'] = dict(cfg)
+
+    def _pull_card_config(self, ticker):
+        row = self._find_row(ticker)
+        if row is not None:
+            try:
+                self.set_card_config(ticker, row.line_config())
+            except Exception:
+                pass
+
+    def sell_anchor(self, ticker):
+        """Today's sell-fill vantage (재입질) if the engine holds one and the
+        stock is empty — the card uses it to pin its load to G1 -4%."""
+        slot = self._slots.get(ticker)
+        e = slot.get('engine') if slot else None
+        if (e is not None and getattr(e, 'anchor_source', '') == 'sell'
+                and getattr(e, 'state', '') == 'EMPTY'):
+            return getattr(e, 'anchor', None)
+        return None
+
+    # ── Manual fire / cancel (UI thread, from the Autopilot window) ──────────
+
+    def manual_fire(self, ticker, side):
+        """Fire the currently-crossed line manually (WATCH mode). Sends the
+        exact same order the bot would send in LIVE."""
+        slot = self._slots.get(ticker)
+        if not slot:
+            return False, 'not watching'
+        if slot['mode'] == 'LIVE':
+            return False, 'LIVE mode fires by itself'
+        with self._lock:
+            trig = (slot['ui'].get('trigger') or {}).get(side)
+            engine = slot['engine']
+        if not trig:
+            return False, f'no {side} line crossed'
+        prov = self.app._toss_provider()
+        if prov is None:
+            return False, 'Toss unavailable'
+        try:
+            seq = self.app._account_seq(prov)
+        except Exception as e:
+            return False, f'account error: {e}'
+        if not seq:
+            return False, 'no Toss account'
+        ok, msg = self._place_real(ticker, slot, prov, seq,
+                                   side, trig['price'], trig['qty'],
+                                   trig.get('label', side) + ' (manual)')
+        if ok and engine is not None:
+            engine.note_manual_order(side, trig['price'], trig['qty'],
+                                     tiers=trig.get('tiers'))
+        self._wake.set()
+        return ok, msg
+
+    def cancel_all(self, ticker):
+        """Cancel every live Toss order for this ticker (ours or not)."""
+        prov = self.app._toss_provider()
+        if prov is None:
+            return False, 'Toss unavailable'
+        try:
+            seq = self.app._account_seq(prov)
+            orders = prov.get_open_orders(seq, ticker) or []
+            n = 0
+            for o in orders:
+                st, _ = prov.cancel_order(o['orderId'], seq)
+                if st == 200:
+                    n += 1
+            self._log(ticker, f'manual cancel: {n}/{len(orders)} orders')
+            self._wake.set()
+            return True, f'cancelled {n}/{len(orders)}'
+        except Exception as e:
+            return False, f'cancel error: {e}'
+
+    # ── Panel subscriptions (Autopilot windows) ───────────────────────────────
 
     def subscribe(self, ticker, fn):
         self._listeners.setdefault(ticker, []).append(fn)
@@ -302,19 +300,20 @@ class AutopilotController:
                 self.unsubscribe(ticker, fn)
 
     def graph_context(self, ticker):
-        """Callables for the Daily 443 window."""
+        """Callables for the Autopilot window."""
         return {
             'ticker': ticker,
             'is_enabled': lambda: self.is_enabled(ticker),
             'ui_state': lambda: self.ui_state(ticker),
             'mode_of': lambda: self.mode_of(ticker),
             'set_mode': lambda m: self.set_mode(ticker, m),
-            'strategy_of': lambda: self.strategy_of(ticker),
-            'set_strategy': lambda s: self.set_strategy(ticker, s),
             'disable': lambda: self.disable(ticker),
             'market_phase': lambda: market_phase(ticker),
             'subscribe': lambda fn: self.subscribe(ticker, fn),
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
+            'manual_fire': lambda side: self.manual_fire(ticker, side),
+            'cancel_all': lambda: self.cancel_all(ticker),
+            'ohlc': lambda: list(self.app._ohlc_data.get(ticker, [])),
         }
 
     # ── Card button / badge ───────────────────────────────────────────────────
@@ -331,10 +330,12 @@ class AutopilotController:
             row.set_autopilot(badge_key)
 
     def on_rows_rebuilt(self):
-        """Cards are recreated on every refresh — re-apply statuses + units."""
+        """Cards are recreated on every refresh — re-apply statuses, units and
+        card configs."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
             self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'))
+            self._pull_card_config(ticker)
 
     # ── Poll thread ───────────────────────────────────────────────────────────
 
@@ -470,81 +471,83 @@ class AutopilotController:
             slot['mode'] = 'WATCH'
             self._log(ticker, 'market left regular hours — LIVE → WATCH')
 
-        real = self._real_snapshot(prov, seq, ticker, slot['my_ids'])
+        snap = self._real_snapshot(prov, seq, ticker, slot['my_ids'])
         mode = slot['mode']
 
-        if real['price'] is not None:
-            slot['ticks'].append((time.time(), real['price']))
+        if snap['price'] is not None:
+            slot['ticks'].append((time.time(), snap['price']))
             del slot['ticks'][:-_TICKS_KEPT]
             self._data_recovered(ticker, slot)
         else:
             self._data_failure(ticker, slot, 'no price from Toss')
 
-        if mode == 'DRY':
-            if slot['paper'] is None:
-                slot['paper'] = PaperBroker(real['shares'], real['avg_cost'],
-                                            real['buying_power'])
-                self._log(ticker,
-                          f"paper account seeded: {real['shares']} shares "
-                          f"@ {real['avg_cost']:,.0f}, cash {real['buying_power']}")
-            paper = slot['paper']
-            paper.on_price(real['price'])
-            snap = {'price': real['price'], 'shares': paper.shares,
-                    'avg_cost': paper.avg, 'orders': paper.open_orders(),
-                    'buying_power': paper.cash}
-        else:
-            snap = real
-
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         snap['unit_cash'] = self._units.get(ccy) or 0.0
-        snap['army_units'] = self._units.get('army') or 0.0
         snap['trading_date'] = self._trading_date(ticker)
         snap['prev_close'] = self._prev_close(prov, ticker, slot)
-        snap['can_trade'] = mode in ('DRY', 'LIVE')
+        snap['can_trade'] = (mode == 'LIVE')
         snap['phase'] = market_phase(ticker)
-        snap['skim_locks'] = self._other_skim_locks(ticker, ccy)
+        with self._lock:
+            snap['card'] = dict(slot['card']) if slot['card'] else None
 
         if slot['engine'] is None:
-            if slot['strategy'] == 'TAZZA':
-                # DRY runs a scratch campaign; WATCH/LIVE restore the saved
-                # one so the ledger (B/S/K) survives restarts (§73).
-                saved = (None if mode == 'DRY'
-                         else self._tazza_store.get(ticker))
-                slot['engine'] = TazzaEngine(
-                    ticker, trading_date=snap['trading_date'], saved=saved,
-                    log=lambda m, t=ticker: self._log(t, m))
-                self._log(ticker, f'타짜 engine armed '
-                                  f'({"campaign restored" if saved else "fresh"})')
-            else:
-                slot['engine'] = Daily443Engine(
-                    ticker, anchor=None, trading_date=snap['trading_date'],
-                    log=lambda m, t=ticker: self._log(t, m))
-                self._log(ticker, f"engine armed (prev close "
-                                  f"{snap['prev_close'] or 'unknown'})")
+            slot['engine'] = WatcherEngine(
+                ticker, trading_date=snap['trading_date'],
+                saved=self._store.get(ticker),
+                log=lambda m, t=ticker: self._log(t, m))
+            self._log(ticker, 'engine armed'
+                              + (' (state restored)'
+                                 if self._store.get(ticker) else ''))
         engine = slot['engine']
 
         acts = engine.poll(snap)
         self._execute(ticker, slot, prov, seq, engine, acts)
-        if (slot['strategy'] == 'TAZZA' and slot['mode'] == 'LIVE'
-                and getattr(engine, 'dirty', False)):
-            self._save_tazza(ticker, engine)
+        if getattr(engine, 'dirty', False):
+            self._save_state(ticker, engine)
             engine.dirty = False
         self._push_ui(ticker, slot, snap=snap)
 
-    def _other_skim_locks(self, ticker, ccy):
-        """밑장 빼기 proceeds locked by OTHER battlefields in this currency —
-        they are not free army for this stock's double (§46)."""
-        total = 0.0
-        for t, s in list(self._slots.items()):
-            if t == ticker:
-                continue
-            e = s.get('engine')
-            if (e is not None and getattr(e, 'skim_pending', False)
-                    and getattr(e, 'currency', None) == ccy):
-                total += getattr(e, 'skim_lock_amount', 0.0) or 0.0
-        return total
-
     # ── Action executor ───────────────────────────────────────────────────────
+
+    def _place_real(self, ticker, slot, prov, seq, side, price, qty, label):
+        """Send one real LIMIT/DAY order; shared by LIVE and manual fire."""
+        wire = fmt_order_price(ticker, price)
+        self._log(ticker, f'place [{label}] {side} {qty} @ {wire}')
+        coid = re.sub(r'[^A-Za-z0-9_-]', '',
+                      f"ap{ticker}{side}")[:26] \
+            + datetime.now().strftime('%H%M%S')
+        try:
+            st, body = prov.place_limit_order(
+                ticker, side, wire, qty, seq, client_order_id=coid)
+        except Exception as e:
+            self._log(ticker, f'place error: {e}')
+            slot['backoff_until'] = time.time() + _BACKOFF_OTHER
+            return False, f'order error: {e}'
+        order_id = (body.get('result') or {}).get('orderId')
+        if st == 200 and order_id:
+            slot['my_ids'].add(order_id)
+            slot['insuff_warned'] = False
+            return True, f'{side} {qty} @ {wire} placed'
+        code = str((body.get('error') or {}).get('code') or st)
+        self._log(ticker, f'place rejected: {code}')
+        if 'insufficient' in code and 'buying' in code:
+            # Army is really out: announce once, back off, keep watching —
+            # Toss is the wall.
+            slot['backoff_until'] = time.time() + _BACKOFF_INSUFFICIENT
+            if not slot.get('insuff_warned'):
+                slot['insuff_warned'] = True
+                self._popup(ticker,
+                            f'Toss rejected the buy ({code}).\n\n'
+                            'The army cannot fund it. The watcher keeps '
+                            'managing the SELL and retries buying every '
+                            '5 minutes.')
+        elif 'hours' in code or 'closed' in code:
+            slot['backoff_until'] = time.time() + _BACKOFF_HOURS_CLOSED
+        elif 'opposite' in code:
+            pass           # a foreign order blocks the side; retry next poll
+        else:
+            slot['backoff_until'] = time.time() + _BACKOFF_OTHER
+        return False, f'rejected: {code}'
 
     def _execute(self, ticker, slot, prov, seq, engine, acts):
         mode = slot['mode']
@@ -555,21 +558,18 @@ class AutopilotController:
                 # Engine announcement (e.g. army EXHAUSTED) — once per
                 # transition; the watcher keeps running.
                 self._popup(ticker, act[1])
-            elif mode == 'WATCH':
+            elif mode != 'LIVE':
                 continue           # engine emits none in WATCH; safety net
             elif kind == 'cancel':
                 _, oid, label = act
                 self._log(ticker, f'cancel [{label}] {oid}')
-                if mode == 'LIVE':
-                    try:
-                        st, body = prov.cancel_order(oid, seq)
-                        if st != 200:
-                            code = (body.get('error') or {}).get('code') or st
-                            self._log(ticker, f'cancel rejected: {code}')
-                    except Exception as e:
-                        self._log(ticker, f'cancel error: {e}')
-                else:
-                    slot['paper'].cancel(oid)
+                try:
+                    st, body = prov.cancel_order(oid, seq)
+                    if st != 200:
+                        code = (body.get('error') or {}).get('code') or st
+                        self._log(ticker, f'cancel rejected: {code}')
+                except Exception as e:
+                    self._log(ticker, f'cancel error: {e}')
                 time.sleep(0.3)   # give the cancel a beat before a re-place
             elif kind == 'place':
                 _, side, price, qty, label = act
@@ -577,46 +577,8 @@ class AutopilotController:
                     self._log(ticker, f'skip place [{label}] (backing off '
                                       f'{slot["backoff_until"] - now:.0f}s)')
                     continue
-                wire = fmt_order_price(ticker, price)
-                self._log(ticker, f'place [{label}] {side} {qty} @ {wire} '
-                                  f'({mode})')
-                if mode == 'DRY':
-                    slot['paper'].place(side, price, qty)
-                    continue
-                coid = re.sub(r'[^A-Za-z0-9_-]', '',
-                              f"ap443{ticker}{side}")[:26] \
-                    + datetime.now().strftime('%H%M%S')
-                try:
-                    st, body = prov.place_limit_order(
-                        ticker, side, wire, qty, seq, client_order_id=coid)
-                except Exception as e:
-                    self._log(ticker, f'place error: {e}')
-                    slot['backoff_until'] = time.time() + _BACKOFF_OTHER
-                    continue
-                order_id = (body.get('result') or {}).get('orderId')
-                if st == 200 and order_id:
-                    slot['my_ids'].add(order_id)
-                    slot['insuff_warned'] = False
-                    continue
-                code = str((body.get('error') or {}).get('code') or st)
-                self._log(ticker, f'place rejected: {code}')
-                if 'insufficient' in code and 'buying' in code:
-                    # Army is really out (the gate may be unlocked): announce
-                    # once, back off, keep watching — Toss is the wall.
-                    slot['backoff_until'] = time.time() + _BACKOFF_INSUFFICIENT
-                    if not slot.get('insuff_warned'):
-                        slot['insuff_warned'] = True
-                        self._popup(ticker,
-                                    f'Toss rejected the buy ({code}).\n\n'
-                                    'The army cannot fund it. The watcher '
-                                    'keeps managing the SELL and retries '
-                                    'buying every 5 minutes.')
-                elif 'hours' in code or 'closed' in code:
-                    slot['backoff_until'] = time.time() + _BACKOFF_HOURS_CLOSED
-                elif 'opposite' in code:
-                    pass       # a foreign order blocks the side; retry next poll
-                else:
-                    slot['backoff_until'] = time.time() + _BACKOFF_OTHER
+                self._place_real(ticker, slot, prov, seq,
+                                 side, price, qty, label)
 
     def _popup(self, ticker, msg):
         self._log(ticker, f'ANNOUNCE: {msg}')
@@ -639,33 +601,18 @@ class AutopilotController:
             'state': engine.state if engine else 'ARMING',
             'status': status or (engine.status if engine else 'arming…'),
             'lines': dict(engine.lines) if engine else {},
+            'trigger': dict(engine.trigger) if engine else {},
             'anchor': engine.anchor if engine else None,
             'anchor_source': engine.anchor_source if engine else 'close',
-            'chase_count': getattr(engine, 'chase_count',
-                                   getattr(engine, 'double_count', 0) or 0),
+            'chase_count': getattr(engine, 'chase_count', 0) or 0,
             'events': list(engine.events) if engine else [],
-            'buy_gear': getattr(engine, 'buy_gear', None),
-            'sell_gear': getattr(engine, 'sell_gear', None),
-            'deploy_ratio': getattr(engine, 'deploy_ratio', 0.0) or 0.0,
+            'gear': getattr(engine, 'gear', None),
+            'pct': getattr(engine, 'pct', None),
+            'tier_pcts': list(getattr(engine, 'tier_pcts', []) or []),
+            'tier_actives': list(getattr(engine, 'tier_actives', []) or []),
+            'gear1_pinned': getattr(engine, 'gear1_pinned', False),
             'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
-            'army_units': self._units.get('army') or 0.0,
             'mode': slot['mode'],
-            'strategy': slot.get('strategy', 'ADAPTIVE'),
-            # 타짜 extras (None/0 for the adaptive engine)
-            'ladder_pct': getattr(engine, 'ladder_pct', None),
-            'ladder_mode': getattr(engine, 'ladder_mode', None),
-            'emergency_stage': getattr(engine, 'emergency_stage', 0) or 0,
-            'tier_progress': getattr(engine, 'tier_progress', None),
-            'skim_pending': getattr(engine, 'skim_pending', False),
-            'skim_rebuy_line': getattr(engine, 'skim_rebuy_line', None),
-            'skim_lock_amount': getattr(engine, 'skim_lock_amount', 0.0) or 0.0,
-            'stage_idle_days': getattr(engine, 'stage_idle_days', 0) or 0,
-            'deployed_units': getattr(engine, 'deployed_units', 0) or 0,
-            'campaign_B': getattr(engine, 'B', None),
-            'campaign_S': getattr(engine, 'S', None),
-            'campaign_K': getattr(engine, 'K', None),
-            'projection': getattr(engine, 'projection', None),
-            'next_down_action': getattr(engine, 'next_down_action', None),
             'badge_key': badge_key,
             'phase': market_phase(ticker),
             'price': (snap or {}).get('price'),

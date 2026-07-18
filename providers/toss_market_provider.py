@@ -278,6 +278,13 @@ class TossMarketProvider(MarketDataProvider):
             if not five:
                 return
             d = data[t]
+            # Vantage point: the last COMPLETED session's close (today's
+            # in-progress bar excluded, same heuristic as _completed_5).
+            tz = _TZ_KR if t.endswith('.KS') else _TZ_US
+            today = datetime.now(tz).strftime('%Y-%m-%d')
+            completed = [b for b in bars if b['ts'][:10] != today]
+            if completed:
+                d['prev_close'] = completed[-1]['close']
             d['5d_high']   = max(b['high'] for b in five)
             d['5d_low']    = min(b['low'] for b in five)
             d['5d_closes'] = [b['close'] for b in five]

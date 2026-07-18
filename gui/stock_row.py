@@ -3,10 +3,10 @@ from core.calc import (
     display_name, normalize_load_pct, sell_pct_color, gap_color,
     load_gap_color, fmt_price,
     calc_load_ladder, calc_buy_cascade, calc_sell_tiers, calc_gap_rate,
-    auto_gear_params, select_auto_gear,
-    AUTO_GEARS, BUY_GEAR_PCTS, gear_for_buy_pct, gear_for_load_pct,
+    select_auto_gear, effective_entry_gear, RE_BAIT_GEAR,
+    AUTO_GEARS, BUY_GEAR_PCTS, gear_for_pct,
     gear_for_sell_pct, gear_label, clamp_gear, gear_button_color,
-    gear_button_fg, buy_gear_detail, load_gear_detail, gear_menu_label,
+    gear_button_fg, gear_detail, gear_menu_label,
 )
 from gui.stepper import Stepper
 
@@ -36,23 +36,23 @@ _MUTE_FG    = '#9A9A9A'
 class StockRow:
     """One unified stock card, used for both EMPTY and DEPLOYED stocks.
 
-    The layout is identical for both states (title row + stats + 3-column buy/
-    sell ladder on the left, and three gear boxes — Load | Buy | Sell — on the
-    right). What differs is the strategy logic, driven by ``self.deployed``:
+    ONE gear system drives everything: a single drop percent (G1 -4% … G5
+    -8%) is both the LOAD trigger (below the VANTAGE point — prev session
+    close, or the same-day sell fill) and the chase/rescue trigger (below the
+    avg cost). The autopilot follows exactly these lines (``line_config``).
 
     * DEPLOYED — the buy ladder is the rescue cascade from the real avg cost
-      (Buy 1/2/3) and the sells are real. The Load gear is greyed/disabled.
+      (Buy 1/2/3) and the sells are real.
     * EMPTY — the buy ladder is the projected entry: Load (initial unit) plus
       two projected rescues (Buy 1/2), and the sells are *pseudo* (computed as
-      if the load had filled). The Buy and Sell gears are muted but stay
-      clickable so the pseudo lines can be explored.
+      if the load had filled).
 
     The parent grids ``self.frame``; the row does not place itself. The program
     still keeps deployed and empty rows in two separate lists.
     """
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
-                 get_unit_cash, on_graph, on_compute=None, editable=True,
+                 get_unit_cash, on_compute=None, editable=True,
                  on_autopilot=None):
         self.deployed       = deployed
         self.editable       = editable
@@ -61,33 +61,19 @@ class StockRow:
         self.tier           = pos.get('tier', 'Major')
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.get_unit_cash  = get_unit_cash
-        self.on_graph       = on_graph
         self.on_autopilot   = on_autopilot
         self._on_compute_cb = on_compute
         self.current_price  = None
-        self.peak_5d        = None
+        self.vantage        = None    # prev session close / same-day sell fill
+        self.vantage_src    = 'close' # 'close' | 'sell' (re-bait → G1 pinned)
         self.volatility     = None
         self._army_pct      = None
-        self._gap           = None    # current vs anchor (load) %, for ordering
-        self._buy_trig      = []      # per buy line: current has crossed it
-        self._sell_trig     = []      # per active sell tier: current has crossed it
-        self._sell_tier_lbls = []     # 'T1'/'T2'/'T3' aligned to _sell_lines
+        self._gap           = None    # current vs anchor %, for ordering
         self._computing     = False
         self._syncing_gear  = False
         self._order_side    = None
-        self._auto_buy_shift = 0
-        self._auto_sell_shift = 0
-        self._base_gear = None
-        self._load_gear = None
-        self._buy_gear = None
-        self._sell_gear = None
-
-        # Chart data (filled by compute; safe defaults so a graph before the
-        # first fetch still opens).
-        self._anchor_label = 'Avg' if deployed else 'Load'
-        self._anchor_price = None
-        self._buy_lines    = []
-        self._sell_lines   = []
+        self._base_gear = None        # pure volatility gear
+        self._eff_gear  = None        # after heavy-unit / re-bait rules
 
         # -- Card frame --------------------------------------------------------
         self.frame = tk.Frame(parent, bd=1, relief='groove', padx=8, pady=3)
@@ -97,18 +83,10 @@ class StockRow:
             value=str(pos.get('shares', 0)) if pos.get('shares', 0) > 0 else '')
         self.avg_cost_var = tk.StringVar(value=self._fmt_init(pos.get('avg_cost', 0)))
 
-        init_load = normalize_load_pct(pos.get('load_gear', 5))
-        load_gear = gear_for_load_pct(init_load)
-
-        pct_init = pos.get('buy_pct', 5)
-        if pct_init not in BUY_GEAR_PCTS:
-            pct_init = 5
-        buy_gear = gear_for_buy_pct(pct_init)
-        init_gear = buy_gear if self.deployed else load_gear
-        self.load_pct_var = tk.IntVar(
-            value=-AUTO_GEARS[init_gear]['load_pct'])
-        self.buy_pct_var = tk.IntVar(
-            value=AUTO_GEARS[init_gear]['buy_pct'])
+        pct_init = normalize_load_pct(pos.get('buy_pct')
+                                      or pos.get('load_gear', 5))
+        init_gear = gear_for_pct(pct_init)
+        self.pct_var = tk.IntVar(value=AUTO_GEARS[init_gear]['pct'])
         self.buy_gear_var = tk.StringVar(
             value=self._gear_button_text(init_gear))
 
@@ -139,7 +117,6 @@ class StockRow:
         # -- Reactive traces (after all widgets exist) -------------------------
         self.shares_var.trace_add('write', lambda *_: self._on_input_change())
         self.avg_cost_var.trace_add('write', lambda *_: self._on_input_change())
-        self.load_pct_var.trace_add('write', lambda *_: self._on_input_change())
         for i in range(3):
             self.t_active[i].trace_add('write', lambda *_: self._on_input_change())
             self.t_pct[i].trace_add('write', lambda *_: self._on_input_change())
@@ -181,10 +158,6 @@ class StockRow:
         # Army % (deployed only)
         tk.Label(r0, textvariable=self.army_pct_var,
                  font=_F_SM, fg='#888').pack(side='left', padx=(3, 6))
-
-        tk.Button(r0, text='Graph', font=_F_SM, width=6,
-                  command=lambda: self.on_graph(self.ticker)
-                  ).pack(side='left', padx=(0, 6))
 
         self.auto_btn = tk.Checkbutton(
             r0, variable=self.auto_var, indicatoron=False, takefocus=0,
@@ -229,7 +202,7 @@ class StockRow:
             lbl.pack(side='left', padx=(2, 12))
             return lbl
 
-        cost_label = 'Total Cost:' if self.deployed else '5D High:'
+        cost_label = 'Total Cost:' if self.deployed else 'Vantage:'
         _out(cost_label, self.cost_var)
         _out('Current:', self.current_var)
         self.current_lbl = stats.winfo_children()[-1]  # the Current value label
@@ -349,52 +322,35 @@ class StockRow:
 
     # ── Gear value getters ────────────────────────────────────────────────────
 
-    def _get_load_pct(self) -> int:
+    def _get_pct(self) -> int:
+        """THE drop percent: one number drives the load AND the chase."""
         try:
-            v = abs(self.load_pct_var.get())
-        except tk.TclError:
-            v = 5
-        gear = gear_for_load_pct(v)
-        return AUTO_GEARS[gear]['load_pct']
-
-    def _get_buy_pct(self) -> int:
-        try:
-            v = int(self.buy_pct_var.get())
+            v = int(self.pct_var.get())
         except (tk.TclError, ValueError):
             v = 5
         return v if v in BUY_GEAR_PCTS else 5
 
     def _gear_button_text(self, gear: int):
-        return buy_gear_detail(gear) if self.deployed else load_gear_detail(gear)
+        return gear_detail(gear)
 
-    def _current_load_buy_gear(self):
-        if self.auto_var.get() and self._base_gear:
-            return self._buy_gear if self.deployed else self._load_gear
-        if self.deployed:
-            return gear_for_buy_pct(self._get_buy_pct())
-        return gear_for_load_pct(self._get_load_pct())
+    def _current_gear(self):
+        if self.auto_var.get() and self._eff_gear:
+            return self._eff_gear
+        return gear_for_pct(self._get_pct())
 
-    def _set_buy_gear(self, gear: int):
+    def _set_gear(self, gear: int):
         gear = clamp_gear(gear)
-        load_pct = AUTO_GEARS[gear]['load_pct']
-        buy_pct = AUTO_GEARS[gear]['buy_pct']
+        pct = AUTO_GEARS[gear]['pct']
         self._syncing_gear = True
         try:
-            try:
-                current_load = int(self.load_pct_var.get())
-            except tk.TclError:
-                current_load = 0
-            if current_load != -load_pct:
-                self.load_pct_var.set(-load_pct)
-            if self._get_buy_pct() != buy_pct:
-                self.buy_pct_var.set(buy_pct)
+            if self._get_pct() != pct:
+                self.pct_var.set(pct)
         finally:
             self._syncing_gear = False
         self.buy_gear_var.set(self._gear_button_text(gear))
 
     def _sync_buy_menu(self):
-        self.buy_gear_var.set(
-            self._gear_button_text(self._current_load_buy_gear()))
+        self.buy_gear_var.set(self._gear_button_text(self._current_gear()))
 
     # ── Auto / manual ─────────────────────────────────────────────────────────
 
@@ -410,50 +366,51 @@ class StockRow:
         vol = self.volatility
         if vol is None:
             self.vol_var.set('V --')
-        elif self.auto_var.get():
-            self.vol_var.set(f'V {vol:.1f}% → G{select_auto_gear(vol)}')
-        else:
+        elif not self.auto_var.get():
             self.vol_var.set(f'V {vol:.1f}%')
+        elif not self.deployed and self.vantage_src == 'sell':
+            self.vol_var.set(f'V {vol:.1f}% → G1 재입질')
+        else:
+            base = select_auto_gear(vol)
+            eff = self._eff_gear or base
+            heavy = ' ▲heavy' if eff > base else ''
+            self.vol_var.set(f'V {vol:.1f}% → G{eff}{heavy}')
 
     def _apply_auto(self):
-        """In auto mode, drive every gear from the 5-day volatility (the load
-        gear too, so it is correct whether the card is empty now or later
-        demotes back to empty). Frozen while orders rest so the ordered gear
-        can't be overwritten."""
-        if self._order_locked:
+        """In auto mode the gear comes from the 5-day volatility. Empty cards
+        additionally apply the two exceptions: the heavy-unit minimum ENTRY
+        gear (one share too big for a shallow bait) and the same-day re-bait
+        (vantage = today's sell fill → gear 1). Frozen while orders rest so
+        the ordered gear can't be overwritten."""
+        if self._order_locked or not self.auto_var.get():
             return
-        if self.auto_var.get() and self.volatility is not None:
-            g = auto_gear_params(
-                self.volatility, self._auto_buy_shift, self._auto_sell_shift)
-            self._base_gear = g['base_gear']
-            self._load_gear = g['load_gear']
-            self._buy_gear = g['buy_gear']
-            self._sell_gear = g['sell_gear']
-            try:
-                current_load = int(self.load_pct_var.get())
-            except tk.TclError:
-                current_load = 0
-            if current_load != -g['load_pct']:
-                self.load_pct_var.set(-g['load_pct'])
-            if self._get_buy_pct() != g['buy_pct']:
-                self.buy_pct_var.set(g['buy_pct'])
-            self._sync_buy_menu()
-            for i in range(3):
-                if self.t_pct[i].get() != g['tiers'][i]:
-                    self.t_pct[i].set(g['tiers'][i])
-
-    def set_global_gear_shifts(self, buy_shift=0, sell_shift=0):
-        self._auto_buy_shift = int(buy_shift or 0)
-        self._auto_sell_shift = int(sell_shift or 0)
+        if not self.deployed and self.vantage_src == 'sell':
+            gear = RE_BAIT_GEAR          # same-day re-bait: gear 1 for today
+        elif self.volatility is None:
+            return
+        elif self.deployed:
+            gear = select_auto_gear(self.volatility)
+        else:
+            ref_price = self.current_price or self.vantage
+            gear = effective_entry_gear(self.volatility, ref_price,
+                                        self.get_unit_cash())
+        self._base_gear = select_auto_gear(self.volatility)
+        self._eff_gear = gear
+        g = AUTO_GEARS[gear]
+        if self._get_pct() != g['pct']:
+            self.pct_var.set(g['pct'])
+        self._sync_buy_menu()
+        for i in range(3):
+            if self.t_pct[i].get() != g['tiers'][i]:
+                self.t_pct[i].set(g['tiers'][i])
 
     def _current_gear_labels(self):
-        if self.auto_var.get() and self._base_gear:
-            load_buy_gear = self._buy_gear if self.deployed else self._load_gear
-            sell_gear = self._sell_gear
+        gear = self._current_gear()
+        if self.auto_var.get() and self._eff_gear:
+            sell_gear = self._eff_gear
         else:
-            load_buy_gear = self._current_load_buy_gear()
             sell_gear = gear_for_sell_pct(self.t_pct[1].get())
-        return load_buy_gear, sell_gear
+        return gear, sell_gear
 
     def _refresh_gear_title_text(self):
         load_buy_gear, sell_gear = self._current_gear_labels()
@@ -534,7 +491,7 @@ class StockRow:
             23, 23, text=str(gear), fill=fg, font=_F_GEAR_BADGE)
 
     def _update_buy_color(self, muted=False):
-        gear = self._current_load_buy_gear()
+        gear = self._current_gear()
         default_bg = getattr(self, '_buy_menu_default_bg', '#F0F0F0')
         default_fg = getattr(self, '_buy_menu_default_fg', 'black')
         self.buy_menu.config(
@@ -551,7 +508,7 @@ class StockRow:
             stepper.set_value_color(c, 'white' if float(pct) >= 7 else 'black')
 
     def _on_buy_gear_select(self, gear):
-        self._set_buy_gear(gear)
+        self._set_gear(gear)
         self._update_buy_color()
         self._on_input_change()
 
@@ -594,7 +551,7 @@ class StockRow:
         ccy  = self.currency
         pcts = [self.t_pct[i].get() for i in range(3)]
         acts = [self.t_active[i].get() for i in range(3)]
-        buy_pct = self._get_buy_pct()
+        pct = self._get_pct()
 
         try:
             shares = int(self.shares_var.get().replace(',', '') or 0)
@@ -610,7 +567,7 @@ class StockRow:
             anchor_price = avg_cost if avg_cost > 0 else None
             if shares > 0 and avg_cost > 0:
                 self.cost_var.set(fmt_price(shares * avg_cost, ccy))
-                buy_lines  = calc_buy_cascade(shares, avg_cost, buy_pct, 3)
+                buy_lines  = calc_buy_cascade(shares, avg_cost, pct, 3)
                 sell_lines = calc_sell_tiers(shares, avg_cost, pcts, acts)
             else:
                 self.cost_var.set('--')
@@ -618,38 +575,40 @@ class StockRow:
                 sell_lines = [{'price': None, 'qty': None} for _ in range(3)]
         else:
             buy_labels = ['Load', 'Buy 1', 'Buy 2']
-            if self.peak_5d and self.peak_5d > 0:
+            if self.vantage and self.vantage > 0:
                 buy_lines, load_price, load_shares = calc_load_ladder(
-                    self.peak_5d, self._get_load_pct(), buy_pct,
-                    self.get_unit_cash(), rescues=2)
+                    self.vantage, pct, self.get_unit_cash(), rescues=2)
                 anchor_price = load_price if load_price > 0 else None
                 sell_lines = calc_sell_tiers(load_shares, load_price, pcts, acts)
-                self.cost_var.set(fmt_price(self.peak_5d, ccy))
+                tag = ' (재입질)' if self.vantage_src == 'sell' else ''
+                self.cost_var.set(fmt_price(self.vantage, ccy) + tag)
             else:
                 anchor_price = None
                 buy_lines  = [{'price': None, 'qty': None} for _ in range(3)]
                 sell_lines = [{'price': None, 'qty': None} for _ in range(3)]
                 self.cost_var.set('--')
 
-        # Current price + gap vs the anchor (avg cost or load price)
+        # Current price + gap
         if self.current_price:
             self.current_var.set(fmt_price(self.current_price, ccy))
         else:
             self.current_var.set('--')
 
-        if self.current_price and anchor_price:
-            if self.deployed:
-                gap = calc_gap_rate(self.current_price, anchor_price)  # vs avg
-            else:
-                # Load relative to the current price (the origin): negative = the
-                # load sits n% below the live price, matching the load gear
-                # (at current==high it equals -gear, e.g. -8%). More negative
-                # (deeper blue) = farther below = less likely to be hit soon.
-                gap = (anchor_price - self.current_price) / self.current_price * 100.0
+        # Deployed: gap = current vs avg cost (P&L red/blue).
+        # Empty: gap = current vs the VANTAGE point — today's move from the
+        # entry origin. The bait sits at -pct, so this gap says how much of
+        # the day's drop is still needed before the next battle starts.
+        if self.deployed and self.current_price and anchor_price:
+            gap = calc_gap_rate(self.current_price, anchor_price)
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
-            self.gap_lbl.config(
-                fg=(gap_color(gap) if self.deployed else load_gap_color(gap)))
+            self.gap_lbl.config(fg=gap_color(gap))
+        elif (not self.deployed and self.current_price
+                and self.vantage and self.vantage > 0):
+            gap = (self.current_price - self.vantage) / self.vantage * 100.0
+            self._gap = gap
+            self.gap_var.set(f"{gap:+.2f}%")
+            self.gap_lbl.config(fg=load_gap_color(gap, pct))
         else:
             self._gap = None
             self.gap_var.set('--')
@@ -686,24 +645,6 @@ class StockRow:
                 self.t_info_var[i].set('--')
                 self.t_info_lbl[i].config(fg='#CCC')
 
-        # Stash chart data + per-line trigger state
-        self._anchor_label = 'Avg' if self.deployed else 'Load'
-        self._anchor_price = anchor_price
-        self._buy_lines = [(buy_labels[i], buy_lines[i]['price'],
-                            buy_lines[i]['qty']) for i in range(3)]
-        self._buy_trig = [(cur is not None and p is not None and cur <= p)
-                          for (_, p, _) in self._buy_lines]
-        self._sell_lines, self._sell_tier_lbls = [], []
-        for i in range(3):
-            if sell_lines[i]['price'] is not None:
-                self._sell_lines.append((f"+{pcts[i]}%", sell_lines[i]['price'],
-                                         sell_lines[i]['qty']))
-                self._sell_tier_lbls.append(f"T{i+1}")
-        # Sell triggers only matter for deployed stocks (empty sells are pseudo).
-        self._sell_trig = [(self.deployed and cur is not None and p is not None
-                            and cur >= p)
-                           for (_, p, _) in self._sell_lines]
-
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -714,13 +655,11 @@ class StockRow:
     _AP_STYLES = {
         None:    ('AUTOPILOT',           None,      'black'),
         'WATCH': ('AUTOPILOT\nWATCH',    '#3366CC', 'white'),
-        'DRY':   ('AUTOPILOT\nDRY RUN',  '#E08000', 'white'),
         'LIVE':  ('AUTOPILOT\nLIVE',     '#CC0000', 'white'),
     }
 
     def set_autopilot(self, key):
-        """Color the big Autopilot button to the status
-        (None/'WATCH'/'DRY'/'LIVE')."""
+        """Color the big Autopilot button to the status (None/'WATCH'/'LIVE')."""
         if not hasattr(self, 'ap_btn'):
             return
         text, bg, fg = self._AP_STYLES.get(key, self._AP_STYLES[None])
@@ -728,25 +667,19 @@ class StockRow:
         self.ap_btn.config(text=text, bg=bg, fg=fg,
                            activebackground=bg, activeforeground=fg)
 
-    # -- Order intents (used by the graph order/cancel flow) ------------------
-
-    def order_intents(self, side: str) -> list:
-        """The orders this card's current ladder represents on the given side:
-        BUY = the 3 buy lines, SELL = the active sell tiers. Each is
-        {ticker, side, label, price, qty, currency, triggered}. 'triggered' means
-        the current price has crossed that line (the bait is bitten)."""
-        if side == 'BUY':
-            lines, trig = self._buy_lines, self._buy_trig
-        else:
-            lines, trig = self._sell_lines, self._sell_trig
-        out = []
-        for i, (label, price, qty) in enumerate(lines):
-            if price is None or not qty:
-                continue
-            out.append({'ticker': self.ticker, 'side': side, 'label': label,
-                        'price': price, 'qty': int(qty), 'currency': self.currency,
-                        'triggered': bool(trig[i]) if i < len(trig) else False})
-        return out
+    def line_config(self) -> dict:
+        """The gear numbers the autopilot must follow — exactly what this
+        card shows right now (one unified logic, the card is the source)."""
+        try:
+            tier_pcts = [int(self.t_pct[i].get()) for i in range(3)]
+        except (tk.TclError, ValueError):
+            tier_pcts = list(AUTO_GEARS[self._current_gear()]['tiers'])
+        return {
+            'gear': self._current_gear(),
+            'pct': self._get_pct(),
+            'tier_pcts': tier_pcts,
+            'tier_actives': [bool(self.t_active[i].get()) for i in range(3)],
+        }
 
     def current_shares(self) -> int:
         try:
@@ -759,22 +692,16 @@ class StockRow:
         self.army_pct_var.set(
             f"({pct:.1f}%)" if (pct is not None and self.deployed) else '')
 
-    def update_live(self, price=None, peak_5d=None, closes_5d=None,
-                    volatility=None):
+    def update_live(self, price=None, vantage=None, volatility=None,
+                    vantage_src=None):
         if price is not None:
             self.current_price = price
-        if peak_5d is not None:
-            self.peak_5d = peak_5d
+        if vantage is not None:
+            self.vantage = vantage
+        if vantage_src is not None:
+            self.vantage_src = vantage_src
         if volatility is not None:
             self.volatility = volatility
-
-    def chart_data(self) -> dict:
-        return {
-            'anchor_label': self._anchor_label,
-            'anchor_price': self._anchor_price,
-            'buy_lines':    list(self._buy_lines),
-            'sell_lines':   list(self._sell_lines),
-        }
 
     def get_state(self) -> dict:
         try:
@@ -792,8 +719,8 @@ class StockRow:
             'shares':     shares,
             'avg_cost':   avg_cost,
             'cost_basis': shares * avg_cost,
-            'load_gear':  self._get_load_pct(),
-            'buy_pct':    self._get_buy_pct(),
+            'load_gear':  self._get_pct(),
+            'buy_pct':    self._get_pct(),
             't1_pct':     self.t_pct[0].get(),
             't2_pct':     self.t_pct[1].get(),
             't3_pct':     self.t_pct[2].get(),
