@@ -118,8 +118,10 @@ class AutopilotController:
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self._store, f, ensure_ascii=False, indent=1)
             os.replace(tmp, _STATE_STORE)
+            return True
         except OSError as e:
             self._log(ticker, f'state save failed: {e}')
+            return False
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -503,8 +505,10 @@ class AutopilotController:
         acts = engine.poll(snap)
         self._execute(ticker, slot, prov, seq, engine, acts)
         if getattr(engine, 'dirty', False):
-            self._save_state(ticker, engine)
-            engine.dirty = False
+            # Keep dirty on a failed write so campaign fills and one-time
+            # migrations (such as legacy HOLD cleanup) retry next poll.
+            if self._save_state(ticker, engine):
+                engine.dirty = False
         self._push_ui(ticker, slot, snap=snap)
 
     # ── Action executor ───────────────────────────────────────────────────────
@@ -555,8 +559,8 @@ class AutopilotController:
         for act in acts:
             kind = act[0]
             if kind == 'notify':
-                # Engine announcement (e.g. army EXHAUSTED) — once per
-                # transition; the watcher keeps running.
+                # Reserved for explicit one-time engine warnings. Reserve
+                # exhaustion itself is visual-only in the Autopilot window.
                 self._popup(ticker, act[1])
             elif mode != 'LIVE':
                 continue           # engine emits none in WATCH; safety net
@@ -602,6 +606,7 @@ class AutopilotController:
             'status': status or (engine.status if engine else 'arming…'),
             'lines': dict(engine.lines) if engine else {},
             'trigger': dict(engine.trigger) if engine else {},
+            'trigger_note': getattr(engine, 'trigger_note', None),
             'anchor': engine.anchor if engine else None,
             'anchor_source': engine.anchor_source if engine else 'close',
             'chase_count': getattr(engine, 'chase_count', 0) or 0,

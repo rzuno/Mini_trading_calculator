@@ -6,9 +6,9 @@ the live price every poll and fires a real LIMIT order only when a line is
 crossed; after a fill the position changes, every line is recomputed from the
 new reality, and it goes back to watching. No strategic play beyond the
 lines: no 밑장 빼기, no stages, no idle-day escalation, no gear shifting by
-the bot. When the army can't fund a buy the buy side simply stops (announced
-once) and the SELL keeps being watched — 밑장 빼기 / gear lowering is the
-COMMANDER's manual decision.
+the bot. When the army can't fund a buy the buy side simply stops, its line is
+shown muted in the charts, and the SELL keeps being watched — 밑장 빼기 / gear
+lowering is the COMMANDER's manual decision.
 
 Lines (all from core.calc, identical to the cards):
 
@@ -18,7 +18,7 @@ Lines (all from core.calc, identical to the cards):
               the bait hangs −4% below the fill, gear 1 regardless of V,
               and dies at the session end / day roll).
     DEPLOYED  CHASE at avg × (1 − pct), sized by the gear ratio
-              (-4% ×1/2 … -8% = the whole position again, 더블);
+              (-4% ×1/2 … -8% ×1.0 = the whole position again);
               SELL tiers at avg × (1 + tier%), the held shares split across
               the ACTIVE tiers (middle tier alone is the default full exit).
               A buy fill restarts the tier ladder on the whole holding.
@@ -108,9 +108,10 @@ class WatcherEngine:
 
         self.buy_state = 'OK'          # 'OK' | 'EXHAUSTED'
         self.trigger = {'BUY': None, 'SELL': None}   # crossed lines (manual fire)
+        self.trigger_note = None       # why a crossed line is NOT fireable
 
         self.dirty = False             # state changed since the last save
-        self._exhaust_notified = False
+        self._exhaust_logged = False
         self._pending = None           # {'side','price','qty','tiers','ts'}
         self._prev_shares = None
         self._prev_avg = 0.0
@@ -130,7 +131,16 @@ class WatcherEngine:
         for f in _SAVE_FIELDS:
             if f in saved:
                 setattr(self, f, saved[f])
-        self.events = list(self.events or [])
+        restored_events = list(self.events or [])
+        # Older builds inserted a synthetic HOLD row every time an Autopilot
+        # window armed on an existing position. Campaign fills now mean actual
+        # broker-observed BUY/SELL changes only, so discard those legacy rows
+        # while preserving every real fill and the rest of the campaign state.
+        self.events = [e for e in restored_events
+                       if not (isinstance(e, dict)
+                               and e.get('kind') == 'HOLD')]
+        if len(self.events) != len(restored_events):
+            self.dirty = True       # persist the one-time migration next poll
         self.tier_done = list(self.tier_done or [False, False, False])
 
     # ── Small helpers ─────────────────────────────────────────────────────────
@@ -145,22 +155,19 @@ class WatcherEngine:
         del self.events[:-300]
         self.dirty = True
 
-    def _exhaust(self, acts, what):
-        """Buy side out of army: announce ONCE, keep watching the sell."""
+    def _exhaust(self, what):
+        """Buy side out of army: NO popup — the graph shows the muted buy
+        line and the trigger row explains it. Logged once per transition."""
         self.buy_state = 'EXHAUSTED'
-        if not self._exhaust_notified:
-            self._exhaust_notified = True
+        if not self._exhaust_logged:
+            self._exhaust_logged = True
             self._log(f'EXHAUSTED: {what}')
-            acts.append(('notify',
-                         f'army exhausted — {what}. Buying stopped; the SELL '
-                         f'line stays watched. 밑장 빼기 or a lower gear is '
-                         f'your manual call.'))
 
     def _buy_ok(self):
-        if self.buy_state == 'EXHAUSTED' and self._exhaust_notified:
+        if self.buy_state == 'EXHAUSTED' and self._exhaust_logged:
             self._log('army available again — buying resumes')
         self.buy_state = 'OK'
-        self._exhaust_notified = False
+        self._exhaust_logged = False
 
     @staticmethod
     def _split_orders(snap):
@@ -248,8 +255,9 @@ class WatcherEngine:
         prev = self._prev_shares
         avg = float(snap.get('avg_cost') or 0)
         if prev is None:                       # first poll after (re)arming
+            # Log only — the fill list records actual BUY/SELL changes, not
+            # every (re)opening of the window.
             if shares > 0:
-                self._event('HOLD', shares, avg, shares, avg)
                 self._log(f'armed on an existing position: {shares} @ '
                           f'{self._fp(avg)}')
             return
@@ -324,6 +332,7 @@ class WatcherEngine:
         self._prev_shares = shares
         self._prev_avg = float(snap.get('avg_cost') or 0)
         self.trigger = {'BUY': None, 'SELL': None}
+        self.trigger_note = None
         return (self._poll_deployed(snap, shares) if shares > 0
                 else self._poll_empty(snap))
 
@@ -343,8 +352,8 @@ class WatcherEngine:
 
         chase_p = trim_buy_price(self.ticker, avg * (1 - pct / 100.0))
         cq = calc_buy_shares(shares, pct)
-        chase_label = (f'-{pct}% 더블 (G{b["gear"]})' if pct >= 8
-                       else f'-{pct}% chase (G{b["gear"]})')
+        size_tag = ' x1.0' if pct == 8 else ''
+        chase_label = f'-{pct}%{size_tag} chase (G{b["gear"]})'
 
         # Sell tiers: split the holding across the active, not-yet-done tiers.
         # If every active tier is already done but shares remain (e.g. a
@@ -369,7 +378,7 @@ class WatcherEngine:
         bp = snap.get('buying_power')
         affordable = bp is None or cq * chase_p <= bp
         if not affordable:
-            self._exhaust(acts, f'next buy needs {cq} @ {self._fp(chase_p)}')
+            self._exhaust(f'next buy needs {cq} @ {self._fp(chase_p)}')
         else:
             self._buy_ok()
 
@@ -415,8 +424,10 @@ class WatcherEngine:
                 self.status = f'[{tag}] buy resting — waiting for the fill'
                 return acts
             if not affordable:
-                self.status = (f'[{tag}] BUY line crossed but the army '
-                               f'cannot fund it — watching the sell only')
+                self.trigger_note = ('▼ BUY crossed — no reserve army; '
+                                     'manual Buy button is off')
+                self.status = (f'[{tag}] BUY line crossed, but no reserve '
+                               f'army remains — watching SELL only')
                 return acts
             self.trigger['BUY'] = {'side': 'BUY', 'price': chase_p,
                                    'qty': cq, 'label': chase_label}
@@ -486,7 +497,7 @@ class WatcherEngine:
         bp = snap.get('buying_power')
         affordable = bp is None or lq * load_p <= bp
         if not affordable:
-            self._exhaust(acts, f'load needs {lq} @ {self._fp(load_p)}')
+            self._exhaust(f'load needs {lq} @ {self._fp(load_p)}')
         else:
             self._buy_ok()
 
@@ -503,8 +514,10 @@ class WatcherEngine:
                 self.status = 'load buy resting — waiting for the fill'
                 return acts
             if not affordable:
-                self.status = (f'[{tag}] LOAD line crossed but the army '
-                               f'cannot fund it')
+                self.trigger_note = ('▼ LOAD crossed — no reserve army; '
+                                     'manual Buy button is off')
+                self.status = (f'[{tag}] LOAD line crossed, but no reserve '
+                               f'army remains')
                 return acts
             self.trigger['BUY'] = {'side': 'BUY', 'price': load_p,
                                    'qty': lq, 'label': label}

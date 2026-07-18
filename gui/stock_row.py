@@ -31,6 +31,7 @@ _F_GEAR_BADGE = ('Segoe UI', 18, 'bold')
 _MUTE_TITLE = '#C0C0C0'
 _MUTE_BG    = '#F0F0F0'
 _MUTE_FG    = '#9A9A9A'
+_AP_BUTTON_TOP_GAP = 18       # one heading-line below the gear-box titles
 
 
 class StockRow:
@@ -303,7 +304,10 @@ class StockRow:
                 height=3, bd=2, takefocus=0,
                 command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
-            self.ap_btn.pack(side='left', anchor='n', padx=(12, 0))
+            # Sit one label-line below the gear-box headings so the large
+            # button aligns with the actual controls instead of their titles.
+            self.ap_btn.pack(side='left', anchor='n', padx=(12, 0),
+                             pady=(_AP_BUTTON_TOP_GAP, 0))
 
     # ── Formatting ────────────────────────────────────────────────────────────
 

@@ -12,8 +12,12 @@ tables, same tiers). No strategy toggle, no dry-run: just WATCH or LIVE.
            to WATCH at the close). While LIVE, the manual buttons rest.
 
 Left: the live tick curve inside the gear zone with every threshold line.
-Right: the campaign fill log and (toggleable) the 5-day candle panel with
-the V value and the same lines — the old Graph popup lives here now.
+Right: the live campaign-status snapshot, recorded fill log, and 5-day
+candle panel with the V value and the same lines — the old Graph popup
+lives here now, always shown.
+When the army cannot fund the buy line, no popup fires: the buy line is
+drawn muted (✕ … no army) and the trigger row explains why the manual
+Buy button is off.
 
 Closing the window in WATCH mode stops the polling; in LIVE the autopilot
 keeps running in the background (the card button stays colored).
@@ -23,10 +27,12 @@ import time as _time
 from datetime import datetime as _dt
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox
 
 from core.calc import STOCK_NAMES, BUY_GEAR_INFO, fmt_price
-from gui.candle_chart import CandlePanel
+from gui.candle_chart import (CandlePanel, bounded_label_layout,
+                              required_label_pad)
 
 _F_TITLE = ('Segoe UI', 17, 'bold')
 _F_STAT  = ('Segoe UI', 13)
@@ -35,6 +41,7 @@ _F_INFO  = ('Segoe UI', 12)
 _F_AXIS  = ('Segoe UI', 10)
 _F_REF   = ('Segoe UI', 11, 'bold')
 _F_LOG   = ('Consolas', 11)
+_F_LOG_B = ('Consolas', 11, 'bold')
 
 _CLR = {
     'tier1': '#007700',
@@ -50,15 +57,95 @@ _CLR = {
     'zone':  '#F0F7F0',
     'state_dep': '#0033AA',
 }
-_KIND_CLR = {'LOAD': '#E08000', 'CHASE': '#7E3FBF', 'SELL': '#007700',
-             'HOLD': '#555555'}
+_KIND_CLR = {'LOAD': '#E08000', 'CHASE': '#7E3FBF', 'SELL': '#007700'}
 
 _PHASE_TXT = {'REGULAR': ('OPEN (regular)', '#007700'),
               'PRE':     ('pre-market', '#B8860B'),
               'AFTER':   ('after-market', '#B8860B'),
               'CLOSED':  ('CLOSED', '#888888')}
 _LIVE_BG = '#CC0000'
-_TOGGLE_ON_BG = '#3366CC'
+_NO_ARMY_CLR = '#999999'      # muted buy line when the army can't fund it
+_GEAR_TEXT_CLR = {
+    1: '#C62828',     # red
+    2: '#A64B00',     # orange
+    3: '#806800',     # readable dark yellow
+    4: '#18733C',     # green
+    5: '#1565C0',     # blue
+}
+_GEAR_FALLBACK_CLR = '#795548'
+_CAMPAIGN_STATE_CLR = {
+    'DEPLOYED': '#1565C0',
+    'EMPTY': '#A64B00',
+    'ARMING': '#666666',
+}
+
+
+def gear_text_color(gear):
+    """Readable red→orange→yellow→green→blue identity for G1→G5."""
+    try:
+        gear = int(gear)
+    except (TypeError, ValueError):
+        return _GEAR_FALLBACK_CLR
+    return _GEAR_TEXT_CLR.get(gear, _GEAR_FALLBACK_CLR)
+
+
+def campaign_status_text(ui, currency):
+    """Current read-only watcher snapshot shown above the real fill list.
+
+    This is presentation only: it never becomes a campaign event and never
+    touches persisted watcher state.
+    """
+    ui = ui or {}
+    state = ui.get('state') or 'ARMING'
+    mode = ui.get('mode') or 'WATCH'
+    lines = ui.get('lines') or {}
+    shares = int(ui.get('shares') or 0)
+    avg = float(ui.get('avg_cost') or 0)
+    price = ui.get('price')
+    parts = [f'CURRENT — {state} · {mode}']
+
+    if state == 'DEPLOYED' or shares > 0:
+        parts.append(f'Holding: {shares:,} sh @ '
+                     f'{fmt_price(avg, currency)} avg')
+        if price:
+            parts.append(f'Now: {fmt_price(price, currency)}')
+        if lines.get('chase'):
+            p, q = lines['chase']
+            tail = '  [NO ARMY]' if ui.get('buy_state') == 'EXHAUSTED' else ''
+            parts.append(f'Next BUY: {q:,} @ {fmt_price(p, currency)}{tail}')
+        sells = []
+        for key in ('tier1', 'tier2', 'tier3'):
+            if lines.get(key):
+                p, q = lines[key]
+                sells.append(f'T{key[-1]} {q:,}@{fmt_price(p, currency)}')
+        if sells:
+            parts.append('Next SELL: ' + '  '.join(sells))
+    elif state == 'EMPTY':
+        parts.append('Holding: no position (0 sh)')
+        if price:
+            parts.append(f'Now: {fmt_price(price, currency)}')
+        if ui.get('anchor'):
+            source = ('same-day re-bait' if ui.get('anchor_source') == 'sell'
+                      else 'previous close')
+            parts.append(f"Vantage: {fmt_price(ui['anchor'], currency)} "
+                         f'({source})')
+        if lines.get('load'):
+            p, q = lines['load']
+            tail = '  [NO ARMY]' if ui.get('buy_state') == 'EXHAUSTED' else ''
+            parts.append(f'Next LOAD: {q:,} @ {fmt_price(p, currency)}{tail}')
+        if lines.get('psell'):
+            p, q = lines['psell']
+            parts.append(f'After LOAD, first SELL: {q:,} @ '
+                         f'{fmt_price(p, currency)}')
+    else:
+        parts.append('Waiting for the first broker snapshot…')
+
+    orders = ui.get('orders') or []
+    if orders:
+        sides = sorted({o.get('side') for o in orders if o.get('side')})
+        if sides:
+            parts.append('Resting on Toss: ' + '/'.join(sides))
+    return '\n'.join(parts)
 
 
 class AutopilotWindow:
@@ -75,9 +162,12 @@ class AutopilotWindow:
         name = STOCK_NAMES.get(ticker, ticker)
         self.win.title(f'{name} — Autopilot')
         self.win.geometry('1620x720')
-        self.win.minsize(900, 500)
+        # All three panels are always present.  Keep enough room for a useful
+        # live plot beside the fixed status and five-day panels.
+        self.win.minsize(1280, 560)
+        self._ref_font = tkfont.Font(root=self.win, font=_F_REF)
 
-        # ── Header: title/state left, LIVE + 5D toggle right ─────────────────
+        # ── Header: title/state left, market phase + LIVE right ──────────────
         head = tk.Frame(self.win, padx=12, pady=8)
         head.pack(fill='x')
         tk.Label(head, text=f'{name}  — Autopilot', font=_F_TITLE
@@ -89,9 +179,6 @@ class AutopilotWindow:
                                    command=self._on_live)
         self._live_btn.pack(side='right', padx=(6, 0))
         self._default_bg = self._live_btn.cget('bg')
-        self._candle_btn = tk.Button(head, text='5D chart', font=_F_BTN,
-                                     width=9, command=self._toggle_candles)
-        self._candle_btn.pack(side='right', padx=(6, 6))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
@@ -113,7 +200,7 @@ class AutopilotWindow:
         trig = tk.Frame(self.win, padx=12, pady=4)
         trig.pack(fill='x')
         self._trig_lbl = tk.Label(trig, text='no line crossed', font=_F_STAT,
-                                  fg='#888', width=44, anchor='w')
+                                  fg='#888', width=60, anchor='w')
         self._trig_lbl.pack(side='left')
         self._buy_btn = tk.Button(trig, text='Buy', font=_F_STAT, width=8,
                                   state='disabled',
@@ -130,7 +217,7 @@ class AutopilotWindow:
         self._fire_msg = tk.Label(trig, text='', font=_F_INFO, fg='#333')
         self._fire_msg.pack(side='left')
 
-        # ── Body: live chart | fills log | 5-day candle panel (toggle) ───────
+        # ── Body: live chart | fills log | always-visible 5-day panel ────────
         body = tk.Frame(self.win)
         body.pack(fill='both', expand=True, padx=12, pady=(6, 12))
 
@@ -140,15 +227,23 @@ class AutopilotWindow:
 
         side = tk.Frame(body)
         side.pack(side='left', fill='y', padx=(10, 0))
-        tk.Label(side, text='Campaign fills', font=_F_STAT).pack(anchor='w')
+        tk.Label(side, text='Campaign status & fills', font=_F_STAT
+                 ).pack(anchor='w')
+        self._campaign_status_lbl = tk.Label(
+            side, text='', width=36, font=_F_LOG, anchor='nw', justify='left',
+            wraplength=340, bg='#F5F5F5', relief='groove', bd=1,
+            padx=6, pady=5)
+        self._campaign_status_lbl.pack(fill='x', pady=(4, 4))
         self._log_txt = tk.Text(side, width=36, font=_F_LOG, state='disabled',
-                                bg='#FAFAFA', relief='groove', bd=1)
-        self._log_txt.pack(fill='y', expand=True, pady=(4, 0))
+                                wrap='word', bg='#FAFAFA', relief='groove', bd=1)
+        self._log_txt.pack(fill='y', expand=True)
         for kind, clr in _KIND_CLR.items():
             self._log_txt.tag_configure(kind, foreground=clr)
         self._log_txt.tag_configure('TIER', foreground='#007700')
+        self._log_txt.tag_configure('OTHER', foreground='#555555')
+        self._log_txt.tag_configure('HEADER', foreground='#333333',
+                                    font=_F_LOG_B)
 
-        self._candles_open = True
         self.candle_panel = CandlePanel(body, currency, width=470)
         self.candle_panel.pack(side='left', fill='both', padx=(10, 0))
 
@@ -169,21 +264,6 @@ class AutopilotWindow:
             self.ap['disable']()
 
     # ── Controls ──────────────────────────────────────────────────────────────
-
-    def _toggle_candles(self):
-        self._candles_open = not self._candles_open
-        if self._candles_open:
-            self.candle_panel.pack(side='left', fill='both', padx=(10, 0))
-            self._refresh_candles()
-        else:
-            self.candle_panel.pack_forget()
-        self._style_candle_btn()
-
-    def _style_candle_btn(self):
-        if self._candles_open:
-            self._candle_btn.config(bg=_TOGGLE_ON_BG, fg='white')
-        else:
-            self._candle_btn.config(bg=self._default_bg, fg='black')
 
     def _on_live(self):
         if self.ap['mode_of']() == 'LIVE':       # click again → back to WATCH
@@ -256,7 +336,6 @@ class AutopilotWindow:
         self._live_btn.config(
             bg=(_LIVE_BG if mode == 'LIVE' else self._default_bg),
             fg=('white' if mode == 'LIVE' else 'black'))
-        self._style_candle_btn()
 
         phase = ui.get('phase', 'CLOSED')
         txt, pclr = _PHASE_TXT.get(phase, (phase, '#888'))
@@ -264,16 +343,15 @@ class AutopilotWindow:
         self._phase_lbl.config(text=f'{mkt} market: {txt}', fg=pclr)
 
         self._gear_lbl.config(text=self._gear_text(ui),
-                              fg=('#880000' if ui.get('buy_state') == 'EXHAUSTED'
-                                  else '#4B0082'))
+                              fg=gear_text_color(ui.get('gear')))
         self._info_lbl.config(text=self._info_text(ui))
         self._status_lbl.config(
             text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}")
         self._update_trigger_row(ui)
-        self._fill_log(ui.get('events') or [])
+        self._update_campaign_status(ui)
+        self._fill_log(ui)
         self._draw()
-        if self._candles_open:
-            self._refresh_candles()
+        self._refresh_candles()
 
     def _gear_text(self, ui):
         g, pct = ui.get('gear'), ui.get('pct')
@@ -340,6 +418,10 @@ class AutopilotWindow:
                      f"{fmt_price(buy_t['price'], self.ccy)}"
                      + ('' if manual_ok else '   (LIVE fires it)'),
                 fg='#3366CC')
+        elif ui.get('trigger_note'):
+            # A line IS crossed but cannot be fired (e.g. no reserve army) —
+            # say exactly why the manual button is off.
+            self._trig_lbl.config(text=ui['trigger_note'], fg='#B8860B')
         elif ui.get('orders'):
             sides = {o.get('side') for o in ui['orders']}
             self._trig_lbl.config(
@@ -351,20 +433,29 @@ class AutopilotWindow:
     # ── Line labels shared by both charts ────────────────────────────────────
 
     def _line_labels(self, ui):
-        """[(key, label)] for every present line, top (sells) first."""
+        """[(key, label, color)] for every present line, top (sells) first.
+        An unfundable buy line stays visible but muted: ✕ … (no army)."""
         pct = ui.get('pct')
+        no_army = ui.get('buy_state') == 'EXHAUSTED'
         out = []
         for key in ('tier3', 'tier2', 'tier1'):
             if (ui.get('lines') or {}).get(key):
-                out.append((key, f'매도 T{key[-1]}'))
+                out.append((key, f'매도 T{key[-1]}', _CLR[key]))
         if (ui.get('lines') or {}).get('psell'):
-            out.append(('psell', 'SELL (pseudo)'))
+            out.append(('psell', 'SELL (pseudo)', _CLR['psell']))
         if (ui.get('lines') or {}).get('chase'):
-            name = f'-{pct}% 더블' if (pct or 0) >= 8 else f'-{pct}% BUY'
-            out.append(('chase', name))
+            name = f'-{pct}%' + (' x1.0' if pct == 8 else '') + ' BUY'
+            if no_army:
+                out.append(('chase', f'✕ {name} (no army)', _NO_ARMY_CLR))
+            else:
+                out.append(('chase', name, _CLR['chase']))
         if (ui.get('lines') or {}).get('load'):
             tag = ' 재입질' if ui.get('anchor_source') == 'sell' else ''
-            out.append(('load', f'-{pct}% LOAD{tag}'))
+            name = f'-{pct}% LOAD{tag}'
+            if no_army:
+                out.append(('load', f'✕ {name} (no army)', _NO_ARMY_CLR))
+            else:
+                out.append(('load', name, _CLR['load']))
         return out
 
     def _refresh_candles(self):
@@ -380,23 +471,38 @@ class AutopilotWindow:
                              'price': avg, 'color': _CLR['avg'],
                              'dash': (5, 4), 'width': 2})
             elif ui.get('anchor'):
-                refs.append({'label': f'V.P. {fmt_price(ui["anchor"], self.ccy)}',
+                refs.append({'label': f'Vantage {fmt_price(ui["anchor"], self.ccy)}',
                              'price': ui['anchor'], 'color': _CLR['anchor'],
                              'dash': (5, 4), 'width': 1.6})
-            for key, name in self._line_labels(ui):
+            for key, name, color in self._line_labels(ui):
                 p, q = lines[key]
                 refs.append({'label': f'{name} ×{q}', 'price': p,
-                             'color': _CLR[key], 'dash': (2, 4), 'width': 1.6})
+                             'color': color, 'dash': (2, 4), 'width': 1.6})
         self.candle_panel.update(ohlc=ohlc, ref_lines=refs,
                                  current=(ui or {}).get('price'))
 
-    def _fill_log(self, events):
+    def _update_campaign_status(self, ui):
+        state = ui.get('state') or 'ARMING'
+        self._campaign_status_lbl.config(
+            text=campaign_status_text(ui, self.ccy),
+            fg=_CAMPAIGN_STATE_CLR.get(state, '#666666'))
+
+    def _fill_log(self, ui):
+        events = ui.get('events') or []
+        state = ui.get('state') or 'ARMING'
         txt = self._log_txt
         txt.config(state='normal')
         txt.delete('1.0', 'end')
+        txt.insert('end', 'RECORDED FILLS\n', 'HEADER')
         if not events:
-            txt.insert('end', '(campaign log is empty —\n cleared after '
-                              'each full sell)\n')
+            if state == 'DEPLOYED':
+                txt.insert('end', '(no buy/sell changes recorded\n'
+                                  'since this watcher started)\n')
+            elif state == 'EMPTY':
+                txt.insert('end', '(no active campaign fills —\n'
+                                  'waiting for the next LOAD)\n')
+            else:
+                txt.insert('end', '(watcher is arming)\n')
         for e in events:
             price = e.get('price')
             p = fmt_price(price, self.ccy) if price else '--'
@@ -405,12 +511,28 @@ class AutopilotWindow:
             if e.get('avg'):
                 line += f" @ {fmt_price(e['avg'], self.ccy)}"
             kind = e['kind'] if e['kind'] in _KIND_CLR else (
-                'TIER' if e['kind'].startswith('T') else 'HOLD')
+                'TIER' if e['kind'].startswith('T') else 'OTHER')
             txt.insert('end', line + '\n', kind)
         txt.config(state='disabled')
         txt.see('end')
 
     # ── Live chart ────────────────────────────────────────────────────────────
+
+    def _live_reference_rows(self, ui, lines, deployed, avg, anchor):
+        """[(price, color, text, dash, width)] drawn on the live chart."""
+        rows = []
+        if deployed and avg > 0:
+            rows.append((avg, _CLR['avg'],
+                         f'AVG {fmt_price(avg, self.ccy)}', (5, 4), 1.6))
+        elif anchor:
+            rows.append((anchor, _CLR['anchor'],
+                         f'Vantage {fmt_price(anchor, self.ccy)}',
+                         (5, 4), 1.4))
+        for key, name, color in self._line_labels(ui):
+            p, q = lines[key]
+            rows.append((p, color,
+                         f'{name} {fmt_price(p, self.ccy)} ×{q}', None, 2.4))
+        return rows
 
     def _draw(self):
         c = self.canvas
@@ -444,7 +566,15 @@ class AutopilotWindow:
                           font=_F_STAT, fill='#888')
             return
 
-        left, right, top, bottom = 90, 185, 18, 32
+        ref_rows = self._live_reference_rows(
+            ui, lines, deployed, avg, anchor)
+        left, top, bottom = 90, 18, 32
+        wanted_right = required_label_pad(
+            [row[2] for row in ref_rows], self._ref_font.measure,
+            minimum=185, padding=16)
+        max_right = max(100, w - left - 80)
+        right = min(wanted_right, max_right)
+        narrow_labels = wanted_right > max_right
         cw, ch = w - left - right, h - top - bottom
         if cw < 60 or ch < 60:
             return
@@ -495,19 +625,18 @@ class AutopilotWindow:
             y = y_of(price)
             c.create_line(left, y, left + cw, y, fill=color,
                           width=width, dash=dash)
-            c.create_text(label_x, y, text=text, anchor='w',
-                          font=_F_REF, fill=color)
+            text_x, anchor, wrap_width = label_x, 'w', None
+            if narrow_labels:
+                text_x, anchor, wrap_width = bounded_label_layout(
+                    w, self._ref_font.measure(text))
+            options = {'text': text, 'anchor': anchor,
+                       'font': _F_REF, 'fill': color}
+            if wrap_width is not None:
+                options['width'] = wrap_width
+            c.create_text(text_x, y, **options)
 
-        if deployed and avg > 0:
-            ref(avg, _CLR['avg'], f'AVG {fmt_price(avg, self.ccy)}',
-                dash=(5, 4), width=1.6)
-        elif anchor:
-            ref(anchor, _CLR['anchor'],
-                f'V.P. {fmt_price(anchor, self.ccy)}', dash=(5, 4),
-                width=1.4)
-        for key, name in self._line_labels(ui):
-            p, q = lines[key]
-            ref(p, _CLR[key], f'{name} {fmt_price(p, self.ccy)} ×{q}')
+        for price, color, text, dash, width in ref_rows:
+            ref(price, color, text, dash=dash, width=width)
 
         if len(ticks) >= 2:
             pts = []

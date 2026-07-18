@@ -3,7 +3,7 @@
 Run:  python scripts/test_watcher.py     (no network, no tkinter)
 
 Covers the unified rules:
-  - gear table G1 -4%/+3% … G5 -8%/+7% (load = buy), -8% = 더블
+  - gear table G1 -4%/+3% … G5 -8%/+7% (load = buy), -8% ×1.0
   - volatility bands ≤8 / ≤12 / ≤16 / ≤20 / >20
   - heavy-unit minimum entry gear (1.2/1.6/2.0/2.5)
   - vantage-point load (prev close), same-day re-bait (exit −4%, G1 pin)
@@ -68,7 +68,10 @@ ok([AUTO_GEARS[g]['pct'] for g in range(1, 6)] == [4, 5, 6, 7, 8],
    'pcts G1..G5 = 4..8')
 ok(AUTO_GEARS[1]['tiers'] == (1, 3, 5) and AUTO_GEARS[5]['tiers'] == (5, 7, 9),
    'tiers G1 (1,3,5) … G5 (5,7,9)')
-ok(BUY_GEAR_INFO[8]['ratio'] == 1.0, '-8% ratio = 1 (더블)')
+ok(BUY_GEAR_INFO[8]['ratio'] == 1.0, '-8% ratio = x1.0')
+ok(BUY_GEAR_INFO[8]['label'] == '8% drop (x1.0)'
+   and BUY_GEAR_INFO[8]['frac'] == '1.0',
+   'G5 user-facing wording = 8% x1.0')
 ok(VOL_THRESHOLDS == (8.0, 12.0, 16.0, 20.0), 'vol cut points 8/12/16/20')
 for v, g in ((7.9, 1), (8.0, 1), (8.1, 2), (12.0, 2), (12.1, 3), (16.0, 3),
              (16.1, 4), (20.0, 4), (20.1, 5), (None, 1)):
@@ -157,11 +160,14 @@ ok(e.anchor == 99_500 and e.anchor_source == 'close',
    'day roll: re-bait dropped, vantage = prev close')
 ok(e.pct == 6, 'gear back to the card (G3)')
 
-# ── Engine: -8% doubling ─────────────────────────────────────────────────────
-print('— engine: G5 더블 —')
+# ── Engine: -8% ×1.0 ─────────────────────────────────────────────────────────
+print('— engine: G5 x1.0 —')
 e2 = WatcherEngine(T, trading_date=D1)
 e2.poll(snap(100_000, shares=10, avg=100_000, cfg=card(5)))
 ok(e2.lines['chase'] == (92_000, 10), '-8% chase buys the WHOLE position again')
+e2.poll(snap(91_900, shares=10, avg=100_000, cfg=card(5), can=False))
+ok(e2.trigger['BUY']['label'] == '-8% x1.0 chase (G5)',
+   'G5 crossed-line/order wording uses 8% x1.0')
 
 # ── Engine: two tiers, progress, and the gap-up case ─────────────────────────
 print('— engine: tier progress —')
@@ -191,20 +197,44 @@ p = places(acts)
 ok(p == [('place', 'SELL', 105_000, 10, '매도 T1+T2')],
    'gap-up through both tiers → ONE order, all shares, highest line', str(p))
 
-# ── Engine: army exhausted → buy off, sell watched ───────────────────────────
+# ── Engine: army exhausted → buy off, sell watched, NO popup ────────────────
 print('— engine: exhausted —')
 e5 = WatcherEngine(T, trading_date=D1)
 acts = e5.poll(snap(93_000, shares=10, avg=100_000, cfg=card(2), bp=50_000.0))
 ok(e5.buy_state == 'EXHAUSTED', 'unaffordable chase → EXHAUSTED')
-ok(any(a[0] == 'notify' for a in acts), 'announced once')
+ok(not any(a[0] == 'notify' for a in acts),
+   'NO popup — the graph shows the muted line instead')
 ok(not places(acts) and e5.trigger['BUY'] is None,
    'crossed buy line does NOT fire without army')
+ok(e5.trigger_note and 'no reserve army' in e5.trigger_note,
+   'trigger note explains why the manual buy is off', str(e5.trigger_note))
+ok('manual Buy button is off' in e5.trigger_note,
+   'crossed condition names the disabled manual Buy button')
+ok(len(e5.trigger_note) <= 60,
+   'BUY condition fits the trigger banner without clipping')
 ok(e5.lines.get('tier2'), 'sell line stays watched')
 acts = e5.poll(snap(93_000, shares=10, avg=100_000, cfg=card(2), bp=50_000.0))
-ok(not any(a[0] == 'notify' for a in acts), 'no repeat announcement')
+ok(not any(a[0] == 'notify' for a in acts), 'still no popup on later polls')
 acts = e5.poll(snap(104_100, shares=10, avg=100_000, cfg=card(2), bp=50_000.0))
 ok(places(acts) and places(acts)[0][1] == 'SELL',
    'the sell still fires while exhausted')
+
+# arming on an existing position logs only — no fill-list entry
+e5b = WatcherEngine(T, trading_date=D1)
+e5b.poll(snap(100_000, shares=10, avg=100_000, cfg=card(2)))
+ok(e5b.events == [], 'window (re)opening adds NO fill-list entry')
+
+# The same condition/message applies to an EMPTY stock whose LOAD is crossed.
+e5c = WatcherEngine(T, trading_date=D1)
+acts = e5c.poll(snap(94_900, cfg=card(2), bp=50_000.0,
+                     prev_close=100_000))
+ok(e5c.buy_state == 'EXHAUSTED' and e5c.trigger['BUY'] is None
+   and not places(acts) and not any(a[0] == 'notify' for a in acts),
+   'unaffordable crossed LOAD stays off without a popup')
+ok(e5c.trigger_note and 'manual Buy button is off' in e5c.trigger_note,
+   'LOAD condition names the disabled manual Buy button')
+ok(len(e5c.trigger_note) <= 60,
+   'LOAD condition fits the trigger banner without clipping')
 
 # ── Engine: exit first cancels our resting buy ───────────────────────────────
 print('— engine: exit first —')
@@ -250,5 +280,39 @@ e8 = WatcherEngine(T, saved=d)
 ok(e8.anchor == e7.anchor and e8.trading_date == D1
    and e8.tier_done == e7.tier_done,
    'anchor/date/tier progress survive a restart')
+
+# One-time migration: legacy window-open HOLD rows are not campaign fills.
+real_fill = {'ts': '07/18 09:10', 'kind': 'CHASE', 'qty': 5,
+             'price': 95_000, 'shares': 15, 'avg': 98_333}
+legacy_hold = {'ts': '07/18 09:00', 'kind': 'HOLD', 'qty': 10,
+               'price': 100_000, 'shares': 10, 'avg': 100_000}
+saved = dict(d)
+saved['events'] = [legacy_hold, real_fill]
+e11 = WatcherEngine(T, saved=saved)
+ok(e11.events == [real_fill] and e11.dirty,
+   'restore prunes legacy HOLD rows but keeps real fills')
+e11.poll(snap(100_000, shares=15, avg=98_333, cfg=card(2)))
+ok(e11.events == [real_fill],
+   'first unchanged poll after restore adds no campaign fill')
+
+# Campaign fills are driven only by observed share-count changes.
+e12 = WatcherEngine(T, trading_date=D1)
+e12.poll(snap(100_000, shares=10, avg=100_000, cfg=card(2)))
+e12.poll(snap(100_000, shares=10, avg=100_000, cfg=card(2)))
+ok(e12.events == [], 'unchanged holding produces no campaign fill')
+e12.poll(snap(100_000, shares=15, avg=98_000, cfg=card(2)))
+ok(len(e12.events) == 1 and e12.events[0]['kind'] == 'CHASE'
+   and e12.events[0]['qty'] == 5,
+   'observed share increase records exactly one CHASE fill')
+e12.poll(snap(100_000, shares=15, avg=98_000, cfg=card(2)))
+ok(len(e12.events) == 1,
+   'unchanged poll after a buy does not duplicate the fill')
+e12.poll(snap(100_000, shares=12, avg=98_000, cfg=card(2)))
+ok(len(e12.events) == 2 and e12.events[-1]['kind'] == 'SELL'
+   and e12.events[-1]['qty'] == -3,
+   'observed partial share decrease records exactly one SELL fill')
+e12.poll(snap(100_000, shares=12, avg=98_000, cfg=card(2)))
+ok(len(e12.events) == 2,
+   'unchanged poll after a sell does not duplicate the fill')
 
 print(f'\nALL {passed} CHECKS PASSED')

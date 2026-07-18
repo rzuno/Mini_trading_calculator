@@ -1,9 +1,10 @@
 # Daily V-Commandos Autopilot Manual
 
-PART I  — Daily 443 (v001-v003): the original fixed-ratio system and the
-          watcher-model addenda (§30). Kept for history; the fixed 443/352
-          constants and pedals are SUPERSEDED by PART II.
-PART II — Adaptive Gear Autopilot (v004): the current specification.
+PART I   — Daily 443 (v001-v003): historical fixed-ratio system and watcher
+           addenda (§30). Superseded; kept for decision history.
+PART II  — Adaptive Gear Autopilot (v004): historical deployment-based gears.
+           Superseded; kept for decision history.
+PART III — Unified Card-Line Autopilot (v005): CURRENT specification.
 
 ---
 
@@ -1017,12 +1018,10 @@ STOP. Clicking it opens the Daily 443 window. The 5-day graph is back
 to the pure 5D bait system (no autopilot overlay); the bait-hit title
 tag is gone too (trigger state shows as ladder-number colors only).
 
-The campaign fill log is campaign-scoped: it records every buy
-(date/time, quantity, actual price backed out of the broker avg) from
-the LOAD on, seeds a HOLD line when armed onto an existing position,
-survives day rollovers, and is cleared the moment the position is
-fully sold. External (app/web) fills appear in it too while the
-watcher is on.
+Historical v003 campaign behavior seeded a HOLD line when armed onto an
+existing position. That behavior is superseded by PART III: current builds
+record broker-observed buy/sell changes only and never create a campaign fill
+merely because the window opened.
 
 No cap on watched stocks anymore (§18's max-2 is retired) — selection
 is the user's self-rule; empty cards now sort by 5-day volatility to
@@ -1045,7 +1044,7 @@ the gears are now chosen automatically from the deployment ratio.)
 
 ---
 
-# PART II — Adaptive Gear Autopilot (v004, 2026-07-10)
+# PART II — Adaptive Gear Autopilot (v004, 2026-07-10; HISTORICAL)
 
 ## II.1 Purpose
 
@@ -1218,3 +1217,264 @@ Use meaningful remaining reserves when possible.
 Never consume the final 0.5-unit safety reserve.
 Exit the entire position and redeploy quickly.
 ```
+
+---
+
+# PART III — Unified Card-Line Autopilot (v005, 2026-07-18; CURRENT)
+
+## III.1 Authority and purpose
+
+PART III is the current operating specification. Where PART I or PART II
+disagrees with this part, PART III wins.
+
+There is now one strategy calculation for both the stock card and Autopilot.
+The card resolves the gear, buy percentage, and active sell tiers, then sends
+that exact configuration to the watcher. Autopilot does not maintain a second
+443/352 pedal or an independent B1/B2/B3 deployment model.
+
+```text
+what the card shows = what Autopilot watches
+```
+
+The watcher does not predict, shift gears by itself, pre-place a ladder, or
+invent an extra recovery strategy. After an actual fill changes the broker
+holding, all lines are recalculated from the new shares and average cost.
+
+## III.2 Unified G1-G5 gear table
+
+One gear controls both an EMPTY stock's LOAD drop from the vantage point and a
+DEPLOYED stock's next BUY drop from average cost.
+
+```text
+Gear  Drop       Next-buy size             AUTO/default sell-tier bundle
+G1    -4%        current shares × 1/2       +1% / +3% / +5%
+G2    -5%        current shares × 2/3       +2% / +4% / +6%
+G3    -6%        current shares × 3/4       +3% / +5% / +7%
+G4    -7%        current shares × 4/5       +4% / +6% / +8%
+G5    -8%        current shares × 1.0       +5% / +7% / +9%
+```
+
+The G5 wording is `-8% ×1.0`; the older nickname is retired. `×1.0` means that
+the next buy quantity equals the current share count.
+
+Buy quantities use half-up integer rounding with a minimum of one share. LOAD
+uses the integer closest to one unit of cash, also with a one-share minimum.
+BUY limit prices are trimmed down to an orderable tick/cent; SELL limit prices
+are trimmed up.
+
+In AUTO, five-day volatility selects the base gear:
+
+```text
+V <= 8%               -> G1
+8%  < V <= 12%        -> G2
+12% < V <= 16%        -> G3
+16% < V <= 20%        -> G4
+V > 20%               -> G5
+unknown V              -> G1
+```
+
+For an EMPTY stock only, an expensive single share can impose a deeper minimum
+entry gear:
+
+```text
+one share <= 1.2 units -> G1 is allowed
+one share >  1.2 units -> at least G2
+one share >  1.6 units -> at least G3
+one share >  2.0 units -> at least G4
+one share >  2.5 units -> G5
+```
+
+The effective entry gear is the deeper of the volatility gear and this
+single-share minimum. Once the stock is deployed, it follows the card's normal
+gear. MANUAL mode uses the selected G1-G5 LOAD/BUY gear, while each sell-tier
+percentage and on/off toggle remains independently editable. Autopilot follows
+those manual tier values exactly as shown on the card.
+
+## III.3 Vantage, LOAD, BUY, and SELL lines
+
+EMPTY:
+
+```text
+normal vantage       = previous completed session close
+LOAD                 = vantage × (1 - gear drop)
+LOAD quantity        = about one unit, half-up, minimum one share
+informational SELL   = the first active sell tier as if LOAD had filled
+```
+
+After a full same-day exit, the recorded sell price becomes the temporary
+vantage. The re-bait is always G1 (`sell price -4%`) for the rest of that
+session, regardless of the card's normal gear. If it fills, the new campaign
+remains pinned to G1 until its next full exit. An unfilled re-bait expires at
+the trading-day rollover; the normal previous-close vantage then returns.
+
+DEPLOYED:
+
+```text
+next BUY line        = broker average cost × (1 - gear drop)
+next BUY quantity    = current shares × the gear ratio
+SELL line per tier   = broker average cost × (1 + active tier percent)
+```
+
+Only active, not-yet-completed sell tiers are watched. The held shares are
+split across those active tiers, with any integer remainder assigned to the
+middle tier first, then the low tier, then the high tier. By default only T2 is
+active, so T2 is a full-position exit. A BUY fill restarts tier progress for
+the newly enlarged holding. If price crosses several sell tiers in one gap,
+the covered quantities are combined into one SELL at the highest crossed line.
+SELL has decision priority over BUY.
+
+## III.4 WATCH and LIVE
+
+Opening a stock's Autopilot window starts a new watcher in WATCH mode, or
+reuses that stock's existing WATCH/LIVE mode if it is already running. There
+is no DRY mode or strategy toggle in the current window.
+
+```text
+WATCH  Polls price, holdings, orders, and buying power every 10 seconds.
+       Places no automatic order. A crossed, fireable line enables the exact
+       manual Buy or Sell button for that line.
+
+LIVE   Fires the same line automatically when crossed. LIVE is available only
+       in regular market hours and falls back to WATCH when regular hours end.
+```
+
+Nothing is pre-placed merely because the window opened. While an order already
+rests on one side, the same-side trigger and manual button stay off to prevent
+a duplicate order. In LIVE, when an exit crosses, the watcher cancels only its
+own resting BUY before placing SELL; it never automatically cancels an outside
+app/web order.
+
+Closing a WATCH window stops that stock's polling. Closing a LIVE window leaves
+LIVE running in the background, which remains visible through the card-button
+color.
+
+## III.5 Autopilot window and charts
+
+The Autopilot window always shows all three working areas:
+
+```text
+left     live intraday tick chart and current strategy lines
+middle   live current-status snapshot and recorded Campaign fills
+right    five-day candle chart, V value, and the same strategy lines
+```
+
+The five-day chart is visible by default and cannot be hidden. The old
+`5D chart` show/hide button has been removed. Both the live chart and the
+five-day chart update their reference lines from the same watcher state.
+Vantage lines are written as `Vantage`, not the abbreviated `V.P.`.
+
+Right-side chart space is measured from the complete reference labels instead
+of using one fixed margin. Long labels such as `SELL (pseudo)`, BUY quantities,
+and `(no army)` therefore remain visible. The window keeps a practical minimum
+width for its three always-visible panels. If a label still exceeds a narrowed
+canvas, it anchors or wraps inside the canvas instead of being clipped.
+
+The current gear-summary line has a fixed visual identity:
+
+```text
+G1 red    G2 orange    G3 yellow    G4 green    G5 blue
+```
+
+The information/condition banner keeps its existing informational/condition
+color, separate from the gear palette. The large Autopilot button on each
+stock card sits one heading-line lower so it aligns with the gear controls
+instead of their titles.
+
+Each five-day OHLC text row uses the same direction color as its candle body:
+red when `close >= open`, blue when `close < open`. This restores the coloring
+used by the earlier standalone five-day chart.
+
+## III.6 Reserve / no-army behavior
+
+Before enabling a manual LOAD/BUY trigger or firing it in LIVE, the watcher
+compares the required order value with Toss buying power. When Toss supplies a
+numeric buying-power value and the next buy cannot be funded:
+
+```text
+BUY state becomes EXHAUSTED;
+no opening-window warning popup is shown;
+the unavailable LOAD/BUY line remains on both charts in muted gray;
+its label begins with `✕` and says `(no army)`;
+the manual Buy button stays disabled;
+SELL lines remain active and continue to be watched;
+the watcher resumes buying automatically when buying power is sufficient.
+```
+
+The transition is written once per EXHAUSTED episode in the current watcher
+session. It is not announced with a popup every time the window opens. This
+quiet pre-check is different from an actual order request that Toss rejects
+for insufficient buying power: a real broker rejection can still produce a
+warning because it means account state changed between the pre-check and the
+send.
+
+When an unavailable line has not been crossed, the manual trigger row may
+correctly say `no line crossed`; the muted chart line still shows that the
+future buy is unavailable. When it has been crossed, the manual trigger row
+must not say `no line crossed`. It says:
+
+```text
+BUY:  BUY crossed — no reserve army; manual Buy button is off
+
+LOAD: LOAD crossed — no reserve army; manual Buy button is off
+```
+
+The status line above gives the full condition (`BUY line crossed, but no
+reserve army remains — watching SELL only`). The trigger row specifically
+explains the state of the manual Buy/Sell controls.
+
+## III.7 Campaign fills
+
+The middle panel is `Campaign status & fills`. Its top block is a live,
+display-only CURRENT snapshot and is not a campaign event:
+
+```text
+DEPLOYED  shows held shares, average, current price, next BUY, and SELL tiers.
+EMPTY     shows zero shares, Vantage/source, next LOAD, and pseudo first SELL.
+ARMING    says that the first broker snapshot is still pending.
+```
+
+The snapshot is rebuilt from the latest UI state on every poll. It is never
+appended to `events`, never marks the engine dirty, and is never stored in
+`data/autopilot_state.json`. Consequently it can show that an existing position
+is deployed without reviving the old window-open `HOLD` bug.
+
+Below CURRENT, `RECORDED FILLS` contains only actual campaign changes. An empty
+deployed log says that no buy/sell change has been observed since this watcher
+started; an empty-stock log says that there are no active campaign fills and it
+is waiting for the next LOAD. The two states no longer show the same generic
+“campaign log is empty” message.
+
+`Campaign fills` records actual broker-observed holding changes while the
+watcher is running:
+
+```text
+0 shares -> positive shares       LOAD
+shares increase above zero        CHASE
+shares decrease but remain > 0    SELL or completed tier(s)
+unchanged shares                  no fill entry
+opening/reopening the window      no fill entry
+```
+
+Opening on an existing position establishes the current holding as the
+observation baseline. It may write an informational line to the file log, but
+it does not add a `HOLD` row to Campaign fills. Therefore repeated window opens
+do not manufacture fills. Changes that occur while WATCH is stopped are not
+reconstructed as fills when the window later opens; the current broker holding
+becomes the new baseline.
+
+Real fill rows and campaign state persist across restarts. Legacy synthetic
+`HOLD` rows from older versions are removed automatically when that stock's
+saved watcher state is restored; real LOAD, CHASE, SELL, and tier rows are
+preserved. A full exit closes the campaign and clears the campaign-scoped list,
+while the file log retains the closure record.
+
+## III.8 Failure policy and persistence
+
+Missing/stale market or account data skips the whole decision cycle. No order
+is placed or cancelled from incomplete data; the watcher retries on the next
+poll. After roughly six consecutive bad polls, a one-time data warning is
+allowed, and normal operation resumes automatically when data returns.
+
+The vantage, trading date, same-day G1 pin, sell-tier progress, chase count,
+and real campaign fills persist in `data/autopilot_state.json`. Actual Toss
+holdings remain the position source of truth.

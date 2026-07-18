@@ -76,13 +76,13 @@ def normalize_load_pct(value) -> int:
 BUY_GEAR_PCTS = [4, 5, 6, 7, 8]
 
 # Rescue buy size as a fraction of current shares. Deeper bait buys more;
-# -8% buys the WHOLE position again (묻고 더블로 가 — share-count doubling).
+# -8% buys the WHOLE position again (x1.0 — share-count doubling).
 BUY_GEAR_INFO = {
-    4: {'label': '4% drop (1/2)',    'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
-    5: {'label': '5% drop (2/3)',    'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
-    6: {'label': '6% drop (3/4)',    'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
-    7: {'label': '7% drop (4/5)',    'frac': '4/5', 'ratio': 4 / 5, 'color': '#5583A7'},
-    8: {'label': '8% drop (double)', 'frac': '더블', 'ratio': 1.0,   'color': '#44769C'},
+    4: {'label': '4% drop (1/2)',  'frac': '1/2', 'ratio': 1 / 2, 'color': '#B0C4DE'},
+    5: {'label': '5% drop (2/3)',  'frac': '2/3', 'ratio': 2 / 3, 'color': '#88AAC8'},
+    6: {'label': '6% drop (3/4)',  'frac': '3/4', 'ratio': 3 / 4, 'color': '#6690B2'},
+    7: {'label': '7% drop (4/5)',  'frac': '4/5', 'ratio': 4 / 5, 'color': '#5583A7'},
+    8: {'label': '8% drop (x1.0)', 'frac': '1.0', 'ratio': 1.0,   'color': '#44769C'},
 }
 BUY_GEAR_LABELS = [BUY_GEAR_INFO[p]['label'] for p in BUY_GEAR_PCTS]
 BUY_LABEL_TO_PCT = {v['label']: k for k, v in BUY_GEAR_INFO.items()}
@@ -198,7 +198,7 @@ def fx_dev_color(pct: float) -> str:
 
 # ── Auto gear (5-day-volatility-driven gear selection) ───────────────────────
 # One gear bundles the unified drop % (load AND chase) and the three sell-tier
-# percentages. The bait ladder sizes come from BUY_GEAR_INFO (…, -8% = double).
+# percentages. The bait ladder sizes come from BUY_GEAR_INFO (…, -8% ×1.0).
 AUTO_GEARS = {
     1: {'pct': 4, 'tiers': (1, 3, 5)},
     2: {'pct': 5, 'tiers': (2, 4, 6)},
