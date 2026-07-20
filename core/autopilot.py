@@ -33,9 +33,11 @@ Rules that make it run unattended:
     * Partial fills self-heal: the level does not advance, so the next
       touch of the same line re-orders exactly the remainder
       (delta = target − actual).
-    * Opening gap ≥ first offset: compressed one-level init — the opening
-      price BECOMES level ∓1, the anchor is back-computed from it, and only
-      the minimum weight-1 action trades (skipped levels are never chased).
+    * Opening gap ≥ first offset: compressed one-level init — the ANCHOR
+      IS the opening price itself, labeled L∓1 (A); every level is spaced
+      3%-of-the-open from there, and only the minimum weight-1 action
+      trades (skipped levels are never chased). On a normal day the anchor
+      is the previous close, labeled L+0 (A).
     * Daily rebase: each new trading date starts a fresh adventure — new
       anchor (previous regular close), base inventory = actual shares,
       unit re-sized, level 0, day log cleared. P&L history lives in the
@@ -53,7 +55,7 @@ from datetime import datetime
 
 from core.calc import trim_buy_price, trim_sell_price, round_half_up
 
-POLL_SECONDS = 10        # watcher tick
+POLL_SECONDS = 5         # watcher tick (4 light reads per watched ticker)
 
 # ── Grid configuration (v0.2 defaults — edit here, then restart the bot) ────
 GRID_STEP_PCT = 0.03             # arithmetic level spacing (3% of anchor)
@@ -74,10 +76,10 @@ _CROSS_EPS = 1e-9        # relative tolerance so an exact touch of a level
                          # (e.g. 103 vs 100×1.03) counts as crossed despite
                          # binary floating-point noise
 
-_SAVE_FIELDS = ('trading_date', 'anchor', 'reference_close', 'opening_price',
-                'gap_mode', 'gap_pending', 'base_inventory', 'unit_qty',
-                'current_level', 'grid_ready', 'events', 'buy_value',
-                'sell_value', 'fills')
+_SAVE_FIELDS = ('trading_date', 'anchor', 'anchor_level', 'reference_close',
+                'opening_price', 'gap_mode', 'gap_pending', 'base_inventory',
+                'unit_qty', 'current_level', 'grid_ready', 'events',
+                'buy_value', 'sell_value', 'fills')
 
 
 def grid_offsets(cap=LEVEL_CAP, step=GRID_STEP_PCT):
@@ -91,13 +93,17 @@ def cum_weight(n, weights=GRID_WEIGHTS):
     return sum(weights[:n])
 
 
-def level_raw_price(anchor, level, cap=LEVEL_CAP, step=GRID_STEP_PCT):
+def level_raw_price(anchor, level, anchor_level=0, step=GRID_STEP_PCT):
     """Untrimmed grid price for a level (crossings compare against this;
-    orders are tick-trimmed per side at order time)."""
-    if level == 0:
-        return anchor
-    off = grid_offsets(cap, step)[abs(level) - 1]
-    return anchor * (1 + off) if level > 0 else anchor * (1 - off)
+    orders are tick-trimmed per side at order time).
+
+    The ANCHOR is the price that sits at `anchor_level`: the previous
+    close at L0 on a normal day, or the opening price itself at L∓1 on a
+    compressed-gap day. Every level is `step`-of-the-anchor away from it:
+
+        price(k) = anchor × (1 + step × (k − anchor_level))
+    """
+    return anchor * (1 + step * (level - anchor_level))
 
 
 def target_inventory(level, base, unit_qty,
@@ -144,7 +150,9 @@ class GridEngine:
         self.trading_date = trading_date
 
         # ── Adventure (per-day session) state ────────────────────────────
-        self.anchor = None            # fixed grid center for the day
+        self.anchor = None            # THE anchor price: prev close (L0) or
+                                      # the opening price itself (gap, L∓1)
+        self.anchor_level = 0         # the level the anchor sits at
         self.reference_close = None   # previous regular close
         self.opening_price = None     # first regular quote the bot saw
         self.gap_mode = 'NONE'        # 'NONE' | 'DOWN' | 'UP'
@@ -212,7 +220,8 @@ class GridEngine:
         # Round away binary float noise (100×1.03 = 103.000…01) BEFORE any
         # tick trim, so an exact touch crosses and the ceil/floor trims
         # don't drift a cent off the strategy line.
-        return round(level_raw_price(self.anchor, level), 6)
+        return round(level_raw_price(self.anchor, level, self.anchor_level),
+                     6)
 
     def _target(self, level):
         return target_inventory(level, self.base_inventory, self.unit_qty)
@@ -255,6 +264,7 @@ class GridEngine:
                       f'(net {self._fp(net)}), end level '
                       f'{self.current_level:+d}')
         self.anchor = None
+        self.anchor_level = 0
         self.reference_close = None
         self.opening_price = None
         self.gap_mode = 'NONE'
@@ -364,20 +374,26 @@ class GridEngine:
             return False
 
         # First regular quote of the day → fix the coordinate system.
+        # Normal day: the anchor IS the previous close, sitting at L0.
+        # Gap day (open beyond ±3% of it): the anchor IS the opening price
+        # itself, sitting at L∓1 — every level is 3%-of-the-open away.
         self.opening_price = price
         gap = price / ref - 1.0
         if gap <= -GAP_THRESHOLD:
-            self.anchor = price / (1 - grid_offsets()[0])
+            self.anchor = price
+            self.anchor_level = -1
             self.current_level = -1
             self.gap_mode = 'DOWN'
             self.gap_pending = True     # the minimum weight-1 BUY is due
         elif gap >= GAP_THRESHOLD:
-            self.anchor = price / (1 + grid_offsets()[0])
+            self.anchor = price
+            self.anchor_level = +1
             self.current_level = +1
             self.gap_mode = 'UP'
             self.gap_pending = True     # the minimum weight-1 SELL is due
         else:
             self.anchor = ref
+            self.anchor_level = 0
             self.current_level = 0
             self.gap_mode = 'NONE'
             self.gap_pending = False
@@ -386,21 +402,24 @@ class GridEngine:
         self.grid_ready = True
         self.dirty = True
         self._log(f'adventure {self.trading_date}: anchor '
-                  f'{self._fp(self.anchor)} ({self.gap_mode.lower()} gap '
-                  f'{gap * 100:+.2f}%), base {shares} sh, unit '
-                  f'{self.unit_qty} sh, level {self.current_level:+d}')
+                  f'{self._fp(self.anchor)} at L{self.anchor_level:+d} '
+                  f'({self.gap_mode.lower()} gap {gap * 100:+.2f}%), '
+                  f'base {shares} sh, unit {self.unit_qty} sh, '
+                  f'level {self.current_level:+d}')
         return True
 
     def _preview_grid(self, ref, shares, unit):
         """Display-only grid around the prev close before the open."""
         u = max(1, round_half_up(unit / ref)) if unit > 0 else 0
         self.grid = [{'level': k, 'price': level_raw_price(ref, k),
-                      'target': target_inventory(k, shares, u)}
+                      'target': target_inventory(k, shares, u),
+                      'anchor': k == 0}
                      for k in range(LEVEL_CAP, -LEVEL_CAP - 1, -1)]
 
     def _refresh_grid(self):
         self.grid = [{'level': k, 'price': self._raw(k),
-                      'target': self._target(k)}
+                      'target': self._target(k),
+                      'anchor': k == self.anchor_level}
                      for k in range(LEVEL_CAP, -LEVEL_CAP - 1, -1)]
 
     # ── Main decision cycle ───────────────────────────────────────────────────

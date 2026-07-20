@@ -1,7 +1,7 @@
 """Autopilot controller — the bridge between the pure Daily v^ grid engine
 (core/autopilot.py) and the running app.
 
-One background thread polls every watched stock every POLL_SECONDS (10 s),
+One background thread polls every watched stock every POLL_SECONDS (5 s),
 touching ONLY that ticker: price, holdings(symbol), open orders(symbol),
 buying power. The main panel stays refresh-button-driven; only the Autopilot
 window (and the card's button color) follow ticks.
@@ -578,6 +578,7 @@ class AutopilotController:
             'level': getattr(engine, 'current_level', 0),
             'grid_ready': getattr(engine, 'grid_ready', False),
             'anchor': engine.anchor if engine else None,
+            'anchor_level': getattr(engine, 'anchor_level', 0),
             'reference_close': getattr(engine, 'reference_close', None),
             'opening_price': getattr(engine, 'opening_price', None),
             'gap_mode': getattr(engine, 'gap_mode', 'NONE'),

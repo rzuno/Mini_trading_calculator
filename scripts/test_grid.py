@@ -24,8 +24,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.autopilot import (GridEngine, LEVEL_CAP, GRID_STEP_PCT,
-                            grid_offsets, cum_weight, level_raw_price,
-                            target_inventory)
+                            POLL_SECONDS, grid_offsets, cum_weight,
+                            level_raw_price, target_inventory)
 
 T = 'TEST'                 # USD-style ticker: cent trims keep prices exact
 D1, D2 = '2026-07-21', '2026-07-22'
@@ -100,7 +100,7 @@ def make_snap(price, broker, date=D1, prev_close=100.0, unit_cash=100.0,
 
 def settle(engine, broker, price, max_polls=40, **kw):
     """Poll at one price until nothing more happens (the watcher would do
-    the same over consecutive 10-second ticks). A resting unfilled limit —
+    the same over consecutive 5-second ticks). A resting unfilled limit —
     e.g. a KR BUY trimmed one tick below the raw line — is a valid steady
     state: the bot waits for the fill. Returns the placed acts."""
     placed = []
@@ -147,7 +147,12 @@ def near(a, b, eps=1e-6):
 ok(near(level_raw_price(100, 1), 103) and near(level_raw_price(100, -3), 91)
    and near(level_raw_price(100, 5), 115)
    and near(level_raw_price(100, -5), 85),
-   'level prices at anchor 100')
+   'level prices at anchor 100 (L0 anchor)')
+ok(near(level_raw_price(90, -1, anchor_level=-1), 90)
+   and near(level_raw_price(90, 0, anchor_level=-1), 92.7)
+   and near(level_raw_price(90, -2, anchor_level=-1), 87.3),
+   'gap grid: the OPEN is the anchor at L-1, steps = 3% of the open')
+ok(POLL_SECONDS == 5, 'watcher polls every 5 seconds')
 tg = [target_inventory(k, 10, 1) for k in range(-5, 6)]
 ok(tg == [25, 20, 16, 13, 11, 10, 9, 7, 4, 0, 0],
    'targets base 10 u1: -5→25 … +4/+5 clamp at 0', str(tg))
@@ -262,20 +267,28 @@ ok(len(placed) == 3 and [a[3] for a in placed] == [1, 2, 3],
    'a straight drop to L-3 steps one adjacent order at a time')
 ok(b.shares == 16 and e.current_level == -3, 'ends reconciled at L-3')
 
-# ── Opening gaps (compressed one-level) ─────────────────────────────────────
+# ── Opening gaps (compressed one-level; the OPEN is the anchor) ─────────────
 print('— opening gaps —')
 e, b = fresh()
 settle(e, b, 90.0)                           # first regular quote -10%
 ok(e.gap_mode == 'DOWN' and e.current_level == -1,
    'down gap: opening price becomes L-1')
-ok(abs(e.anchor - 90.0 / 0.97) < 1e-9, 'compressed anchor 90/0.97')
-ok(b.shares == 11, 'only the minimum weight-1 BUY (no catch-up)')
+ok(e.anchor == 90.0 and e.anchor_level == -1,
+   'the anchor IS the open (90.00 at L-1), not a back-computed point')
+grid = {g['level']: g for g in e.grid}
+ok(near(grid[0]['price'], 92.7) and near(grid[-2]['price'], 87.3)
+   and grid[-1]['anchor'] and not grid[0]['anchor'],
+   'gap grid levels hang off the open in 3%-of-open steps',
+   str({k: round(g['price'], 2) for k, g in grid.items()}))
+ok(b.shares == 11, 'only the minimum weight-1 BUY at the open (no catch-up)')
 
 e, b = fresh()
 settle(e, b, 110.0)
 ok(e.gap_mode == 'UP' and e.current_level == 1
-   and abs(e.anchor - 110.0 / 1.03) < 1e-9 and b.shares == 9,
-   'up gap: L+1, anchor 110/1.03, minimum SELL 1')
+   and e.anchor == 110.0 and e.anchor_level == 1 and b.shares == 9,
+   'up gap: the open 110.00 IS the anchor at L+1, minimum SELL 1')
+ok(near({g['level']: g for g in e.grid}[0]['price'], 106.7),
+   'up-gap L0 sits 3% of the open below it')
 
 e, b = fresh()
 settle(e, b, 98.0)

@@ -47,13 +47,13 @@ grid_type: ARITHMETIC_PERCENT_OF_ANCHOR
 grid_step: 0.03                    # offsets 3/6/9/12/15% of the anchor
 grid_weights: [1, 2, 3, 4, 5]      # linear; cumulative W = 1,3,6,10,15
 opening_gap_threshold: 0.03        # = the first offset
-session_anchor_source: PREVIOUS_REGULAR_CLOSE
+session_anchor_source: PREV_CLOSE_AT_L0_OR_GAP_OPEN_AT_L1   # see §5.1
 daily_rebase: true
 one_action_per_poll: true
 max_open_strategy_orders: 1
 pairing_mode: TARGET_INVENTORY
 insufficient_cash_policy: SKIP_UNTIL_ARMY_RETURNS   # see §7
-poll_interval_seconds: 10
+poll_interval_seconds: 5
 trade_session: REGULAR_ONLY
 ```
 
@@ -123,7 +123,7 @@ external trades self-healing.
 
 ## 5. The daily adventure lifecycle
 
-### 5.1 Initialization (every trading date)
+### 5.1 Initialization — WHAT THE ANCHOR IS
 
 ```text
 reference_close  = previous completed regular close (provider prev_close)
@@ -131,24 +131,40 @@ opening_price    = the FIRST regular-session quote the watcher sees
                    (arming mid-session: the first quote after arming)
 base_inventory   = actual broker shares at that moment
 unit_qty         = from unit_cash and the anchor, frozen for the day
-current_level    = 0                    (or ∓1 on a compressed gap open)
 ```
+
+The anchor is ONE concrete price, and it carries the **(A)** marker on
+its level line:
+
+```text
+normal day  (|open/close − 1| < 3%):
+    anchor = YESTERDAY'S CLOSE, sitting at L+0 (A); start level 0.
+
+gap day     (open ≥ 3% away from yesterday's close):
+    anchor = TODAY'S OPENING PRICE ITSELF, sitting at L-1 (A) on a
+    down gap or L+1 (A) on an up gap; the day starts there by trading
+    one unit (§5.2).
+```
+
+Every level is spaced 3%-OF-THE-ANCHOR from it:
+
+```text
+price(k) = anchor × (1 + 0.03 × (k − anchor_level))
+```
+
+So on a down-gap day with open 90: L-1 (A) = 90.00, L+0 = 92.70,
+L-2 = 87.30 — the grid hangs off the open, and nothing is interpolated
+between yesterday's close and today's open.
 
 Before the regular open the window shows a preview grid around the
 previous close (`WAIT_OPEN`); nothing trades.
 
 ### 5.2 Opening gap (compressed one-level)
 
-If `|opening/reference − 1| ≥ 3%`:
-
-```text
-down gap:  anchor = opening / 0.97,  current_level = -1
-up gap:    anchor = opening / 1.03,  current_level = +1
-```
-
-The opening price BECOMES level ∓1; skipped levels from the overnight move
-are NEVER executed. Only the minimum weight-1 action trades (BUY 1 unit /
-SELL 1 unit toward the ∓1 target):
+If `|opening/reference − 1| ≥ 3%`: the opening price becomes the anchor
+at L∓1 (A) as above; skipped levels from the overnight move are NEVER
+executed. Only the minimum weight-1 action trades (BUY 1 unit / SELL
+1 unit toward the ∓1 target, at the open price):
 
 * the gap action fires as a normal limit at the level line;
 * if the army cannot fund the gap BUY, it stays DUE and fires by itself
@@ -167,7 +183,7 @@ delta     = target(new_level) − actual_inventory
 delta<0 → SELL at the level line   delta>0 → BUY at the level line
 ```
 
-* **One action per poll** (10 s): a straight drop through several levels
+* **One action per poll** (5 s): a straight drop through several levels
   steps one adjacent order at a time, each fill confirmed before the next.
 * **Fill-confirmed advancement:** only a broker-confirmed inventory equal
   to the target advances `current_level`. Quote crossings and order
@@ -176,6 +192,10 @@ delta<0 → SELL at the level line   delta>0 → BUY at the level line
   BUY down — the bot never trades on the wrong side of its line. A KR BUY
   whose raw line falls between ticks rests one tick below and fills when
   that tick trades.
+* Because the order is sent AFTER the crossing is observed (up to one
+  poll late), the actual fill can differ slightly from the line — always
+  in our favor or equal: a BUY limit at the line fills at the line or
+  LOWER, a SELL limit fills at the line or HIGHER.
 
 ### 5.4 Repeated oscillation
 
@@ -262,13 +282,19 @@ The Autopilot window (card's big button → arms WATCH):
 
 ```text
 header   state (WATCHING / ORDER_PENDING / WAIT_OPEN) · market phase · LIVE
-line 2   anchor · gap · level · unit · base · today net (fills)
+line 2   anchor @ L∓n (A) · gap · level · unit · base · today net (fills)
 trigger  ▲/▼ crossed-level indicator · Buy · Sell · Cancel buttons
 left     live tick curve inside the grid: all 11 level lines (soft),
-         anchor + the two adjacent watch lines bold with their trades,
+         the anchor line labeled L+0 (A) — or L∓1 (A) on a gap day —
+         plus the two adjacent watch lines bold with their trades,
          corridor between the watch lines shaded
 right    adventure status snapshot · today's fill log · 5-day candle panel
 ```
+
+LIVE is hard-gated to the regular session: it cannot be switched on
+outside REGULAR hours, and an already-LIVE bot drops back to WATCH on the
+first poll after the session leaves REGULAR (pre-market, after-market,
+closed). Resting DAY orders die on Toss at the close.
 
 Cancel cancels ALL resting Toss orders on the ticker (ours or not).
 
@@ -276,7 +302,7 @@ Cancel cancels ALL resting Toss orders on the ticker (ours or not).
 
 ## 9. Toss integration (what one poll touches)
 
-Per 10-second cycle, ONLY the watched ticker: price quote, holdings
+Per 5-second cycle, ONLY the watched ticker: price quote, holdings
 (symbol), open orders (symbol), buying power. Broker truth: actual
 shares, sellable shares, cash, open orders, fills (share diffs ARE the
 fill detection). Local truth: anchor, levels, targets, intended

@@ -1,7 +1,7 @@
 """Autopilot window — the Daily v^ grid cockpit for one watched stock.
 
 Opened by the card's big Autopilot button. Opening it arms WATCH mode: the
-stock is polled every 10 s and this window follows every tick. The bot runs
+stock is polled every 5 s and this window follows every tick. The bot runs
 the Daily v^ Linear Weighted Grid (the DAILY ADVENTURE) — it does NOT use
 the card gear system; the cards stay the manual-trading aid.
 
@@ -104,9 +104,11 @@ def adventure_status_text(ui, currency):
 
     if ui.get('grid_ready'):
         gap = ui.get('gap_mode') or 'NONE'
-        gap_txt = '' if gap == 'NONE' else f'  ({gap.lower()} gap open)'
-        parts.append(f"Anchor: {fmt_price(ui.get('anchor'), currency)}"
-                     f'{gap_txt}')
+        a_lvl = ui.get('anchor_level') or 0
+        src = ('prev close' if gap == 'NONE'
+               else f'{gap.lower()}-gap OPEN')
+        parts.append(f"Anchor: {fmt_price(ui.get('anchor'), currency)} "
+                     f'= L{a_lvl:+d} (A), {src}')
         parts.append(f"Level: {ui.get('level', 0):+d}   "
                      f"Inventory: {shares:,} sh "
                      f"(base {ui.get('base_inventory', 0):,}, "
@@ -153,7 +155,7 @@ def adventure_status_text(ui, currency):
 
 class AutopilotWindow:
     """Live cockpit for one watched stock. Subscribes to the controller and
-    redraws on every 10-second tick."""
+    redraws on every 5-second tick."""
 
     def __init__(self, parent, ticker, currency, ap_ctx):
         self.ap = ap_ctx
@@ -364,9 +366,11 @@ class AutopilotWindow:
             return f'daily adventure — waiting for the regular open{tail}'
         gap = ui.get('gap_mode') or 'NONE'
         gap_txt = '' if gap == 'NONE' else f' · {gap.lower()} gap'
+        a_lvl = ui.get('anchor_level') or 0
         net = (ui.get('sell_value') or 0) - (ui.get('buy_value') or 0)
-        return (f"anchor {fmt_price(ui.get('anchor'), self.ccy)}{gap_txt}"
-                f" · L{ui.get('level', 0):+d}"
+        return (f"anchor {fmt_price(ui.get('anchor'), self.ccy)}"
+                f" @ L{a_lvl:+d} (A){gap_txt}"
+                f" · now L{ui.get('level', 0):+d}"
                 f" · unit {ui.get('unit_qty', 0)} sh"
                 f" · base {ui.get('base_inventory', 0)} sh"
                 f" · today net {fmt_price(net, self.ccy)}"
@@ -427,29 +431,36 @@ class AutopilotWindow:
     # ── Grid line rows shared by both charts ─────────────────────────────────
 
     def _grid_rows(self, ui):
-        """[(price, color, text, bold)] for every grid level. The adjacent
-        watch levels are bold and carry the trade they would fire; far
-        levels are soft; an unfundable down-line is muted (✕ … no army)."""
+        """[(price, color, text, bold)] for every grid level. The anchor
+        level carries the (A) marker — L+0 (A) on a normal day, L∓1 (A) on
+        a gap day where the OPEN is the anchor. Adjacent watch levels are
+        bold and carry the trade they would fire; far levels are soft; an
+        unfundable down-line is muted (✕ … no army)."""
         rows = []
         lvl = ui.get('level') or 0
+        a_lvl = ui.get('anchor_level') or 0
         no_army = ui.get('buy_state') == 'EXHAUSTED'
         up, dn = next_transitions(ui)
         for g in (ui.get('grid') or []):
             k, price, target = g['level'], g['price'], g['target']
+            is_anchor = bool(g.get('anchor', k == a_lvl))
             adj = None
             if up and k == up['level']:
                 adj = up
             elif dn and k == dn['level']:
                 adj = dn
-            if k == 0:
+            text = f'L{k:+d}'
+            if is_anchor:
+                text += ' (A)'
+            text += f' {fmt_price(price, self.ccy)}'
+            if is_anchor:
                 color = _CLR['anchor']
-                text = f'A {fmt_price(price, self.ccy)}'
             else:
-                color = (_CLR['up'] if k > 0 else _CLR['dn'])
-                soft = (_CLR['up_soft'] if k > 0 else _CLR['dn_soft'])
-                text = f'L{k:+d} {fmt_price(price, self.ccy)}'
+                # Side colors relative to the ANCHOR level, not zero.
+                color = (_CLR['up'] if k > a_lvl else _CLR['dn'])
                 if adj is None:
-                    color = soft
+                    color = (_CLR['up_soft'] if k > a_lvl
+                             else _CLR['dn_soft'])
             if adj is not None and adj['side'] != '—':
                 text += f"  {adj['side']} {adj['qty']}"
                 if adj['side'] == 'BUY' and no_army:
@@ -457,7 +468,7 @@ class AutopilotWindow:
                     text = f'✕ {text} (no army)'
             elif k == lvl:
                 text += '  ← here'
-            rows.append((price, color, text, adj is not None or k == 0))
+            rows.append((price, color, text, adj is not None or is_anchor))
         return rows
 
     def _refresh_candles(self):
@@ -466,7 +477,9 @@ class AutopilotWindow:
         refs = []
         if ui and ui.get('grid_ready'):
             up, dn = next_transitions(ui)
-            refs.append({'label': f"A {fmt_price(ui.get('anchor'), self.ccy)}",
+            a_lvl = ui.get('anchor_level') or 0
+            refs.append({'label': f"L{a_lvl:+d} (A) "
+                                  f"{fmt_price(ui.get('anchor'), self.ccy)}",
                          'price': ui.get('anchor'), 'color': _CLR['anchor'],
                          'dash': (5, 4), 'width': 2})
             no_army = ui.get('buy_state') == 'EXHAUSTED'

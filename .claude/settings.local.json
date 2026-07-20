@@ -22,7 +22,10 @@
       "Bash(python -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['gui/stock_row.py','gui/candle_chart.py','gui/main_window.py','core/calc.py']]; print\\('syntax OK'\\)\")",
       "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
       "Bash",
-      "PowerShell"
+      "PowerShell",
+      "Bash(\".venv/Scripts/python.exe\" scripts/test_grid.py)",
+      "Bash(\".venv/Scripts/python.exe\" scripts/test_autopilot_ui.py)",
+      "Bash(\".venv/Scripts/python.exe\" \"C:\\\\Users\\\\rzuno\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--py-Mini-trading-calculator\\\\7622f6f5-df81-4b14-aef6-8af15aef8fcb\\\\scratchpad\\\\smoke_grid_tk.py\")"
     ]
   }
 }
