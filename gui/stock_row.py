@@ -37,10 +37,11 @@ _AP_BUTTON_TOP_GAP = 18       # one heading-line below the gear-box titles
 class StockRow:
     """One unified stock card, used for both EMPTY and DEPLOYED stocks.
 
-    ONE gear system drives everything: a single drop percent (G1 -4% … G5
-    -8%) is both the LOAD trigger (below the VANTAGE point — prev session
-    close, or the same-day sell fill) and the chase/rescue trigger (below the
-    avg cost). The autopilot follows exactly these lines (``line_config``).
+    ONE gear system drives the card: a single drop percent (G1 -4% … G5
+    -8%) is both the LOAD trigger (below the VANTAGE point — the previous
+    session's close) and the chase/rescue trigger (below the avg cost).
+    The card is the MANUAL trading aid; the autopilot runs its own Daily v^
+    grid strategy and does not read the card.
 
     * DEPLOYED — the buy ladder is the rescue cascade from the real avg cost
       (Buy 1/2/3) and the sells are real.
@@ -670,20 +671,6 @@ class StockRow:
         bg = bg or self._ap_btn_default_bg
         self.ap_btn.config(text=text, bg=bg, fg=fg,
                            activebackground=bg, activeforeground=fg)
-
-    def line_config(self) -> dict:
-        """The gear numbers the autopilot must follow — exactly what this
-        card shows right now (one unified logic, the card is the source)."""
-        try:
-            tier_pcts = [int(self.t_pct[i].get()) for i in range(3)]
-        except (tk.TclError, ValueError):
-            tier_pcts = list(AUTO_GEARS[self._current_gear()]['tiers'])
-        return {
-            'gear': self._current_gear(),
-            'pct': self._get_pct(),
-            'tier_pcts': tier_pcts,
-            'tier_actives': [bool(self.t_active[i].get()) for i in range(3)],
-        }
 
     def current_shares(self) -> int:
         try:

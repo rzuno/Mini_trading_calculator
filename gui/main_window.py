@@ -604,24 +604,10 @@ class App:
 
     def _on_row_compute(self):
         """Called when any row recomputes (gear change, tier toggle, typed
-        input) — update army% and hand the fresh line config to the
-        autopilot, so the bot always follows what the cards show."""
+        input) — update army% across the cards. The cards are a manual
+        trading aid only; the autopilot runs its own grid strategy."""
         if self._fx_rate:
             self._update_army(self._fx_rate)
-        self._push_card_configs()
-
-    def _push_card_configs(self):
-        for row in self.deployed_rows + self.empty_rows:
-            self.autopilot.set_card_config(row.ticker, row.line_config())
-
-    def _vantage_for(self, ticker, d):
-        """(vantage, source) for a card: the autopilot's same-day sell fill
-        (재입질 — pins the load to G1 -4%) when one exists, otherwise the
-        previous completed session's close."""
-        sell = self.autopilot.sell_anchor(ticker)
-        if sell:
-            return sell, 'sell'
-        return d.get('prev_close'), 'close'
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 
@@ -767,15 +753,14 @@ class App:
             self._update_unit_usd()
 
         # Update every row through the one unified signature. The vantage
-        # point (prev close, or today's sell fill from the autopilot) anchors
-        # the empty cards' load lines.
+        # point (previous completed close) anchors the empty cards' load
+        # lines — the cards are the manual gear aid, independent of the bot.
         for row in self.deployed_rows + self.empty_rows:
             d = data.get(row.ticker, {})
-            vant, vsrc = self._vantage_for(row.ticker, d)
             row.update_live(
                 d.get('price'),
-                vantage=vant,
-                vantage_src=vsrc,
+                vantage=d.get('prev_close'),
+                vantage_src='close',
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
 
         for row in self.deployed_rows + self.empty_rows:
@@ -790,10 +775,8 @@ class App:
         self._update_banner()      # sets auto N before army% uses it
         self._update_army(fx_rate)
 
-        # Cards were rebuilt — re-apply autopilot badges, refresh cached
-        # units, and hand the fresh card configs to the watcher.
+        # Cards were rebuilt — re-apply autopilot badges + cached units.
         self.autopilot.on_rows_rebuilt()
-        self._push_card_configs()
 
         if not quiet:
             self.last_refresh_var.set(

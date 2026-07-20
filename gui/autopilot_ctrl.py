@@ -1,4 +1,4 @@
-"""Autopilot controller — the bridge between the pure line-watcher engine
+"""Autopilot controller — the bridge between the pure Daily v^ grid engine
 (core/autopilot.py) and the running app.
 
 One background thread polls every watched stock every POLL_SECONDS (10 s),
@@ -6,24 +6,24 @@ touching ONLY that ticker: price, holdings(symbol), open orders(symbol),
 buying power. The main panel stays refresh-button-driven; only the Autopilot
 window (and the card's button color) follow ticks.
 
-ONE strategy. The engine follows the lines the CARD computes: every card
-pushes its gear config (pct + tiers) into the controller on every compute,
-so whatever the commander sees on the card IS what the bot watches.
+ONE strategy: the Daily v^ Linear Weighted Grid (the daily adventure). The
+bot is fully self-contained — it does NOT read the card gear system; the
+cards remain the manual-trading aid.
 
 Modes per stock:
-    WATCH — lines + ticks + fill detection, NO orders from the bot. The
-            crossed line is exposed as a trigger; the window's Buy/Sell
+    WATCH — grid + ticks + fill detection, NO orders from the bot. A due
+            transition is exposed as a trigger; the window's Buy/Sell
             buttons can fire it manually (through this controller).
-    LIVE  — real Toss LIMIT/DAY orders, fired only when a line is touched.
-            Allowed only while the market is in REGULAR hours; when the
-            session ends, LIVE drops back to WATCH automatically.
+    LIVE  — real Toss LIMIT/DAY orders, fired only when a grid level is
+            crossed. Allowed only while the market is in REGULAR hours;
+            when the session ends, LIVE drops back to WATCH automatically.
 
 Error policy: a failed poll skips the whole cycle and retries; ~6 straight
 failures announce a data problem once. insufficient-buying-power announces
-once and backs off 5 min (the SELL stays managed — no hard stop);
+once and backs off 5 min (the SELL side stays managed — no hard stop);
 order-hours-closed backs off 5 min; opposite-pending retries next cycle.
 
-Engine state (vantage anchor, 재입질 pin, tier progress, fills) persists in
+Engine state (anchor, level, base inventory, day log) persists in
 data/autopilot_state.json so a restart re-arms exactly where it left off.
 """
 
@@ -37,7 +37,7 @@ from datetime import datetime, date, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-from core.autopilot import WatcherEngine, POLL_SECONDS
+from core.autopilot import GridEngine, POLL_SECONDS
 from core.calc import fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
@@ -148,17 +148,16 @@ class AutopilotController:
             if ticker in self._slots:
                 return True, 'already watching'
             self._slots[ticker] = {
-                'engine': None, 'mode': 'WATCH', 'card': None,
+                'engine': None, 'mode': 'WATCH',
                 'backoff_until': 0.0,
                 'prev_close': None, 'prev_close_date': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
-                       'status': 'arming…', 'lines': {}, 'mode': 'WATCH',
+                       'status': 'arming…', 'grid': [], 'mode': 'WATCH',
                        'price': None, 'phase': market_phase(ticker)},
             }
         self.refresh_units()
-        self._pull_card_config(ticker)      # UI thread: read the card now
         self._log(ticker, 'WATCH started')
         self._ensure_thread()
         self._wake.set()
@@ -202,35 +201,6 @@ class AutopilotController:
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
 
-    # ── Card config: the card IS the strategy (UI thread) ────────────────────
-
-    def set_card_config(self, ticker, cfg):
-        """The card pushes {'gear','pct','tier_pcts','tier_actives'} on every
-        compute. The poll thread reads it under the lock."""
-        slot = self._slots.get(ticker)
-        if not slot or not cfg:
-            return
-        with self._lock:
-            slot['card'] = dict(cfg)
-
-    def _pull_card_config(self, ticker):
-        row = self._find_row(ticker)
-        if row is not None:
-            try:
-                self.set_card_config(ticker, row.line_config())
-            except Exception:
-                pass
-
-    def sell_anchor(self, ticker):
-        """Today's sell-fill vantage (재입질) if the engine holds one and the
-        stock is empty — the card uses it to pin its load to G1 -4%."""
-        slot = self._slots.get(ticker)
-        e = slot.get('engine') if slot else None
-        if (e is not None and getattr(e, 'anchor_source', '') == 'sell'
-                and getattr(e, 'state', '') == 'EMPTY'):
-            return getattr(e, 'anchor', None)
-        return None
-
     # ── Manual fire / cancel (UI thread, from the Autopilot window) ──────────
 
     def manual_fire(self, ticker, side):
@@ -260,7 +230,8 @@ class AutopilotController:
                                    trig.get('label', side) + ' (manual)')
         if ok and engine is not None:
             engine.note_manual_order(side, trig['price'], trig['qty'],
-                                     tiers=trig.get('tiers'))
+                                     level=trig.get('level'),
+                                     target=trig.get('target'))
         self._wake.set()
         return ok, msg
 
@@ -332,12 +303,10 @@ class AutopilotController:
             row.set_autopilot(badge_key)
 
     def on_rows_rebuilt(self):
-        """Cards are recreated on every refresh — re-apply statuses, units and
-        card configs."""
+        """Cards are recreated on every refresh — re-apply statuses + units."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
             self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'))
-            self._pull_card_config(ticker)
 
     # ── Poll thread ───────────────────────────────────────────────────────────
 
@@ -489,15 +458,13 @@ class AutopilotController:
         snap['prev_close'] = self._prev_close(prov, ticker, slot)
         snap['can_trade'] = (mode == 'LIVE')
         snap['phase'] = market_phase(ticker)
-        with self._lock:
-            snap['card'] = dict(slot['card']) if slot['card'] else None
 
         if slot['engine'] is None:
-            slot['engine'] = WatcherEngine(
+            slot['engine'] = GridEngine(
                 ticker, trading_date=snap['trading_date'],
                 saved=self._store.get(ticker),
                 log=lambda m, t=ticker: self._log(t, m))
-            self._log(ticker, 'engine armed'
+            self._log(ticker, 'grid engine armed'
                               + (' (state restored)'
                                  if self._store.get(ticker) else ''))
         engine = slot['engine']
@@ -604,18 +571,22 @@ class AutopilotController:
             'ticker': ticker,
             'state': engine.state if engine else 'ARMING',
             'status': status or (engine.status if engine else 'arming…'),
-            'lines': dict(engine.lines) if engine else {},
             'trigger': dict(engine.trigger) if engine else {},
             'trigger_note': getattr(engine, 'trigger_note', None),
+            # Grid (daily adventure) exposure
+            'grid': [dict(g) for g in getattr(engine, 'grid', []) or []],
+            'level': getattr(engine, 'current_level', 0),
+            'grid_ready': getattr(engine, 'grid_ready', False),
             'anchor': engine.anchor if engine else None,
-            'anchor_source': engine.anchor_source if engine else 'close',
-            'chase_count': getattr(engine, 'chase_count', 0) or 0,
+            'reference_close': getattr(engine, 'reference_close', None),
+            'opening_price': getattr(engine, 'opening_price', None),
+            'gap_mode': getattr(engine, 'gap_mode', 'NONE'),
+            'base_inventory': getattr(engine, 'base_inventory', 0),
+            'unit_qty': getattr(engine, 'unit_qty', 0),
+            'buy_value': getattr(engine, 'buy_value', 0.0),
+            'sell_value': getattr(engine, 'sell_value', 0.0),
+            'fills': getattr(engine, 'fills', 0),
             'events': list(engine.events) if engine else [],
-            'gear': getattr(engine, 'gear', None),
-            'pct': getattr(engine, 'pct', None),
-            'tier_pcts': list(getattr(engine, 'tier_pcts', []) or []),
-            'tier_actives': list(getattr(engine, 'tier_actives', []) or []),
-            'gear1_pinned': getattr(engine, 'gear1_pinned', False),
             'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
             'mode': slot['mode'],
             'badge_key': badge_key,

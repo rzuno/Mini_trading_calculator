@@ -1,4 +1,4 @@
-"""Headless checks for Autopilot presentation helpers.
+"""Headless checks for Autopilot presentation helpers (Daily v^ grid).
 
 Run:  python scripts/test_autopilot_ui.py
 
@@ -14,8 +14,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gui.autopilot_window import (AutopilotWindow, campaign_status_text,
-                                  gear_text_color)
+from gui.autopilot_window import (AutopilotWindow, adventure_status_text,
+                                  next_transitions)
 from gui.candle_chart import (bounded_label_layout, candle_color,
                               required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
@@ -31,46 +31,90 @@ def ok(cond, name, info=''):
     print(f'  ok  {name}')
 
 
-print('— campaign current status —')
-deployed_events = []
-deployed = {
-    'state': 'DEPLOYED', 'mode': 'WATCH', 'shares': 12,
-    'avg_cost': 100.0, 'price': 101.0, 'buy_state': 'OK',
-    'lines': {'chase': (95.0, 8), 'tier2': (104.0, 12)},
-    'events': deployed_events,
-}
-text = campaign_status_text(deployed, 'USD')
-ok('CURRENT — DEPLOYED · WATCH' in text, 'deployed status names its state')
-ok('Holding: 12 sh @ 100.00 avg' in text,
-   'deployed status shows current holding and average')
-ok('Next BUY: 8 @ 95.00' in text and 'Next SELL: T2 12@104.00' in text,
-   'deployed status shows next buy and sell lines')
-ok(deployed_events == [], 'rendering current status creates no fill event')
+def grid_ui(**over):
+    """A ready mid-adventure ui dict: anchor 100, level -1, 11 sh held."""
+    grid = [{'level': k,
+             'price': 100.0 * (1 + 0.03 * k),
+             'target': max(0, 10 + (0, 1, 3, 6, 10, 15)[abs(k)]
+                           * (1 if k < 0 else -1))}
+            for k in range(5, -6, -1)]
+    ui = {
+        'state': 'WATCHING', 'mode': 'WATCH', 'shares': 11, 'price': 96.5,
+        'grid_ready': True, 'grid': grid, 'level': -1, 'anchor': 100.0,
+        'gap_mode': 'NONE', 'base_inventory': 10, 'unit_qty': 1,
+        'buy_value': 97.0, 'sell_value': 0.0, 'fills': 1,
+        'buy_state': 'OK', 'events': [], 'orders': [],
+    }
+    ui.update(over)
+    return ui
 
-empty_events = []
-empty = {
-    'state': 'EMPTY', 'mode': 'WATCH', 'shares': 0, 'price': 98.0,
-    'anchor': 100.0, 'anchor_source': 'close', 'buy_state': 'EXHAUSTED',
-    'lines': {'load': (95.0, 11), 'psell': (99.0, 11)},
-    'events': empty_events,
-}
-text = campaign_status_text(empty, 'USD')
-ok('CURRENT — EMPTY · WATCH' in text and 'no position (0 sh)' in text,
-   'empty status is visibly different from deployed status')
-ok('Vantage: 100.00 (previous close)' in text,
-   'empty status spells out Vantage')
-ok('Next LOAD: 11 @ 95.00  [NO ARMY]' in text,
-   'empty status shows unavailable next load')
-ok('After LOAD, first SELL: 11 @ 99.00' in text,
-   'empty status shows the pseudo first sell as context')
-ok(empty_events == [], 'empty current status is not persisted as a fill')
 
-print('— gear colors and card spacing —')
-gear_colors = [gear_text_color(g) for g in range(1, 6)]
-ok(gear_colors == ['#C62828', '#A64B00', '#806800', '#18733C', '#1565C0'],
-   'G1..G5 use red/orange/yellow/green/blue')
-ok(len(set(gear_colors)) == 5, 'every gear color is distinguishable')
-ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
+print('— next transitions —')
+ui = grid_ui()
+up, dn = next_transitions(ui)
+ok(up and up['level'] == 0 and up['side'] == 'SELL' and up['qty'] == 1,
+   'up from L-1 is the level-0 SELL 1', str(up))
+ok(dn and dn['level'] == -2 and dn['side'] == 'BUY' and dn['qty'] == 2,
+   'down from L-1 is the L-2 BUY 2', str(dn))
+edge = grid_ui(level=5, shares=0)
+up, dn = next_transitions(edge)
+ok(up is None and dn is not None,
+   'at +5 there is no upper watch line (outside the zone)')
+
+print('— adventure status text —')
+events = []
+text = adventure_status_text(grid_ui(events=events), 'USD')
+ok('ADVENTURE — WATCHING · WATCH' in text, 'status names state and mode')
+ok('Anchor: 100.00' in text, 'status shows the fixed anchor')
+ok('Level: -1   Inventory: 11 sh (base 10, unit 1)' in text,
+   'status shows level, inventory, base and unit', text)
+ok('Up   L+0 @ 100.00 → SELL 1' in text, 'status shows the next up trade')
+ok('Down L-2 @ 94.00 → BUY 2' in text, 'status shows the next down trade')
+ok('Today: buys 97.00 · sells 0.00 · net -97.00 (1 fills)' in text,
+   'status shows the day accounting line', text)
+ok(events == [], 'rendering the status creates no fill event')
+
+no_army = adventure_status_text(grid_ui(buy_state='EXHAUSTED'), 'USD')
+ok('[NO ARMY]' in no_army, 'unfunded down trade is marked, not popped up')
+
+waiting = adventure_status_text(
+    {'state': 'WAIT_OPEN', 'mode': 'WATCH', 'grid_ready': False,
+     'reference_close': 100.0, 'shares': 10, 'price': 99.0}, 'USD')
+ok('Grid not built yet' in waiting and 'Prev close: 100.00' in waiting,
+   'pre-open status explains the wait')
+
+resting = adventure_status_text(
+    grid_ui(orders=[{'side': 'BUY', 'price': 94.0, 'qty_open': 2}]), 'USD')
+ok('Resting on Toss: BUY' in resting, 'resting orders are listed')
+
+print('— grid line rows —')
+window = AutopilotWindow.__new__(AutopilotWindow)
+window.ccy = 'USD'
+rows = window._grid_rows(grid_ui())
+by_text = {r[2]: r for r in rows}
+ok(len(rows) == 11, 'all 11 levels get a row')
+anchor_rows = [r for r in rows if r[2].startswith('A ')]
+ok(len(anchor_rows) == 1 and anchor_rows[0][3],
+   'the anchor row is bold and labeled A')
+ok(any('L+0' not in t and 'SELL 1' in t for t in by_text),
+   'the adjacent up row carries its trade')
+ok(any('BUY 2' in t for t in by_text), 'the adjacent down row carries BUY 2')
+bold_rows = [r for r in rows if r[3]]
+ok(len(bold_rows) == 2,
+   'at L-1 the anchor IS the up watch line (anchor + L-2 bold)',
+   str([r[2] for r in bold_rows]))
+
+deep = grid_ui(level=-2, shares=13)
+bold_rows = [r for r in window._grid_rows(deep) if r[3]]
+ok(len(bold_rows) == 3
+   and any(t.startswith('A ') for _p, _c, t, _b in bold_rows),
+   'at L-2 anchor + both watch lines are bold',
+   str([r[2] for r in bold_rows]))
+
+rows = window._grid_rows(grid_ui(buy_state='EXHAUSTED'))
+muted = [r for r in rows if r[2].startswith('✕')]
+ok(len(muted) == 1 and 'no army' in muted[0][2] and muted[0][1] == '#999999',
+   'unfunded down line is muted with ✕ … (no army)')
 
 print('— chart labels and candle text —')
 ok(candle_color({'open': 10, 'close': 11}) == '#CC3333',
@@ -82,7 +126,7 @@ ok(candle_color({'open': 10, 'close': 10}) == '#CC3333',
 ok(required_label_pad(['short'], lambda s: len(s) * 10,
                       minimum=100, padding=16) == 100,
    'short chart labels retain the normal right margin')
-long_label = 'SELL (pseudo) 1,333.69 ×11'
+long_label = 'L-2 94.00  BUY 2 (no army)'
 ok(required_label_pad([long_label], lambda s: len(s) * 10,
                       minimum=100, padding=16) == len(long_label) * 10 + 16,
    'long chart labels receive enough measured right margin')
@@ -93,17 +137,7 @@ x, anchor, wrap = bounded_label_layout(160, 300)
 ok(anchor == 'w' and x >= 0 and x + wrap <= 160,
    'label wider than the canvas receives a bounded wrap width')
 
-window = AutopilotWindow.__new__(AutopilotWindow)
-window.ccy = 'USD'
-ui = {'pct': 5, 'buy_state': 'OK',
-      'lines': {'load': (95.0, 11), 'psell': (99.0, 11)}}
-rows = window._live_reference_rows(
-    ui, ui['lines'], deployed=False, avg=0, anchor=100.0)
-labels = [row[2] for row in rows]
-ok(any(label.startswith('Vantage 100.00') for label in labels)
-   and not any('V.P.' in label for label in labels),
-   'live chart uses Vantage instead of V.P.')
-ok('SELL (pseudo) 99.00 ×11' in labels,
-   'live pseudo-sell label is assembled in full')
+print('— card spacing —')
+ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
 
 print(f'\nALL {passed} UI CHECKS PASSED')

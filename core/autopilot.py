@@ -1,37 +1,48 @@
-"""Unified autopilot engine — the line watcher (pure logic).
+"""Daily v^ Linear Weighted Grid engine — the Daily Adventure autopilot.
 
-ONE strategy for everything now: the bot follows exactly the lines the stock
-CARD computes — same gear tables, same tier splits (core.calc). It watches
-the live price every poll and fires a real LIMIT order only when a line is
-crossed; after a fill the position changes, every line is recomputed from the
-new reality, and it goes back to watching. No strategic play beyond the
-lines: no 밑장 빼기, no stages, no idle-day escalation, no gear shifting by
-the bot. When the army can't fund a buy the buy side simply stops, its line is
-shown muted in the charts, and the SELL keeps being watched — 밑장 빼기 / gear
-lowering is the COMMANDER's manual decision.
+The bot no longer follows the card gear lines. It runs the grid strategy
+(manual: "Daily v^ Grid Autopilot Manual.md"): every trading day builds ONE
+fixed coordinate system — the ADVENTURE — around a session anchor, and the
+bot mechanically rebalances inventory whenever price crosses a grid level.
+Both sides of a wobble are harvested: V (fall→BUY, rebound→SELL) and
+^ (rise→SELL, dip→REBUY). The cards keep their gear system as the manual
+trading aid; this engine ignores them.
 
-Lines (all from core.calc, identical to the cards):
+The grid (defaults, all module constants below):
 
-    EMPTY     LOAD at vantage × (1 − pct), sized to ~1 unit.
-              vantage = previous session close (normal), or — after a
-              same-day full exit — the actual sell fill (RE-BAIT exception:
-              the bait hangs −4% below the fill, gear 1 regardless of V,
-              and dies at the session end / day roll).
-    DEPLOYED  CHASE at avg × (1 − pct), sized by the gear ratio
-              (-4% ×1/2 … -8% ×1.0 = the whole position again);
-              SELL tiers at avg × (1 + tier%), the held shares split across
-              the ACTIVE tiers (middle tier alone is the default full exit).
-              A buy fill restarts the tier ladder on the whole holding.
+    levels   -5 … +5           (cap 5: OUTSIDE the zone nothing is chased)
+    offsets  3% arithmetic     level ±n = anchor × (1 ± 0.03·n)
+    weights  [1, 2, 3, 4, 5]   cumulative W(n) = 1, 3, 6, 10, 15
 
-Gear source: the card pushes its current config on every compute →
-    snap['card'] = {'pct', 'gear', 'tier_pcts', 'tier_actives'}
-Exception 1 (same-day re-bait): a campaign opened by the re-bait is PINNED
-to gear 1 (chase −4% ×1/2, tiers +1/+3/+5) until its full exit.
-Exception 2 (heavy-unit minimum entry gear) lives in the card's auto-gear
-logic, so the pct arrives here with it already applied.
+Target inventory (the whole state machine):
 
-WATCH mode never places orders; instead the crossed line is exposed as
-`trigger` so the Autopilot window's Buy/Sell buttons can fire it manually.
+    target(-n) = base + W(n)·unit      target(+n) = base − W(n)·unit
+    clamped to [MIN_INVENTORY, MAX_INVENTORY]; order = target − actual.
+
+Rules that make it run unattended:
+
+    * Adjacent transitions only, ONE strategy order at a time, and the
+      level advances ONLY on a broker-confirmed fill reaching the target.
+    * Nothing to BUY (reserve army can't fund the delta): the transition is
+      simply NOT taken — the level stays, the line stays crossed, and the
+      buy fires by itself the moment cash returns (e.g. after a sell).
+    * Nothing to SELL (target clamps to actual, e.g. inventory at the
+      lower bound): the level advances SILENTLY so the grid keeps tracking
+      price; the first downward crossing buys, and the upper levels can
+      sell again after that.
+    * Partial fills self-heal: the level does not advance, so the next
+      touch of the same line re-orders exactly the remainder
+      (delta = target − actual).
+    * Opening gap ≥ first offset: compressed one-level init — the opening
+      price BECOMES level ∓1, the anchor is back-computed from it, and only
+      the minimum weight-1 action trades (skipped levels are never chased).
+    * Daily rebase: each new trading date starts a fresh adventure — new
+      anchor (previous regular close), base inventory = actual shares,
+      unit re-sized, level 0, day log cleared. P&L history lives in the
+      log file; the rebase never rewrites it.
+
+WATCH mode places nothing; a due transition is exposed as `trigger` so the
+window's Buy/Sell buttons can fire the exact same order manually.
 
 This module has NO network and NO tkinter. State survives restarts via
 to_dict()/`saved` (the controller persists it).
@@ -40,81 +51,125 @@ to_dict()/`saved` (the controller persists it).
 import time
 from datetime import datetime
 
-from core.calc import (AUTO_GEARS, RE_BAIT_GEAR, RE_BAIT_PCT,
-                       calc_buy_shares, calc_sell_tiers,
-                       trim_buy_price, trim_sell_price, round_half_up)
+from core.calc import trim_buy_price, trim_sell_price, round_half_up
 
 POLL_SECONDS = 10        # watcher tick
 
+# ── Grid configuration (v0.2 defaults — edit here, then restart the bot) ────
+GRID_STEP_PCT = 0.03             # arithmetic level spacing (3% of anchor)
+LEVEL_CAP = 5                    # zone = -5 … +5; outside is not chased
+GRID_WEIGHTS = (1, 2, 3, 4, 5)   # linear level weights (units per step)
+GAP_THRESHOLD = GRID_STEP_PCT    # opening gap ≥ 1 level → compressed init
+
+# Absolute inventory bounds (shares). CORE is never sold; MAX None = only
+# the cap bounds accumulation (W(5)=15 units above base).
+CORE_INVENTORY = 0
+MIN_INVENTORY = 0
+MAX_INVENTORY = None
+
 _PENDING_STALE_S = 90    # forget an order intent this long after placing it
-                         # if nothing rests and nothing filled (DAY order
-                         # died / was cancelled outside)
+                         # if nothing rests and nothing filled
 
-_SAVE_FIELDS = ('anchor', 'anchor_source', 'trading_date', 'gear1_pinned',
-                'tier_done', 'chase_count', 'events')
+_CROSS_EPS = 1e-9        # relative tolerance so an exact touch of a level
+                         # (e.g. 103 vs 100×1.03) counts as crossed despite
+                         # binary floating-point noise
 
-_DEFAULT_ACTIVES = (False, True, False)     # middle tier is the default exit
-
-
-def default_card_config() -> dict:
-    """Fallback when the card has not pushed a config yet (gear 1)."""
-    return {'gear': 1, 'pct': AUTO_GEARS[1]['pct'],
-            'tier_pcts': list(AUTO_GEARS[1]['tiers']),
-            'tier_actives': list(_DEFAULT_ACTIVES)}
+_SAVE_FIELDS = ('trading_date', 'anchor', 'reference_close', 'opening_price',
+                'gap_mode', 'gap_pending', 'base_inventory', 'unit_qty',
+                'current_level', 'grid_ready', 'events', 'buy_value',
+                'sell_value', 'fills')
 
 
-class WatcherEngine:
-    """One watched stock. Feed `poll(snap)` every cycle; execute the returned
-    actions in order.
+def grid_offsets(cap=LEVEL_CAP, step=GRID_STEP_PCT):
+    """Arithmetic offsets [step, 2·step, …] out to the cap."""
+    return [step * n for n in range(1, cap + 1)]
+
+
+def cum_weight(n, weights=GRID_WEIGHTS):
+    """W(n): total units between the anchor and absolute level n."""
+    n = min(abs(int(n)), len(weights))
+    return sum(weights[:n])
+
+
+def level_raw_price(anchor, level, cap=LEVEL_CAP, step=GRID_STEP_PCT):
+    """Untrimmed grid price for a level (crossings compare against this;
+    orders are tick-trimmed per side at order time)."""
+    if level == 0:
+        return anchor
+    off = grid_offsets(cap, step)[abs(level) - 1]
+    return anchor * (1 + off) if level > 0 else anchor * (1 - off)
+
+
+def target_inventory(level, base, unit_qty,
+                     minimum=None, maximum=None, weights=GRID_WEIGHTS):
+    """Bounded target share count at a grid level."""
+    w = cum_weight(level, weights)
+    raw = base + w * unit_qty if level < 0 else (
+        base - w * unit_qty if level > 0 else base)
+    lo = max(CORE_INVENTORY, MIN_INVENTORY if minimum is None else minimum)
+    raw = max(lo, raw)
+    hi = MAX_INVENTORY if maximum is None else maximum
+    if hi is not None:
+        raw = min(hi, raw)
+    return int(raw)
+
+
+class GridEngine:
+    """One adventure battlefield. Feed `poll(snap)` every cycle; execute the
+    returned actions in order.
 
     snap = {
         'price':        float|None   live price,
         'shares':       int          held shares (source of truth: broker),
-        'avg_cost':     float        broker average cost,
+        'avg_cost':     float        broker average cost (accounting only),
         'orders':       [{'id','side','price','qty_open','filled','mine'}],
         'buying_power': float|None   cash reserve in this stock's currency,
         'unit_cash':    float        1 unit in this stock's currency,
         'trading_date': str          market-local date 'YYYY-MM-DD',
-        'prev_close':   float|None   previous completed close (vantage),
-        'can_trade':    bool         False in WATCH mode → the crossed line
+        'prev_close':   float|None   previous completed regular close,
+        'phase':        str          'REGULAR'|'PRE'|'AFTER'|'CLOSED',
+        'can_trade':    bool         False in WATCH mode → the due transition
                                      is exposed as `trigger`, NOT fired,
-        'card':         dict|None    the card's gear config (see module doc),
     }
 
-    actions: ('cancel', order_id, label) — only ever our own orders —
-             ('place', side, price, qty, label), ('notify', message).
+    actions: ('place', side, price, qty, label), ('notify', message).
+    The grid bot never auto-cancels: it keeps ONE strategy order and waits.
     """
 
     def __init__(self, ticker, trading_date=None, log=None, saved=None):
         self.ticker = ticker
         self.currency = 'KRW' if ticker.endswith('.KS') else 'USD'
-        self.state = 'ARMING'          # ARMING → EMPTY / DEPLOYED
+        self.state = 'ARMING'     # ARMING|WAIT_OPEN|WATCHING|ORDER_PENDING
         self.status = 'arming…'
-        self.lines = {}                # 'load'|'psell'|'chase'|'tier1'|'tier2'|'tier3'
-        self.events = []               # THIS campaign's fills; cleared on full sell
         self.trading_date = trading_date
 
-        self.anchor = None             # vantage: prev close or same-day sell fill
-        self.anchor_source = 'close'   # 'close' | 'sell' (re-bait)
-        self.gear1_pinned = False      # campaign opened by the re-bait → G1
-        self.tier_done = [False, False, False]
-        self.chase_count = 0
+        # ── Adventure (per-day session) state ────────────────────────────
+        self.anchor = None            # fixed grid center for the day
+        self.reference_close = None   # previous regular close
+        self.opening_price = None     # first regular quote the bot saw
+        self.gap_mode = 'NONE'        # 'NONE' | 'DOWN' | 'UP'
+        self.gap_pending = False      # the minimum weight-1 gap action is due
+        self.base_inventory = 0       # actual shares when the grid was built
+        self.unit_qty = 0             # frozen share size of one unit
+        self.current_level = 0
+        self.grid_ready = False
 
-        # Resolved gear of the last poll (for the UI).
-        self.gear = None
-        self.pct = None
-        self.tier_pcts = list(AUTO_GEARS[1]['tiers'])
-        self.tier_actives = list(_DEFAULT_ACTIVES)
+        # Day log + accounting-lite (cleared at the daily rebase).
+        self.events = []              # today's actual fills
+        self.buy_value = 0.0
+        self.sell_value = 0.0
+        self.fills = 0
 
-        self.buy_state = 'OK'          # 'OK' | 'EXHAUSTED'
-        self.trigger = {'BUY': None, 'SELL': None}   # crossed lines (manual fire)
-        self.trigger_note = None       # why a crossed line is NOT fireable
+        # UI exposure (rebuilt every poll).
+        self.grid = []                # [{'level','price','target'}] cap→-cap
+        self.trigger = {'BUY': None, 'SELL': None}
+        self.trigger_note = None
+        self.buy_state = 'OK'         # 'OK' | 'EXHAUSTED' (down-line muted)
 
-        self.dirty = False             # state changed since the last save
+        self.dirty = False
         self._exhaust_logged = False
-        self._pending = None           # {'side','price','qty','tiers','ts'}
+        self._pending = None          # {'side','price','qty','level','target','ts'}
         self._prev_shares = None
-        self._prev_avg = 0.0
         self._log = log or (lambda msg: None)
         if saved:
             self._restore(saved)
@@ -123,51 +178,49 @@ class WatcherEngine:
 
     def to_dict(self):
         d = {f: getattr(self, f) for f in _SAVE_FIELDS}
-        d['q'] = self._prev_shares
         d['saved_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         return d
 
     def _restore(self, saved):
-        for f in _SAVE_FIELDS:
-            if f in saved:
-                setattr(self, f, saved[f])
-        restored_events = list(self.events or [])
-        # Older builds inserted a synthetic HOLD row every time an Autopilot
-        # window armed on an existing position. Campaign fills now mean actual
-        # broker-observed BUY/SELL changes only, so discard those legacy rows
-        # while preserving every real fill and the rest of the campaign state.
-        self.events = [e for e in restored_events
-                       if not (isinstance(e, dict)
-                               and e.get('kind') == 'HOLD')]
-        if len(self.events) != len(restored_events):
-            self.dirty = True       # persist the one-time migration next poll
-        self.tier_done = list(self.tier_done or [False, False, False])
+        try:
+            for f in _SAVE_FIELDS:
+                if f in saved:
+                    setattr(self, f, saved[f])
+            self.events = list(self.events or [])
+            self.current_level = int(self.current_level or 0)
+            self.base_inventory = int(self.base_inventory or 0)
+            self.unit_qty = int(self.unit_qty or 0)
+            if self.grid_ready and (not self.anchor or self.unit_qty <= 0):
+                self.grid_ready = False     # old/foreign store format
+        except (TypeError, ValueError):
+            self.__init__(self.ticker, trading_date=self.trading_date,
+                          log=self._log)
 
     # ── Small helpers ─────────────────────────────────────────────────────────
 
     def _fp(self, p):
         return f'{p:,.0f}' if self.currency == 'KRW' else f'{p:,.2f}'
 
-    def _event(self, kind, qty, price, shares, avg):
+    def _event(self, kind, qty, price, shares):
         self.events.append({'ts': datetime.now().strftime('%m/%d %H:%M'),
                             'kind': kind, 'qty': qty, 'price': price,
-                            'shares': shares, 'avg': avg})
+                            'shares': shares})
         del self.events[:-300]
         self.dirty = True
 
-    def _exhaust(self, what):
-        """Buy side out of army: NO popup — the graph shows the muted buy
-        line and the trigger row explains it. Logged once per transition."""
-        self.buy_state = 'EXHAUSTED'
-        if not self._exhaust_logged:
-            self._exhaust_logged = True
-            self._log(f'EXHAUSTED: {what}')
+    def _raw(self, level):
+        # Round away binary float noise (100×1.03 = 103.000…01) BEFORE any
+        # tick trim, so an exact touch crosses and the ceil/floor trims
+        # don't drift a cent off the strategy line.
+        return round(level_raw_price(self.anchor, level), 6)
 
-    def _buy_ok(self):
-        if self.buy_state == 'EXHAUSTED' and self._exhaust_logged:
-            self._log('army available again — buying resumes')
-        self.buy_state = 'OK'
-        self._exhaust_logged = False
+    def _target(self, level):
+        return target_inventory(level, self.base_inventory, self.unit_qty)
+
+    def _order_price(self, side, level):
+        raw = self._raw(level)
+        return (trim_sell_price(self.ticker, raw) if side == 'SELL'
+                else trim_buy_price(self.ticker, raw))
 
     @staticmethod
     def _split_orders(snap):
@@ -175,37 +228,18 @@ class WatcherEngine:
         sells = [o for o in snap.get('orders', []) if o.get('side') == 'SELL']
         return buys, sells
 
-    def _place(self, acts, side, price, qty, label, tiers=None):
+    def _place(self, acts, side, price, qty, label, level, target):
         acts.append(('place', side, price, qty, label))
         self._pending = {'side': side, 'price': price, 'qty': qty,
-                         'tiers': list(tiers or []), 'ts': time.time()}
+                         'level': level, 'target': target, 'ts': time.time()}
 
-    def note_manual_order(self, side, price, qty, tiers=None):
+    def note_manual_order(self, side, price, qty, level=None, target=None):
         """Register a manually-fired order (the window's Buy/Sell buttons in
-        WATCH mode) so its fill is attributed exactly like a bot order —
-        tier progress, exit price, same-day re-bait all work the same."""
+        WATCH mode) so its fill advances the level exactly like a bot order."""
         self._pending = {'side': side, 'price': price, 'qty': qty,
-                         'tiers': list(tiers or []), 'ts': time.time()}
+                         'level': level, 'target': target, 'ts': time.time()}
 
-    # ── Gear resolution (card config + the two exceptions) ───────────────────
-
-    def _bundle(self, snap):
-        """{'gear','pct','tier_pcts','tier_actives','pinned'} for this poll."""
-        card = dict(snap.get('card') or default_card_config())
-        actives = list(card.get('tier_actives') or _DEFAULT_ACTIVES)
-        if not any(actives):
-            actives = list(_DEFAULT_ACTIVES)
-        if self.gear1_pinned:
-            return {'gear': RE_BAIT_GEAR, 'pct': AUTO_GEARS[RE_BAIT_GEAR]['pct'],
-                    'tier_pcts': list(AUTO_GEARS[RE_BAIT_GEAR]['tiers']),
-                    'tier_actives': actives, 'pinned': True}
-        return {'gear': card.get('gear') or 1,
-                'pct': int(card.get('pct') or AUTO_GEARS[1]['pct']),
-                'tier_pcts': list(card.get('tier_pcts')
-                                  or AUTO_GEARS[1]['tiers']),
-                'tier_actives': actives, 'pinned': False}
-
-    # ── Day rollover: the re-bait dies, the anchor resets to prev close ──────
+    # ── Daily rebase: every date is a fresh adventure ────────────────────────
 
     def _roll_day(self, snap):
         d = snap.get('trading_date')
@@ -213,32 +247,31 @@ class WatcherEngine:
             return
         first = self.trading_date is None
         self.trading_date = d
-        self.chase_count = 0
-        if first:
-            return
-        if (snap.get('shares') or 0) <= 0:
-            if self.anchor_source == 'sell':
-                # The re-bait NEVER crosses into a new day, even when the
-                # fresh prev close is not known yet.
-                self._log('re-bait expired unfilled — not carried into the '
-                          'new day')
-                self.anchor = None
-                self.anchor_source = 'close'
-            if snap.get('prev_close'):
-                self.anchor = snap['prev_close']
-                self.anchor_source = 'close'
-                self._log(f'new day {d}: vantage = prev close '
-                          f'{self._fp(self.anchor)}')
-            self.dirty = True
+        if not first and self.grid_ready:
+            net = self.sell_value - self.buy_value
+            self._log(f'adventure closed: {self.fills} fills, '
+                      f'buy {self._fp(self.buy_value)} / '
+                      f'sell {self._fp(self.sell_value)} '
+                      f'(net {self._fp(net)}), end level '
+                      f'{self.current_level:+d}')
+        self.anchor = None
+        self.reference_close = None
+        self.opening_price = None
+        self.gap_mode = 'NONE'
+        self.gap_pending = False
+        self.current_level = 0
+        self.grid_ready = False
+        self.events = []
+        self.buy_value = 0.0
+        self.sell_value = 0.0
+        self.fills = 0
+        self._pending = None
+        self.dirty = True
+        if not first:
+            self._log(f'new adventure day {d} — grid rebuilds at the '
+                      f'regular open')
 
     # ── Fill detection (broker share diffs are the truth) ────────────────────
-
-    def _take_pending(self, side):
-        p = self._pending
-        if p and p['side'] == side:
-            self._pending = None
-            return p
-        return None
 
     def _expire_pending(self, snap, shares):
         """Drop a stale intent: nothing rests on that side, nothing filled."""
@@ -253,74 +286,122 @@ class WatcherEngine:
 
     def _detect_fills(self, snap, shares):
         prev = self._prev_shares
-        avg = float(snap.get('avg_cost') or 0)
-        if prev is None:                       # first poll after (re)arming
-            # Log only — the fill list records actual BUY/SELL changes, not
-            # every (re)opening of the window.
+        if prev is None:
             if shares > 0:
-                self._log(f'armed on an existing position: {shares} @ '
-                          f'{self._fp(avg)}')
+                self._log(f'armed with {shares} shares held')
             return
-        if shares > prev:
-            self._on_buy_fill(snap, prev, shares, avg)
-        elif shares < prev:
-            self._on_sell_fill(snap, prev, shares, avg)
+        if shares == prev:
+            return
+        qty = abs(shares - prev)
+        side = 'BUY' if shares > prev else 'SELL'
+        pend = self._pending if (self._pending
+                                 and self._pending['side'] == side) else None
+        price = (pend['price'] if pend
+                 else (snap.get('price') or snap.get('avg_cost') or 0.0))
+        value = qty * (price or 0.0)
+        if side == 'BUY':
+            self.buy_value += value
+        else:
+            self.sell_value += value
+        self.fills += 1
 
-    def _on_buy_fill(self, snap, prev, shares, avg):
-        qty = shares - prev
-        pend = self._take_pending('BUY')
+        if pend and pend.get('level') is not None:
+            kind = f'{side} L{pend["level"]:+d}'
+        else:
+            kind = f'{side} ext'
+            self._log(f'external {side.lower()}: {prev} → {shares} shares '
+                      f'(targets self-heal)')
+        self._event(kind, shares - prev, price, shares)
+
         if pend:
-            price = pend['price']
-        else:
-            price = ((avg * shares - self._prev_avg * prev) / qty
-                     if avg > 0 and self._prev_avg > 0 and prev > 0
-                     else (avg or None))
-        if prev == 0:
-            # New campaign. Opened by the same-day re-bait → pinned to G1.
-            self.gear1_pinned = (self.anchor_source == 'sell')
-            self.tier_done = [False, False, False]
-            self._event('LOAD', qty, price, shares, avg)
-            self._log(f'LOAD filled: 0 → {shares} shares'
-                      + (' — re-bait: campaign pinned to G1'
-                         if self.gear1_pinned else ''))
-        else:
-            self.chase_count += 1
-            # Any BUY fill restarts the tier ladder on the whole holding.
-            self.tier_done = [False, False, False]
-            self._event('CHASE', qty, price, shares, avg)
-            self._log(f'CHASE filled: {prev} → {shares} shares '
-                      f'(chase #{self.chase_count} today)')
+            target = pend.get('target')
+            if target is not None and shares == target:
+                self.current_level = pend['level']
+                self._pending = None
+                self._log(f'level {pend["level"]:+d} confirmed: '
+                          f'inventory {shares}')
+            else:
+                resting = [o for o in snap.get('orders', [])
+                           if o.get('side') == side]
+                if not resting:
+                    self._pending = None
+                    self._log(f'partial fill done at {shares}/{target} — '
+                              f'level stays {self.current_level:+d}; the '
+                              f'remainder re-orders on the next touch')
+                else:
+                    self._log(f'partial fill: {shares}/{target} — order '
+                              f'still resting')
         self.dirty = True
 
-    def _on_sell_fill(self, snap, prev, shares, avg):
-        qty = prev - shares
-        pend = self._take_pending('SELL')
-        if pend:
-            price = pend['price']
-            for i in (pend.get('tiers') or []):
-                if 0 <= i < 3:
-                    self.tier_done[i] = True
-            kind = ('T' + '/'.join(str(i + 1) for i in pend['tiers'])
-                    if pend.get('tiers') else 'SELL')
-        else:
-            price = snap.get('price') or self._prev_avg or None
-            kind = 'SELL'
-            self._log(f'external sell: {prev} → {shares} shares')
-        self._event(kind, -qty, price, shares, avg)
+    # ── Session (adventure) initialization ───────────────────────────────────
 
-        if shares == 0:
-            self._log(f'campaign closed: -{qty} @ {self._fp(price or 0)}')
-            self.events = []
-            self.tier_done = [False, False, False]
-            self.gear1_pinned = False
-            if price:
-                # Same-day re-bait: one bait at the exit fill −4% (gear 1),
-                # valid only for the rest of this session.
-                self.anchor = price
-                self.anchor_source = 'sell'
-                self._log(f're-bait armed: {self._fp(price)} '
-                          f'-{RE_BAIT_PCT}% (G1) until the session ends')
+    def _ensure_session(self, snap, shares):
+        if self.grid_ready:
+            return True
+        ref = snap.get('prev_close')
+        price = snap.get('price')
+        unit = snap.get('unit_cash') or 0.0
+        if not ref or ref <= 0:
+            self.state = 'ARMING'
+            self.status = 'adventure waiting — no previous close yet'
+            self.grid = []
+            return False
+        self.reference_close = ref
+        if price is None:
+            self.state = 'ARMING'
+            self.status = 'adventure waiting — no quote yet'
+            self._preview_grid(ref, shares, unit)
+            return False
+        if snap.get('phase') != 'REGULAR':
+            self.state = 'WAIT_OPEN'
+            self.status = (f'adventure starts at the regular open '
+                           f'(prev close {self._fp(ref)})')
+            self._preview_grid(ref, shares, unit)
+            return False
+        if unit <= 0:
+            self.state = 'ARMING'
+            self.status = 'adventure waiting — unit cash unknown'
+            return False
+
+        # First regular quote of the day → fix the coordinate system.
+        self.opening_price = price
+        gap = price / ref - 1.0
+        if gap <= -GAP_THRESHOLD:
+            self.anchor = price / (1 - grid_offsets()[0])
+            self.current_level = -1
+            self.gap_mode = 'DOWN'
+            self.gap_pending = True     # the minimum weight-1 BUY is due
+        elif gap >= GAP_THRESHOLD:
+            self.anchor = price / (1 + grid_offsets()[0])
+            self.current_level = +1
+            self.gap_mode = 'UP'
+            self.gap_pending = True     # the minimum weight-1 SELL is due
+        else:
+            self.anchor = ref
+            self.current_level = 0
+            self.gap_mode = 'NONE'
+            self.gap_pending = False
+        self.base_inventory = shares
+        self.unit_qty = max(1, round_half_up(unit / self.anchor))
+        self.grid_ready = True
         self.dirty = True
+        self._log(f'adventure {self.trading_date}: anchor '
+                  f'{self._fp(self.anchor)} ({self.gap_mode.lower()} gap '
+                  f'{gap * 100:+.2f}%), base {shares} sh, unit '
+                  f'{self.unit_qty} sh, level {self.current_level:+d}')
+        return True
+
+    def _preview_grid(self, ref, shares, unit):
+        """Display-only grid around the prev close before the open."""
+        u = max(1, round_half_up(unit / ref)) if unit > 0 else 0
+        self.grid = [{'level': k, 'price': level_raw_price(ref, k),
+                      'target': target_inventory(k, shares, u)}
+                     for k in range(LEVEL_CAP, -LEVEL_CAP - 1, -1)]
+
+    def _refresh_grid(self):
+        self.grid = [{'level': k, 'price': self._raw(k),
+                      'target': self._target(k)}
+                     for k in range(LEVEL_CAP, -LEVEL_CAP - 1, -1)]
 
     # ── Main decision cycle ───────────────────────────────────────────────────
 
@@ -330,207 +411,186 @@ class WatcherEngine:
         self._expire_pending(snap, shares)
         self._detect_fills(snap, shares)
         self._prev_shares = shares
-        self._prev_avg = float(snap.get('avg_cost') or 0)
         self.trigger = {'BUY': None, 'SELL': None}
         self.trigger_note = None
-        return (self._poll_deployed(snap, shares) if shares > 0
-                else self._poll_empty(snap))
-
-    # ── DEPLOYED: chase + sell tiers, fire only on touch ─────────────────────
-
-    def _poll_deployed(self, snap, shares):
-        self.state = 'DEPLOYED'
-        avg = float(snap.get('avg_cost') or 0)
-        if avg <= 0:
-            self.status = 'deployed — waiting for avg cost'
+        if not self._ensure_session(snap, shares):
             return []
+        self._refresh_grid()
+        return self._watch(snap, shares)
 
-        b = self._bundle(snap)
-        self.gear, self.pct = b['gear'], b['pct']
-        self.tier_pcts, self.tier_actives = b['tier_pcts'], b['tier_actives']
-        pct = b['pct']
-
-        chase_p = trim_buy_price(self.ticker, avg * (1 - pct / 100.0))
-        cq = calc_buy_shares(shares, pct)
-        size_tag = ' x1.0' if pct == 8 else ''
-        chase_label = f'-{pct}%{size_tag} chase (G{b["gear"]})'
-
-        # Sell tiers: split the holding across the active, not-yet-done tiers.
-        # If every active tier is already done but shares remain (e.g. a
-        # partial fill), the ladder restarts on the remainder.
-        actives_now = [a and not d
-                       for a, d in zip(b['tier_actives'], self.tier_done)]
-        if not any(actives_now) and any(b['tier_actives']):
-            self.tier_done = [False, False, False]
-            actives_now = list(b['tier_actives'])
-        split = calc_sell_tiers(shares, avg, b['tier_pcts'], actives_now)
-        sell_lines = [(i, trim_sell_price(self.ticker, e['price']), e['qty'])
-                      for i, e in enumerate(split) if e['price'] is not None]
-
-        self.lines = {}
-        if cq > 0:
-            self.lines['chase'] = (chase_p, cq)
-        for i, p, q in sell_lines:
-            self.lines[f'tier{i + 1}'] = (p, q)
-
+    def _gap_action(self, snap, shares):
+        """The one-time minimum weight-1 action of a compressed gap open:
+        reconcile inventory to the target of the level the opening price
+        became (∓1). Cleared once inventory matches; while it cannot run
+        (no cash / WATCH mode) it simply stays due and retries."""
+        lvl = self.current_level
+        target = self._target(lvl)
+        delta = target - shares
         acts = []
-        # Army check every poll so the UI can flag exhaustion early.
-        bp = snap.get('buying_power')
-        affordable = bp is None or cq * chase_p <= bp
-        if not affordable:
-            self._exhaust(f'next buy needs {cq} @ {self._fp(chase_p)}')
-        else:
-            self._buy_ok()
-
-        price = snap.get('price')
-        if price is None:
-            self.status = 'no price — watching paused'
+        if delta == 0:
+            self.gap_pending = False
+            self.dirty = True
+            self._log(f'gap action done — inventory {shares} matches '
+                      f'level {lvl:+d}')
             return acts
-        buys, sells = self._split_orders(snap)
+        side = 'BUY' if delta > 0 else 'SELL'
+        qty = abs(delta)
+        line = self._order_price(side, lvl)
+        label = f'gap {side} L{lvl:+d} → {target}'
         can = snap.get('can_trade', True)
-        tag = (f'G{b["gear"]}' + (' pinned' if b['pinned'] else '')
-               + f' -{pct}%')
-
-        # 1) SELL first (exit has priority). If the price gapped through
-        #    several tiers, everything they cover goes in ONE order at the
-        #    highest crossed line.
-        crossed = [(i, p, q) for i, p, q in sell_lines if price >= p]
-        if crossed:
-            tqty = sum(q for _i, _p, q in crossed)
-            tprice = max(p for _i, p, _q in crossed)
-            tiers = [i for i, _p, _q in crossed]
-            tlabel = '매도 ' + '+'.join(f'T{i + 1}' for i in tiers)
-            if sells:
-                # An order already rests on this side — no trigger either,
-                # so the manual button cannot double-order.
-                self.status = f'[{tag}] sell resting — waiting for the fill'
+        if side == 'BUY':
+            bp = snap.get('buying_power')
+            cost = qty * line
+            if bp is not None and cost > bp:
+                self.trigger_note = (f'▼ gap BUY due at L{lvl:+d} — needs '
+                                     f'{self._fp(cost)} but reserve '
+                                     f'{self._fp(bp)}: skipped until the '
+                                     f'army returns')
+                self.status = (f'[L{lvl:+d}] gap BUY unfunded '
+                               f'({self._fp(cost)} > {self._fp(bp)})')
                 return acts
-            self.trigger['SELL'] = {'side': 'SELL', 'price': tprice,
-                                    'qty': tqty, 'label': tlabel,
-                                    'tiers': tiers}
-            if not can:
-                self.status = (f'[{tag}] SELL trigger met @ {self._fp(price)} '
-                               f'(watching only)')
-                return acts
-            acts += [('cancel', o['id'], 'our buy (exit first)')
-                     for o in buys if o.get('mine')]
-            self._place(acts, 'SELL', tprice, tqty, tlabel, tiers=tiers)
-            self.status = f'[{tag}] SELL fired: {tqty} @ {self._fp(tprice)}'
+        self.trigger[side] = {'side': side, 'price': line, 'qty': qty,
+                              'label': label, 'level': lvl, 'target': target}
+        if not can:
+            self.status = (f'[L{lvl:+d}] gap {side} due: {qty} @ '
+                           f'{self._fp(line)} (watching only)')
             return acts
-
-        # 2) BUY (chase) — only when the army can fund it.
-        if cq > 0 and price <= chase_p:
-            if buys:
-                self.status = f'[{tag}] buy resting — waiting for the fill'
-                return acts
-            if not affordable:
-                self.trigger_note = ('▼ BUY crossed — no reserve army; '
-                                     'manual Buy button is off')
-                self.status = (f'[{tag}] BUY line crossed, but no reserve '
-                               f'army remains — watching SELL only')
-                return acts
-            self.trigger['BUY'] = {'side': 'BUY', 'price': chase_p,
-                                   'qty': cq, 'label': chase_label}
-            if not can:
-                self.status = (f'[{tag}] BUY trigger met @ {self._fp(price)} '
-                               f'(watching only)')
-                return acts
-            acts += [('cancel', o['id'], 'our sell (chase first)')
-                     for o in sells if o.get('mine')]
-            self._place(acts, 'BUY', chase_p, cq, chase_label)
-            self.status = f'[{tag}] BUY fired: {cq} @ {self._fp(chase_p)}'
-            return acts
-
-        lo = self._fp(chase_p) if cq > 0 else '--'
-        hi = (self._fp(min(p for _i, p, _q in sell_lines))
-              if sell_lines else '--')
-        tail = ' · EXHAUSTED (buy off)' if self.buy_state == 'EXHAUSTED' else ''
-        self.status = (f'[{tag}] watching: {lo} < now {self._fp(price)} '
-                       f'< {hi}{tail}')
+        self._place(acts, side, line, qty, label, lvl, target)
+        self.state = 'ORDER_PENDING'
+        self.status = (f'[L{lvl:+d}] gap {side} fired: {qty} @ '
+                       f'{self._fp(line)}')
         return acts
 
-    # ── EMPTY: watch the load line hanging off the vantage point ─────────────
-
-    def _poll_empty(self, snap):
-        self.state = 'EMPTY'
-        if not self.anchor or self.anchor <= 0:
-            if snap.get('prev_close'):
-                self.anchor = snap['prev_close']
-                self.anchor_source = 'close'
-                self._log(f'vantage = prev close {self._fp(self.anchor)}')
-                self.dirty = True
-            else:
-                self.status = 'empty — waiting for the vantage (prev close)'
-                self.lines = {}
-                return []
-
-        rebait = (self.anchor_source == 'sell')
-        b = self._bundle(snap)
-        if rebait:                      # exception 1: gear 1 for the day
-            b = {'gear': RE_BAIT_GEAR, 'pct': RE_BAIT_PCT,
-                 'tier_pcts': list(AUTO_GEARS[RE_BAIT_GEAR]['tiers']),
-                 'tier_actives': b['tier_actives'], 'pinned': False}
-        self.gear, self.pct = b['gear'], b['pct']
-        self.tier_pcts, self.tier_actives = b['tier_pcts'], b['tier_actives']
-        pct = b['pct']
-
-        load_p = trim_buy_price(self.ticker,
-                                self.anchor * (1 - pct / 100.0))
-        unit = snap.get('unit_cash') or 0.0
-        lq = (max(1, round_half_up(unit / load_p))
-              if unit > 0 and load_p > 0 else 0)
-        if lq <= 0:
-            self.lines = {}
-            self.status = 'empty — unit cash unknown'
+    def _watch(self, snap, shares):
+        price = snap.get('price')
+        lvl = self.current_level
+        tag = f'L{lvl:+d}'
+        if price is None:
+            self.state = 'WATCHING'
+            self.status = f'[{tag}] no price — watching paused'
             return []
 
-        # Pseudo exit (informational): the lowest active tier as if loaded.
-        psplit = calc_sell_tiers(lq, load_p, b['tier_pcts'],
-                                 b['tier_actives'])
-        psell = next(((trim_sell_price(self.ticker, e['price']), e['qty'])
-                      for e in psplit if e['price'] is not None), None)
-        self.lines = {'load': (load_p, lq)}
-        if psell:
-            self.lines['psell'] = psell
+        # Down-side affordability every poll (muted line + note in the UI).
+        down = lvl - 1 if lvl - 1 >= -LEVEL_CAP else None
+        if down is not None:
+            d_delta = self._target(down) - shares
+            if d_delta > 0:
+                cost = d_delta * self._order_price('BUY', down)
+                bp = snap.get('buying_power')
+                if bp is not None and cost > bp:
+                    if self.buy_state != 'EXHAUSTED':
+                        self.buy_state = 'EXHAUSTED'
+                        if not self._exhaust_logged:
+                            self._exhaust_logged = True
+                            self._log(f'army short for level {down:+d} '
+                                      f'(needs {self._fp(cost)})')
+                else:
+                    self.buy_state = 'OK'
+                    self._exhaust_logged = False
+            else:
+                self.buy_state = 'OK'
 
+        buys, sells = self._split_orders(snap)
+        if self._pending:
+            resting = buys if self._pending['side'] == 'BUY' else sells
+            if resting:
+                self.state = 'ORDER_PENDING'
+                self.status = (f"[{tag}] {self._pending['side']} "
+                               f"{self._pending['qty']} @ "
+                               f"{self._fp(self._pending['price'])} resting "
+                               f"— waiting for the fill")
+                return []
+        elif buys or sells:
+            # Foreign order on a bot-exclusive ticker: no new transitions.
+            self.state = 'WATCHING'
+            sides = '/'.join(sorted({o.get('side') or '?'
+                                     for o in buys + sells}))
+            self.status = (f'[{tag}] {sides} order resting on Toss (not '
+                           f'mine) — adventure paused until it clears')
+            return []
+
+        self.state = 'WATCHING'
+        if snap.get('phase') != 'REGULAR':
+            self.status = (f'[{tag}] session over — adventure sleeps '
+                           f'(inventory {shares})')
+            return []
+
+        up = lvl + 1 if lvl + 1 <= LEVEL_CAP else None
+        transition = None
+        if up is not None and price >= self._raw(up) * (1 - _CROSS_EPS):
+            transition = up
+        elif down is not None and price <= self._raw(down) * (1 + _CROSS_EPS):
+            transition = down
+        if transition is None:
+            if self.gap_pending:
+                return self._gap_action(snap, shares)
+            lo = self._fp(self._raw(down)) if down is not None else 'edge'
+            hi = self._fp(self._raw(up)) if up is not None else 'edge'
+            self.status = (f'[{tag}] watching: {lo} < now {self._fp(price)} '
+                           f'< {hi} · inv {shares}')
+            return []
+
+        target = self._target(transition)
+        delta = target - shares
+        can = snap.get('can_trade', True)
         acts = []
+
+        if delta == 0:
+            # Bound-clamped (e.g. nothing to sell): the grid keeps tracking
+            # price so the way back down can trade again.
+            self.current_level = transition
+            self.gap_pending = False
+            self.dirty = True
+            self._log(f'level {transition:+d} reached — target equals '
+                      f'inventory ({shares}), nothing to trade')
+            self.status = (f'[L{transition:+d}] level advanced without a '
+                           f'trade (bounds) · inv {shares}')
+            return acts
+
+        if delta < 0:
+            qty = -delta
+            line = self._order_price('SELL', transition)
+            label = f'grid SELL L{transition:+d} → {target}'
+            self.trigger['SELL'] = {'side': 'SELL', 'price': line,
+                                    'qty': qty, 'label': label,
+                                    'level': transition, 'target': target}
+            if not can:
+                self.status = (f'[{tag}] SELL due → L{transition:+d}: {qty} '
+                               f'@ {self._fp(line)} (watching only)')
+                return acts
+            self.gap_pending = False    # the transition supersedes it
+            self._place(acts, 'SELL', line, qty, label, transition, target)
+            self.state = 'ORDER_PENDING'
+            self.status = (f'[{tag}] SELL fired → L{transition:+d}: {qty} '
+                           f'@ {self._fp(line)}')
+            return acts
+
+        qty = delta
+        line = self._order_price('BUY', transition)
+        cost = qty * line
         bp = snap.get('buying_power')
-        affordable = bp is None or lq * load_p <= bp
-        if not affordable:
-            self._exhaust(f'load needs {lq} @ {self._fp(load_p)}')
-        else:
-            self._buy_ok()
-
-        price = snap.get('price')
-        if price is None:
-            self.status = 'no price — watching paused'
+        if bp is not None and cost > bp:
+            # The transition is NOT taken: the level stays, and this buy
+            # fires by itself whenever the army returns (e.g. after a sell).
+            self.trigger_note = (f'▼ L{transition:+d} crossed — needs '
+                                 f'{self._fp(cost)} but reserve '
+                                 f'{self._fp(bp)}: buy skipped until the '
+                                 f'army returns')
+            self.status = (f'[{tag}] L{transition:+d} crossed but no army '
+                           f'({self._fp(cost)} > {self._fp(bp)}) — '
+                           f'sell side stays watched')
             return acts
-        buys, _sells = self._split_orders(snap)
-        label = f'-{pct}% load' + (' (re-bait)' if rebait else '')
-        tag = f'G{b["gear"]}' + (' re-bait' if rebait else '')
-
-        if price <= load_p:
-            if buys:
-                self.status = 'load buy resting — waiting for the fill'
-                return acts
-            if not affordable:
-                self.trigger_note = ('▼ LOAD crossed — no reserve army; '
-                                     'manual Buy button is off')
-                self.status = (f'[{tag}] LOAD line crossed, but no reserve '
-                               f'army remains')
-                return acts
-            self.trigger['BUY'] = {'side': 'BUY', 'price': load_p,
-                                   'qty': lq, 'label': label}
-            if not snap.get('can_trade', True):
-                self.status = (f'[{tag}] LOAD trigger met @ '
-                               f'{self._fp(price)} (watching only)')
-                return acts
-            self._place(acts, 'BUY', load_p, lq, label)
-            self.status = f'[{tag}] LOAD fired: {lq} @ {self._fp(load_p)}'
+        label = f'grid BUY L{transition:+d} → {target}'
+        self.trigger['BUY'] = {'side': 'BUY', 'price': line, 'qty': qty,
+                               'label': label, 'level': transition,
+                               'target': target}
+        if not can:
+            self.status = (f'[{tag}] BUY due → L{transition:+d}: {qty} '
+                           f'@ {self._fp(line)} (watching only)')
             return acts
-
-        src = '재입질' if rebait else 'prev close'
-        self.status = (f'[{tag}] watching: load {self._fp(load_p)} < now '
-                       f'{self._fp(price)} (vantage {self._fp(self.anchor)}, '
-                       f'{src})')
+        self.gap_pending = False        # the transition supersedes it
+        self._place(acts, 'BUY', line, qty, label, transition, target)
+        self.state = 'ORDER_PENDING'
+        self.status = (f'[{tag}] BUY fired → L{transition:+d}: {qty} '
+                       f'@ {self._fp(line)}')
         return acts
