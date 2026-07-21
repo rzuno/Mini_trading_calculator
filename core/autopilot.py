@@ -33,6 +33,12 @@ Rules that make it run unattended:
     * Partial fills self-heal: the level does not advance, so the next
       touch of the same line re-orders exactly the remainder
       (delta = target − actual).
+    * Manual (external) fills are FOLDED INTO THE BASE: a buy/sell the bot
+      did not place shifts base_inventory by the same amount, so every
+      level target shifts with it and the bot's own units stay untouched —
+      manual trading and the bot coexist without fighting each other.
+      (Sold below the bot's deployed depth, the base clamps at 0 and the
+      bot simply rebuilds on its normal lines.)
     * Opening gap ≥ first offset: compressed one-level init — the ANCHOR
       IS the opening price itself, labeled L∓1 (A); every level is spaced
       3%-of-the-open from there, and only the minimum weight-1 action
@@ -43,8 +49,9 @@ Rules that make it run unattended:
       unit re-sized, level 0, day log cleared. P&L history lives in the
       log file; the rebase never rewrites it.
 
-WATCH mode places nothing; a due transition is exposed as `trigger` so the
-window's Buy/Sell buttons can fire the exact same order manually.
+WATCH mode places nothing; a due transition is still exposed as `trigger`
+(the controller keeps manual-fire support for a future UI — the current
+window has no manual buttons).
 
 This module has NO network and NO tkinter. State survives restarts via
 to_dict()/`saved` (the controller persists it).
@@ -319,8 +326,18 @@ class GridEngine:
             kind = f'{side} L{pend["level"]:+d}'
         else:
             kind = f'{side} ext'
-            self._log(f'external {side.lower()}: {prev} → {shares} shares '
-                      f'(targets self-heal)')
+            if self.grid_ready:
+                # Fold the commander's manual trade into the base so every
+                # level target shifts with it: the bot's own units stay the
+                # same size and manual/bot trading never fight each other.
+                old = self.base_inventory
+                self.base_inventory = max(0, old + (shares - prev))
+                self._log(f'external {side.lower()}: {prev} → {shares} '
+                          f'shares — folded into base ({old} → '
+                          f'{self.base_inventory}); bot units unchanged')
+            else:
+                self._log(f'external {side.lower()}: {prev} → {shares} '
+                          f'shares (before the grid — base follows at init)')
         self._event(kind, shares - prev, price, shares)
 
         if pend:

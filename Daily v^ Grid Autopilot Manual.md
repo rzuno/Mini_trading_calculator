@@ -259,44 +259,71 @@ A partially-filled order never advances the level. When the order is gone,
 the next touch of the same line re-orders exactly the remainder
 (`delta = target − actual`). Nothing is assumed filled.
 
-### Foreign orders (bot-exclusive ticker)
+### Manual trades coexist (external fills fold into the base)
 
-The strategy assumes the ticker is bot-exclusive while running. If a
-resting order the bot did not place appears, new transitions pause until
-it clears (status says so); fills from outside are absorbed by the target
-model and logged as `ext`.
+A fill the bot did not place — the commander trading the same ticker from
+the app/web — is FOLDED INTO THE BASE: `base_inventory` shifts by the
+same amount, so every level target shifts with it and the bot's own
+units stay exactly the same size. Manual trading and the bot are
+innocuous to each other:
+
+```text
+manually BUY 20 more   → base 10 → 30; the next crossings still trade
+                         the normal 1/2/3-unit deltas; the manual 20
+                         shares are never sold by the bot.
+manually SELL it all   → base → 0; upper crossings advance silently
+                         (nothing to sell), the first L-n crossing buys
+                         its normal unit, and the way back up sells it.
+sold below bot depth   → the base clamps at 0 and the bot simply
+                         rebuilds toward its normal level targets.
+```
+
+A RESTING manual order still pauses new transitions until it clears
+(one order at a time is a bot invariant); once it fills, the fold above
+applies.
+
+### Foreign orders (bot-exclusive order book)
+
+If a resting order the bot did not place appears, new transitions pause
+until it clears (status says so). Fills from outside are folded as above
+and logged as `ext`.
 
 ---
 
-## 8. Modes, window, manual fire
+## 8. Modes and the window
 
 ```text
-WATCH  polling + grid + fill detection; NO orders from the bot. A due
-       transition arms the trigger row; the Buy / Sell buttons fire that
-       exact order manually (confirm dialog → real Toss order).
+WATCH  polling + grid + fill detection; NO orders from the bot.
 LIVE   the bot fires by itself on every crossing. Regular hours only;
-       auto-drops to WATCH at the close. Manual buttons rest while LIVE.
+       auto-drops to WATCH at the close.
 ```
 
-The Autopilot window (card's big button → arms WATCH):
+The Autopilot window (card's big button → arms WATCH) is ONE information
+banner over TWO charts — compact in width, growing in height:
 
 ```text
-header   state (WATCHING / ORDER_PENDING / WAIT_OPEN) · market phase · LIVE
-line 2   anchor @ L∓n (A) · gap · level · unit · base · today net (fills)
-trigger  ▲/▼ crossed-level indicator · Buy · Sell · Cancel buttons
+header   name · state (WATCHING / ORDER_PENDING / WAIT_OPEN) · phase · LIVE
+banner   anchor @ L∓n (A) · gap · level · unit · base · today net (fills)
+         inventory · deployed units · now · reserve · resting orders
+         ▲ next up transition · ▼ next down transition [NO ARMY]
+         engine status + poll time
+         오늘 fills (n): one line per fill — shown only when fills exist
 left     live tick curve inside the grid: all 11 level lines (soft),
          the anchor line labeled L+0 (A) — or L∓1 (A) on a gap day —
          plus the two adjacent watch lines bold with their trades,
          corridor between the watch lines shaded
-right    adventure status snapshot · today's fill log · 5-day candle panel
+right    5-day candle panel with the anchor + watch lines
 ```
+
+The old right-hand status/fills column and the manual Buy/Sell/Cancel
+buttons were removed (2026-07-21) — the banner carries everything. The
+controller still implements manual fire and cancel-all for a future UI;
+today the bot is WATCH (look only) or LIVE (trade by itself).
 
 LIVE is hard-gated to the regular session: it cannot be switched on
 outside REGULAR hours, and an already-LIVE bot drops back to WATCH on the
 first poll after the session leaves REGULAR (pre-market, after-market,
 closed). Resting DAY orders die on Toss at the close.
-
-Cancel cancels ALL resting Toss orders on the ticker (ours or not).
 
 ---
 

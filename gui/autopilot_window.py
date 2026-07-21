@@ -5,20 +5,24 @@ stock is polled every 5 s and this window follows every tick. The bot runs
 the Daily v^ Linear Weighted Grid (the DAILY ADVENTURE) — it does NOT use
 the card gear system; the cards stay the manual-trading aid.
 
-    WATCH  a due grid transition lights the trigger row; the Buy / Sell
-           buttons let the commander fire that same order manually.
+    WATCH  polling + grid + fill detection only; nothing is placed.
     LIVE   the bot rebalances by itself the moment a grid level is
            crossed; allowed only during regular market hours (drops back
-           to WATCH at the close). While LIVE, the manual buttons rest.
+           to WATCH at the close).
 
-Left: the live tick curve inside the grid — every level line from -5 to +5
-(clipped to the visible range), the anchor, and the two ADJACENT watch
-lines emphasized. Right: the adventure status snapshot, today's fill log,
-and the 5-day candle panel.
-When the reserve army cannot fund the next buy level, no popup fires: the
-lower watch line is drawn muted (✕ … no army) and the trigger row explains
-why the manual Buy button is off — the buy fires by itself when cash
-returns.
+Layout is ONE information banner over TWO charts — nothing else:
+
+    header   name · state · market phase · LIVE
+    banner   adventure line (anchor @ L±n (A) · level · unit · base · net)
+             inventory · reserve · ▲▼ the two next transitions
+             engine status + poll time
+             today's fills (only when there are any)
+    charts   live tick curve inside the grid  |  5-day candle panel
+
+The old right-hand status/fills column and the manual Buy/Sell/Cancel
+buttons are gone (the controller still supports manual fire for the
+future; the UI just doesn't show it). When the army cannot fund the next
+buy level, the line is drawn muted (✕ … no army) and the status says why.
 
 Closing the window in WATCH mode stops the polling; in LIVE the autopilot
 keeps running in the background (the card button stays colored).
@@ -42,8 +46,7 @@ _F_BTN   = ('Segoe UI', 13, 'bold')
 _F_INFO  = ('Segoe UI', 12)
 _F_AXIS  = ('Segoe UI', 10)
 _F_REF   = ('Segoe UI', 11, 'bold')
-_F_LOG   = ('Consolas', 11)
-_F_LOG_B = ('Consolas', 11, 'bold')
+_F_FILLS = ('Consolas', 11)
 
 # KR color language: red = the upper (SELL) half, blue = the lower (BUY)
 # half. Soft shades are the far, not-yet-adjacent levels.
@@ -56,7 +59,6 @@ _CLR = {
     'path':    '#1A1A1A',
     'now':     '#CC0000',
     'zone':    '#F4F1FA',
-    'state_on': '#0033AA',
 }
 _PHASE_TXT = {'REGULAR': ('OPEN (regular)', '#007700'),
               'PRE':     ('pre-market', '#B8860B'),
@@ -66,6 +68,8 @@ _LIVE_BG = '#CC0000'
 _NO_ARMY_CLR = '#999999'      # muted buy line when the army can't fund it
 _STATE_CLR = {'WATCHING': '#0033AA', 'ORDER_PENDING': '#B8860B',
               'WAIT_OPEN': '#666666', 'ARMING': '#666666'}
+
+_FILLS_SHOWN = 8              # newest fills listed in the banner
 
 
 def _grid_by_level(ui):
@@ -92,65 +96,48 @@ def next_transitions(ui):
     return out[0], out[1]
 
 
-def adventure_status_text(ui, currency):
-    """Read-only adventure snapshot shown above the day's fill list.
-    Presentation only — never becomes an event, never touches state."""
-    ui = ui or {}
-    state = ui.get('state') or 'ARMING'
-    mode = ui.get('mode') or 'WATCH'
-    shares = int(ui.get('shares') or 0)
-    price = ui.get('price')
-    parts = [f'ADVENTURE — {state} · {mode}']
-
-    if ui.get('grid_ready'):
-        gap = ui.get('gap_mode') or 'NONE'
-        a_lvl = ui.get('anchor_level') or 0
-        src = ('prev close' if gap == 'NONE'
-               else f'{gap.lower()}-gap OPEN')
-        parts.append(f"Anchor: {fmt_price(ui.get('anchor'), currency)} "
-                     f'= L{a_lvl:+d} (A), {src}')
-        parts.append(f"Level: {ui.get('level', 0):+d}   "
-                     f"Inventory: {shares:,} sh "
-                     f"(base {ui.get('base_inventory', 0):,}, "
-                     f"unit {ui.get('unit_qty', 0):,})")
-        if price:
-            parts.append(f'Now: {fmt_price(price, currency)}')
-        up, dn = next_transitions(ui)
-        if up:
-            parts.append(f"Up   L{up['level']:+d} @ "
-                         f"{fmt_price(up['price'], currency)} → "
-                         f"{up['side']} {up['qty']:,}")
-        else:
-            parts.append(f'Up   edge of the zone (+{LEVEL_CAP})')
-        if dn:
-            tail = ('  [NO ARMY]' if ui.get('buy_state') == 'EXHAUSTED'
-                    and dn['side'] == 'BUY' else '')
-            parts.append(f"Down L{dn['level']:+d} @ "
-                         f"{fmt_price(dn['price'], currency)} → "
-                         f"{dn['side']} {dn['qty']:,}{tail}")
-        else:
-            parts.append(f'Down edge of the zone (-{LEVEL_CAP})')
-        net = (ui.get('sell_value') or 0) - (ui.get('buy_value') or 0)
-        parts.append(f"Today: buys {fmt_price(ui.get('buy_value') or 0, currency)}"
-                     f" · sells {fmt_price(ui.get('sell_value') or 0, currency)}"
-                     f" · net {fmt_price(net, currency)}"
-                     f" ({ui.get('fills') or 0} fills)")
+def next_line(ui, currency):
+    """One banner line naming the two adjacent transitions: '▲ … · ▼ …'."""
+    if not ui.get('grid_ready'):
+        return ''
+    up, dn = next_transitions(ui)
+    parts = []
+    if up:
+        act = ('watch only' if up['side'] == '—'
+               else f"{up['side']} {up['qty']:,}")
+        parts.append(f"▲ L{up['level']:+d} @ "
+                     f"{fmt_price(up['price'], currency)} → {act}")
     else:
-        parts.append('Grid not built yet — the adventure starts at the '
-                     'regular open.')
-        if ui.get('reference_close'):
-            parts.append(f"Prev close: "
-                         f"{fmt_price(ui['reference_close'], currency)}")
-        parts.append(f'Holding: {shares:,} sh')
-        if price:
-            parts.append(f'Now: {fmt_price(price, currency)}')
+        parts.append(f'▲ edge of the zone (+{LEVEL_CAP})')
+    if dn:
+        act = ('watch only' if dn['side'] == '—'
+               else f"{dn['side']} {dn['qty']:,}")
+        tail = (' [NO ARMY]' if ui.get('buy_state') == 'EXHAUSTED'
+                and dn['side'] == 'BUY' else '')
+        parts.append(f"▼ L{dn['level']:+d} @ "
+                     f"{fmt_price(dn['price'], currency)} → {act}{tail}")
+    else:
+        parts.append(f'▼ edge of the zone (-{LEVEL_CAP})')
+    return '      '.join(parts)
 
-    orders = ui.get('orders') or []
-    if orders:
-        sides = sorted({o.get('side') for o in orders if o.get('side')})
-        if sides:
-            parts.append('Resting on Toss: ' + '/'.join(sides))
-    return '\n'.join(parts)
+
+def fills_text(ui, currency, limit=_FILLS_SHOWN):
+    """Today's fills for the banner — '' when the adventure has none yet.
+    Newest last; long days are truncated to the most recent `limit`."""
+    events = ui.get('events') or []
+    if not events:
+        return ''
+    shown = events[-limit:]
+    head = f"오늘 fills ({len(events)})"
+    if len(events) > len(shown):
+        head += f' — last {len(shown)}'
+    lines = [head + ':']
+    for e in shown:
+        price = e.get('price')
+        p = fmt_price(price, currency) if price else '--'
+        lines.append(f"  {e['ts']}  {e['kind']:<9} {e['qty']:+d} @ {p}"
+                     f"  → {e['shares']} sh")
+    return '\n'.join(lines)
 
 
 class AutopilotWindow:
@@ -166,8 +153,8 @@ class AutopilotWindow:
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
         self.win.title(f'{name} — Autopilot (Daily v^ grid)')
-        self.win.geometry('1620x720')
-        self.win.minsize(1280, 560)
+        self.win.geometry('1260x860')
+        self.win.minsize(980, 620)
         self._ref_font = tkfont.Font(root=self.win, font=_F_REF)
 
         # ── Header: title/state left, market phase + LIVE right ──────────────
@@ -185,68 +172,32 @@ class AutopilotWindow:
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
-        # ── Adventure summary line ───────────────────────────────────────────
-        head2 = tk.Frame(self.win, padx=12)
-        head2.pack(fill='x')
-        self._adv_lbl = tk.Label(head2, text='', font=_F_BTN, fg='#4B0082',
-                                 anchor='w')
-        self._adv_lbl.pack(side='left')
-
+        # ── The unified information banner ───────────────────────────────────
+        self._adv_lbl = tk.Label(self.win, text='', font=_F_BTN,
+                                 fg='#4B0082', anchor='w')
+        self._adv_lbl.pack(fill='x', padx=12)
         self._info_lbl = tk.Label(self.win, text='', font=_F_INFO, fg='#333',
                                   anchor='w')
         self._info_lbl.pack(fill='x', padx=14)
+        self._next_lbl = tk.Label(self.win, text='', font=_F_INFO, fg='#333',
+                                  anchor='w')
+        self._next_lbl.pack(fill='x', padx=14)
         self._status_lbl = tk.Label(self.win, text='', font=_F_INFO,
                                     fg='#4B0082', anchor='w')
         self._status_lbl.pack(fill='x', padx=14)
+        self._fills_lbl = tk.Label(self.win, text='', font=_F_FILLS,
+                                   fg='#333', anchor='w', justify='left')
+        # packed/unpacked on demand in _update_fills
 
-        # ── Trigger row: due-transition indicator + manual Buy/Sell/Cancel ───
-        trig = tk.Frame(self.win, padx=12, pady=4)
-        trig.pack(fill='x')
-        self._trig_lbl = tk.Label(trig, text='no level crossed', font=_F_STAT,
-                                  fg='#888', width=60, anchor='w')
-        self._trig_lbl.pack(side='left')
-        self._buy_btn = tk.Button(trig, text='Buy', font=_F_STAT, width=8,
-                                  state='disabled',
-                                  command=lambda: self._do_fire('BUY'))
-        self._buy_btn.pack(side='left', padx=(6, 6))
-        self._sell_btn = tk.Button(trig, text='Sell', font=_F_STAT, width=8,
-                                   state='disabled',
-                                   command=lambda: self._do_fire('SELL'))
-        self._sell_btn.pack(side='left', padx=(0, 6))
-        self._cancel_btn = tk.Button(trig, text='Cancel', font=_F_STAT,
-                                     width=8, state='disabled',
-                                     command=self._do_cancel)
-        self._cancel_btn.pack(side='left', padx=(0, 12))
-        self._fire_msg = tk.Label(trig, text='', font=_F_INFO, fg='#333')
-        self._fire_msg.pack(side='left')
+        # ── Body: live grid chart | 5-day candle panel ───────────────────────
+        self._body = tk.Frame(self.win)
+        self._body.pack(fill='both', expand=True, padx=12, pady=(6, 12))
 
-        # ── Body: live grid chart | status + fills | 5-day panel ─────────────
-        body = tk.Frame(self.win)
-        body.pack(fill='both', expand=True, padx=12, pady=(6, 12))
-
-        self.canvas = tk.Canvas(body, bg='white', highlightthickness=0)
+        self.canvas = tk.Canvas(self._body, bg='white', highlightthickness=0)
         self.canvas.pack(side='left', fill='both', expand=True)
         self.canvas.bind('<Configure>', lambda e: self._draw())
 
-        side = tk.Frame(body)
-        side.pack(side='left', fill='y', padx=(10, 0))
-        tk.Label(side, text='Adventure status & fills', font=_F_STAT
-                 ).pack(anchor='w')
-        self._adv_status_lbl = tk.Label(
-            side, text='', width=38, font=_F_LOG, anchor='nw', justify='left',
-            wraplength=360, bg='#F5F5F5', relief='groove', bd=1,
-            padx=6, pady=5)
-        self._adv_status_lbl.pack(fill='x', pady=(4, 4))
-        self._log_txt = tk.Text(side, width=38, font=_F_LOG, state='disabled',
-                                wrap='word', bg='#FAFAFA', relief='groove', bd=1)
-        self._log_txt.pack(fill='y', expand=True)
-        self._log_txt.tag_configure('BUY', foreground=_CLR['dn'])
-        self._log_txt.tag_configure('SELL', foreground=_CLR['up'])
-        self._log_txt.tag_configure('OTHER', foreground='#555555')
-        self._log_txt.tag_configure('HEADER', foreground='#333333',
-                                    font=_F_LOG_B)
-
-        self.candle_panel = CandlePanel(body, currency, width=470)
+        self.candle_panel = CandlePanel(self._body, currency, width=470)
         self.candle_panel.pack(side='left', fill='both', padx=(10, 0))
 
         self._cb = self._on_update
@@ -297,28 +248,6 @@ class AutopilotWindow:
         if not ok:
             messagebox.showwarning('Autopilot', msg, parent=self.win)
 
-    def _do_fire(self, side):
-        trig = ((self.ui or {}).get('trigger') or {}).get(side)
-        if not trig:
-            return
-        q, p = trig['qty'], trig['price']
-        text = (f"{trig.get('label', side)}\n\n"
-                f"{side} {q} @ {fmt_price(p, self.ccy)}\n\n"
-                f"Send this order to Toss now?")
-        if not messagebox.askyesno(f'Manual {side}', text, parent=self.win):
-            return
-        ok, msg = self.ap['manual_fire'](side)
-        self._fire_msg.config(text=msg, fg=('green' if ok else 'red'))
-
-    def _do_cancel(self):
-        if not messagebox.askyesno(
-                'Cancel orders',
-                f'Cancel ALL resting Toss orders for {self.ticker}?',
-                parent=self.win):
-            return
-        ok, msg = self.ap['cancel_all']()
-        self._fire_msg.config(text=msg, fg=('green' if ok else 'red'))
-
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
     def _on_update(self, ui):
@@ -351,11 +280,10 @@ class AutopilotWindow:
 
         self._adv_lbl.config(text=self._adventure_text(ui))
         self._info_lbl.config(text=self._info_text(ui))
+        self._next_lbl.config(text=next_line(ui, self.ccy))
         self._status_lbl.config(
             text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}")
-        self._update_trigger_row(ui)
-        self._adv_status_lbl.config(text=adventure_status_text(ui, self.ccy))
-        self._fill_log(ui)
+        self._update_fills(ui)
         self._draw()
         self._refresh_candles()
 
@@ -386,47 +314,26 @@ class AutopilotWindow:
                      + (f' @ {fmt_price(avg, self.ccy)} avg' if avg else ''))
         if shares and price and unit > 0:
             parts.append(f'≈ {shares * price / unit:,.2f} u deployed')
+        if price:
+            parts.append(f'now {fmt_price(price, self.ccy)}')
         bp = ui.get('buying_power')
         if bp is not None:
             parts.append(f'reserve {fmt_price(bp, self.ccy)}')
-        if ui.get('buy_state') == 'EXHAUSTED':
-            parts.append('next buy level unfunded — waits for the army')
+        orders = ui.get('orders') or []
+        if orders:
+            sides = sorted({o.get('side') for o in orders if o.get('side')})
+            parts.append('● resting: ' + '/'.join(sides))
         return '      '.join(parts)
 
-    def _update_trigger_row(self, ui):
-        trig = ui.get('trigger') or {}
-        buy_t, sell_t = trig.get('BUY'), trig.get('SELL')
-        mode = ui.get('mode', 'WATCH')
-        manual_ok = mode != 'LIVE'
-        self._buy_btn.config(state=('normal' if buy_t and manual_ok
-                                    else 'disabled'))
-        self._sell_btn.config(state=('normal' if sell_t and manual_ok
-                                     else 'disabled'))
-        self._cancel_btn.config(state=('normal' if ui.get('orders')
-                                       else 'disabled'))
-        if sell_t:
-            self._trig_lbl.config(
-                text=f"▲ L{sell_t.get('level', 0):+d} crossed → SELL "
-                     f"{sell_t['qty']} @ {fmt_price(sell_t['price'], self.ccy)}"
-                     + ('' if manual_ok else '   (LIVE fires it)'),
-                fg=_CLR['up'])
-        elif buy_t:
-            self._trig_lbl.config(
-                text=f"▼ L{buy_t.get('level', 0):+d} crossed → BUY "
-                     f"{buy_t['qty']} @ {fmt_price(buy_t['price'], self.ccy)}"
-                     + ('' if manual_ok else '   (LIVE fires it)'),
-                fg=_CLR['dn'])
-        elif ui.get('trigger_note'):
-            # A level IS crossed but cannot be traded (e.g. no reserve
-            # army) — say exactly why the manual button is off.
-            self._trig_lbl.config(text=ui['trigger_note'], fg='#B8860B')
-        elif ui.get('orders'):
-            sides = {o.get('side') for o in ui['orders']}
-            self._trig_lbl.config(
-                text='● ' + '/'.join(s.lower() for s in sides if s)
-                     + ' order resting on Toss', fg='#0033AA')
-        else:
-            self._trig_lbl.config(text='no level crossed', fg='#888')
+    def _update_fills(self, ui):
+        text = fills_text(ui, self.ccy)
+        if text:
+            self._fills_lbl.config(text=text)
+            if not self._fills_lbl.winfo_ismapped():
+                self._fills_lbl.pack(fill='x', padx=14, pady=(2, 0),
+                                     before=self._body)
+        elif self._fills_lbl.winfo_ismapped():
+            self._fills_lbl.pack_forget()
 
     # ── Grid line rows shared by both charts ─────────────────────────────────
 
@@ -495,27 +402,6 @@ class AutopilotWindow:
                              'color': color, 'dash': (2, 4), 'width': 1.6})
         self.candle_panel.update(ohlc=ohlc, ref_lines=refs,
                                  current=(ui or {}).get('price'))
-
-    def _fill_log(self, ui):
-        events = ui.get('events') or []
-        txt = self._log_txt
-        txt.config(state='normal')
-        txt.delete('1.0', 'end')
-        txt.insert('end', "TODAY'S ADVENTURE FILLS\n", 'HEADER')
-        if not events:
-            txt.insert('end', '(no fills yet today — the log\n'
-                              'clears at each daily rebase)\n')
-        for e in events:
-            price = e.get('price')
-            p = fmt_price(price, self.ccy) if price else '--'
-            line = (f"{e['ts']}  {e['kind']:<9} {e['qty']:+d} @ {p}"
-                    f"  → {e['shares']} sh")
-            kind = ('BUY' if str(e['kind']).startswith('BUY')
-                    else 'SELL' if str(e['kind']).startswith('SELL')
-                    else 'OTHER')
-            txt.insert('end', line + '\n', kind)
-        txt.config(state='disabled')
-        txt.see('end')
 
     # ── Live chart ────────────────────────────────────────────────────────────
 

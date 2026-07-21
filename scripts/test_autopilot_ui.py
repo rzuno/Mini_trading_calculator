@@ -14,7 +14,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gui.autopilot_window import (AutopilotWindow, adventure_status_text,
+from gui.autopilot_window import (AutopilotWindow, fills_text, next_line,
                                   next_transitions)
 from gui.candle_chart import (bounded_label_layout, candle_color,
                               required_label_pad)
@@ -65,35 +65,31 @@ up, dn = next_transitions(edge)
 ok(up is None and dn is not None,
    'at +5 there is no upper watch line (outside the zone)')
 
-print('— adventure status text —')
+print('— banner lines —')
 events = []
-text = adventure_status_text(grid_ui(events=events), 'USD')
-ok('ADVENTURE — WATCHING · WATCH' in text, 'status names state and mode')
-ok('Anchor: 100.00 = L+0 (A), prev close' in text,
-   'normal day: anchor is the prev close at L+0 (A)', text)
-gap_text = adventure_status_text(grid_ui(anchor_level=-1), 'USD')
-ok('Anchor: 100.00 = L-1 (A), down-gap OPEN' in gap_text,
-   'gap day: the OPEN is the anchor, named at its level', gap_text)
-ok('Level: -1   Inventory: 11 sh (base 10, unit 1)' in text,
-   'status shows level, inventory, base and unit', text)
-ok('Up   L+0 @ 100.00 → SELL 1' in text, 'status shows the next up trade')
-ok('Down L-2 @ 94.00 → BUY 2' in text, 'status shows the next down trade')
-ok('Today: buys 97.00 · sells 0.00 · net -97.00 (1 fills)' in text,
-   'status shows the day accounting line', text)
-ok(events == [], 'rendering the status creates no fill event')
+line = next_line(grid_ui(events=events), 'USD')
+ok('▲ L+0 @ 100.00 → SELL 1' in line and '▼ L-2 @ 94.00 → BUY 2' in line,
+   'next-line names both adjacent transitions', line)
+ok(events == [], 'rendering the banner creates no fill event')
+ok('[NO ARMY]' in next_line(grid_ui(buy_state='EXHAUSTED'), 'USD'),
+   'unfunded down transition is marked in the banner, no popup')
+ok(next_line({'grid_ready': False}, 'USD') == '',
+   'no next-line before the grid is built')
+ok('edge of the zone' in next_line(grid_ui(level=5, shares=0), 'USD'),
+   'the zone edge is named at ±5')
 
-no_army = adventure_status_text(grid_ui(buy_state='EXHAUSTED'), 'USD')
-ok('[NO ARMY]' in no_army, 'unfunded down trade is marked, not popped up')
-
-waiting = adventure_status_text(
-    {'state': 'WAIT_OPEN', 'mode': 'WATCH', 'grid_ready': False,
-     'reference_close': 100.0, 'shares': 10, 'price': 99.0}, 'USD')
-ok('Grid not built yet' in waiting and 'Prev close: 100.00' in waiting,
-   'pre-open status explains the wait')
-
-resting = adventure_status_text(
-    grid_ui(orders=[{'side': 'BUY', 'price': 94.0, 'qty_open': 2}]), 'USD')
-ok('Resting on Toss: BUY' in resting, 'resting orders are listed')
+ok(fills_text({'events': []}, 'USD') == '',
+   'no fills today → the fills block is hidden')
+evs = [{'ts': f'07/21 10:{i:02d}', 'kind': 'BUY L-1', 'qty': 1,
+        'price': 97.0, 'shares': 10 + i} for i in range(10)]
+txt = fills_text({'events': evs}, 'USD')
+ok(txt.splitlines()[0] == '오늘 fills (10) — last 8:',
+   'a long day truncates to the newest 8 fills', txt.splitlines()[0])
+ok(len(txt.splitlines()) == 9 and '10:09' in txt and '10:00' not in txt,
+   'the newest fills are the ones kept')
+short = fills_text({'events': evs[:2]}, 'USD')
+ok(short.startswith('오늘 fills (2):') and '+1 @ 97.00' in short,
+   'a short day lists every fill')
 
 print('— grid line rows —')
 window = AutopilotWindow.__new__(AutopilotWindow)

@@ -336,6 +336,36 @@ ok(not acts and 'not mine' not in e.status and 'paused' in e.status,
 settle(e, b, 97.0)
 ok(b.shares == 11, 'clears and resumes when the foreign order is gone')
 
+# ── Manual trades coexist (external fills fold into the base) ───────────────
+print('— manual coexistence —')
+e, b = fresh()
+settle(e, b, 100.0)
+b.shares += 20                               # manual app buy, no bot order
+e.poll(make_snap(100.0, b))                  # detected as external
+ok(e.base_inventory == 30, 'external +20 folds into the base (10 → 30)')
+placed = settle(e, b, 103.0)
+ok(placed and placed[0][1] == 'SELL' and placed[0][3] == 1,
+   'next upper crossing still sells the normal 1 unit (not 21)', str(placed))
+ok(b.shares == 29, 'the manual 20 shares are never touched by the bot')
+
+e, b = fresh()
+settle(e, b, 100.0)
+b.shares = 0                                  # manually emptied the position
+e.poll(make_snap(100.0, b))
+ok(e.base_inventory == 0, 'external sell-out folds the base to 0')
+r = run_path(e, b, [103, 100, 97, 100])
+ok([x[1] for x in r] == [0, 0, 1, 0],
+   'then: L+1 silent (nothing to sell), L-1 buys 1u, back at L0 sells it')
+
+e, b = fresh()
+run_path(e, b, [100, 97])                     # bot deployed 1u at L-1
+b.shares = 0                                  # manual sell took the bot unit too
+e.poll(make_snap(97.0, b))
+ok(e.base_inventory == 0, 'sold below the bot depth: base clamps at 0')
+settle(e, b, 94.0)
+ok(b.shares == 3 and e.current_level == -2,
+   'the bot rebuilds toward the L-2 target on its normal line')
+
 # ── WATCH mode triggers + manual fire ───────────────────────────────────────
 print('— WATCH / manual —')
 e, b = fresh()
