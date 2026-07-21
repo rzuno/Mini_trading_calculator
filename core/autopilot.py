@@ -86,7 +86,7 @@ _CROSS_EPS = 1e-9        # relative tolerance so an exact touch of a level
 _SAVE_FIELDS = ('trading_date', 'anchor', 'anchor_level', 'reference_close',
                 'opening_price', 'gap_mode', 'gap_pending', 'base_inventory',
                 'unit_qty', 'current_level', 'grid_ready', 'events',
-                'buy_value', 'sell_value', 'fills')
+                'buy_value', 'sell_value', 'fills', 'last_shares')
 
 
 def grid_offsets(cap=LEVEL_CAP, step=GRID_STEP_PCT):
@@ -185,6 +185,7 @@ class GridEngine:
         self._exhaust_logged = False
         self._pending = None          # {'side','price','qty','level','target','ts'}
         self._prev_shares = None
+        self.last_shares = None       # persisted share count (restart bookkeeping)
         self._log = log or (lambda msg: None)
         if saved:
             self._restore(saved)
@@ -193,6 +194,9 @@ class GridEngine:
 
     def to_dict(self):
         d = {f: getattr(self, f) for f in _SAVE_FIELDS}
+        # The unresolved order intent survives restarts so a fill that lands
+        # while the program is off can be attributed to the bot on re-arm.
+        d['pending'] = dict(self._pending) if self._pending else None
         d['saved_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         return d
 
@@ -201,10 +205,15 @@ class GridEngine:
             for f in _SAVE_FIELDS:
                 if f in saved:
                     setattr(self, f, saved[f])
+            p = saved.get('pending')
+            self._pending = (dict(p) if isinstance(p, dict)
+                             and p.get('side') in ('BUY', 'SELL') else None)
             self.events = list(self.events or [])
             self.current_level = int(self.current_level or 0)
             self.base_inventory = int(self.base_inventory or 0)
             self.unit_qty = int(self.unit_qty or 0)
+            if self.last_shares is not None:
+                self.last_shares = int(self.last_shares)
             if self.grid_ready and (not self.anchor or self.unit_qty <= 0):
                 self.grid_ready = False     # old/foreign store format
         except (TypeError, ValueError):
@@ -301,11 +310,73 @@ class GridEngine:
             self._log(f"pending {p['side']} expired unfilled — forgotten")
             self._pending = None
 
+    def _arm_attribution(self, snap, shares):
+        """First poll after (re)arming: explain any inventory change that
+        happened while the watcher was OFF, using the persisted bookkeeping
+        (last_shares + the unresolved order intent).
+
+        1. A diff in the pending order's direction is credited to the BOT
+           (its DAY limit filled after shutdown): the level advances when
+           the full order is covered, exactly like live fill detection.
+        2. Whatever remains is a MANUAL trade → folded into the base, the
+           same as it would have been while polling.
+        """
+        known = self.last_shares
+        if known is None:                     # first-ever arm on this ticker
+            if shares > 0:
+                self._log(f'armed with {shares} shares held')
+            return
+        diff = shares - int(known)
+        if diff == 0:
+            if shares > 0:
+                self._log(f're-armed consistent: {shares} shares, '
+                          f'level {self.current_level:+d}')
+            return
+        residual = diff
+        pend = self._pending
+        if pend and self.grid_ready:
+            sign = 1 if pend['side'] == 'BUY' else -1
+            moved = diff * sign               # shares moved the pending way?
+            if moved > 0:
+                take = min(moved, int(pend['qty']))
+                price = pend['price']
+                value = take * (price or 0.0)
+                if pend['side'] == 'BUY':
+                    self.buy_value += value
+                else:
+                    self.sell_value += value
+                self.fills += 1
+                lvl = pend.get('level')
+                kind = (f"{pend['side']} L{lvl:+d}" if lvl is not None
+                        else pend['side'])
+                self._event(kind, sign * take, price,
+                            int(known) + sign * take)
+                self._log(f"{pend['side']} filled while off: {take} @ "
+                          f'{self._fp(price or 0)} (attributed to the bot)')
+                if take == int(pend['qty']) and lvl is not None:
+                    self.current_level = lvl
+                    self._log(f'level {lvl:+d} confirmed from the '
+                              f'restored intent')
+                residual = diff - sign * take
+                self._pending = None
+        if residual:
+            if self.grid_ready:
+                old = self.base_inventory
+                self.base_inventory = max(0, old + residual)
+                self._log(f'manual trade while off: {residual:+d} shares — '
+                          f'folded into base ({old} → '
+                          f'{self.base_inventory}); bot units unchanged')
+                self._event(('BUY ext' if residual > 0 else 'SELL ext'),
+                            residual, snap.get('price'), shares)
+            else:
+                self._log(f'inventory changed while off: {residual:+d} '
+                          f'shares (before the grid — base follows at init)')
+        self.dirty = True
+
     def _detect_fills(self, snap, shares):
         prev = self._prev_shares
         if prev is None:
-            if shares > 0:
-                self._log(f'armed with {shares} shares held')
+            self._arm_attribution(snap, shares)
             return
         if shares == prev:
             return
@@ -324,6 +395,8 @@ class GridEngine:
 
         if pend and pend.get('level') is not None:
             kind = f'{side} L{pend["level"]:+d}'
+        elif pend:
+            kind = side
         else:
             kind = f'{side} ext'
             if self.grid_ready:
@@ -447,6 +520,9 @@ class GridEngine:
         self._expire_pending(snap, shares)
         self._detect_fills(snap, shares)
         self._prev_shares = shares
+        if self.last_shares != shares:
+            self.last_shares = shares         # persisted restart bookkeeping
+            self.dirty = True
         self.trigger = {'BUY': None, 'SELL': None}
         self.trigger_note = None
         if not self._ensure_session(snap, shares):

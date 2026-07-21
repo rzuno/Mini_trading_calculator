@@ -414,6 +414,49 @@ settle(e3, FakeBroker(5), 100.0)
 ok(e3.grid_ready and e3.anchor == 100.0,
    'legacy (line-watcher) store entries fall back to a fresh init')
 
+# ── Restart attribution: trades that happened while the program was OFF ─────
+print('— restart attribution —')
+e, b = fresh()
+settle(e, b, 100.0)
+acts = e.poll(make_snap(94.0, b))             # L-1 BUY 1 fires (limit @ 97)
+b.place(acts[0][1], acts[0][2], acts[0][3])
+d = e.to_dict()                                # …program closes here
+b.on_price(94.0)                               # the DAY order fills while off
+e2 = GridEngine(T, saved=d)
+e2.poll(make_snap(94.0, b))
+ok(e2.current_level == -1 and e2.base_inventory == 10,
+   "the bot's own off-fill is attributed: level advances, base untouched")
+ok(e2.buy_value == 97.0 and e2.fills == 1,
+   'the off-fill is booked at the restored intent price')
+settle(e2, b, 94.0)
+ok(b.shares == 13 and e2.current_level == -2,
+   'and the adventure keeps stepping normally afterwards')
+
+e, b = fresh()
+settle(e, b, 100.0)
+d = e.to_dict()
+b.shares -= 4                                  # manual sell while off
+e2 = GridEngine(T, saved=d)
+e2.poll(make_snap(100.0, b))
+ok(e2.base_inventory == 6 and e2.current_level == 0,
+   'a manual off-trade folds into the base on re-arm (no reconcile-away)')
+
+e, b = fresh()
+settle(e, b, 100.0)
+acts = e.poll(make_snap(94.0, b))
+b.place(acts[0][1], acts[0][2], acts[0][3])
+d = e.to_dict()
+b.on_price(94.0)                               # bot +1 while off
+b.shares += 5                                  # AND a manual +5 while off
+e2 = GridEngine(T, saved=d)
+e2.poll(make_snap(94.0, b))
+ok(e2.current_level == -1 and e2.base_inventory == 15,
+   'mixed off-diff: the intent share goes to the bot, the rest folds',
+   f'L{e2.current_level:+d} base {e2.base_inventory}')
+ok(b.shares == 16
+   and target_inventory(-1, e2.base_inventory, e2.unit_qty) == 16,
+   'inventory stays exactly consistent with the shifted targets')
+
 # ── KR tick trimming ────────────────────────────────────────────────────────
 print('— KR ticks —')
 ek = GridEngine('005930.KS', trading_date=D1)

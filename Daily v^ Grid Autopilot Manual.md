@@ -282,6 +282,27 @@ A RESTING manual order still pauses new transitions until it clears
 (one order at a time is a bot invariant); once it fills, the fold above
 applies.
 
+### Restarts (fills that land while the program is OFF)
+
+The state file also keeps the LAST KNOWN share count and the unresolved
+order intent. On re-arming the same day, any inventory change that
+happened while the watcher was off is attributed:
+
+```text
+diff in the pending order's direction → the bot's own DAY fill:
+    booked at the intent price; the level advances when the full
+    order is covered (partial fills self-heal as usual)
+whatever remains                      → a manual trade: folded into
+    the base, exactly as it would have been while polling
+```
+
+So ON/OFF is symmetric. The one theoretical mislabel — a manual trade
+that exactly matches a dead unfilled bot order's size and direction
+while the program was off — still leaves inventory consistent with the
+shifted targets (a labeling quirk, never a money error). Overnight
+restarts are always clean: the daily rebase absorbs everything into the
+new base.
+
 ### Foreign orders (bot-exclusive order book)
 
 If a resting order the bot did not place appears, new transitions pause
@@ -314,6 +335,11 @@ left     live tick curve inside the grid: all 11 level lines (soft),
          corridor between the watch lines shaded
 right    5-day candle panel with the anchor + watch lines
 ```
+
+The 5-day candles are kept honest: the watcher refetches them every
+5 minutes, and between refetches the live tick is folded into TODAY's
+bar (close follows, high/low stretch) — the candle moves with the Now
+line instead of freezing at the last main-panel refresh.
 
 The old right-hand status/fills column and the manual Buy/Sell/Cancel
 buttons were removed (2026-07-21) — the banner carries everything. The

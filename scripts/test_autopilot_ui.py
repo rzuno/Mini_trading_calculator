@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gui.autopilot_window import (AutopilotWindow, fills_text, next_line,
                                   next_transitions)
+from gui.autopilot_ctrl import merge_live_bar
 from gui.candle_chart import (bounded_label_layout, candle_color,
                               required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
@@ -151,6 +152,26 @@ ok(anchor == 'e' and wrap is None and x - 100 >= 0,
 x, anchor, wrap = bounded_label_layout(160, 300)
 ok(anchor == 'w' and x >= 0 and x + wrap <= 160,
    'label wider than the canvas receives a bounded wrap width')
+
+print('— live candle fold —')
+bars = [
+    {'date': '07/18', 'open': 96.0, 'high': 99.0, 'low': 95.0, 'close': 98.0},
+    {'date': '07/21', 'ts': '2026-07-21T00:00:00+09:00', 'open': 100.0,
+     'high': 101.0, 'low': 99.5, 'close': 100.4},
+]
+v = merge_live_bar(bars, 102.3, '2026-07-21')
+ok(v[-1]['close'] == 102.3 and v[-1]['high'] == 102.3
+   and v[-1]['low'] == 99.5,
+   "today's candle follows the live price (close moves, high stretches)")
+ok(bars[-1]['close'] == 100.4, 'the source bars stay untouched')
+v = merge_live_bar(bars, 97.0, '2026-07-22')
+ok(v[-1]['close'] == 100.4, 'no fold when the last bar is not today')
+v = merge_live_bar([bars[0]], 97.0, '2026-07-21')
+ok(v[-1]['close'] == 98.0, 'no today bar → nothing changes')
+ok(merge_live_bar([], 97.0, '2026-07-21') == [], 'empty bars stay empty')
+v = merge_live_bar([{'date': '07/21', 'open': 1.0, 'high': 1.0,
+                     'low': 1.0, 'close': 1.0}], 1.2, '2026-07-21')
+ok(v[0]['high'] == 1.2, 'MM/DD date fallback matches Yahoo-style bars')
 
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')

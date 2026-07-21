@@ -47,8 +47,29 @@ _STATE_STORE = os.path.join('data', 'autopilot_state.json')
 _BACKOFF_HOURS_CLOSED = 300     # seconds
 _BACKOFF_INSUFFICIENT = 300     # broker refused the buy: army is out
 _BACKOFF_OTHER = 60
-_TICKS_KEPT = 3600              # ~10h of 10s ticks for the live chart
-_FAIL_ANNOUNCE = 6              # consecutive bad polls (~60s) → one warning
+_TICKS_KEPT = 7200              # ~10h of 5s ticks for the live chart
+_FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one warning
+_OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
+
+
+def merge_live_bar(ohlc, price, trading_date):
+    """A copy of the 5-day bars with the LIVE price folded into TODAY's bar
+    (close follows the tick; high/low stretch to include it), so the candle
+    moves with the Now line instead of freezing at fetch time. Bars are
+    untouched when today's bar is absent or the price is unknown."""
+    view = [dict(b) for b in (ohlc or [])]
+    if not view or not price:
+        return view
+    last = view[-1]
+    today_iso = trading_date or ''
+    today_md = (today_iso[5:].replace('-', '/')
+                if len(today_iso) >= 10 else None)
+    ts = str(last.get('ts') or '')
+    if ts[:10] == today_iso or (today_md and last.get('date') == today_md):
+        last['close'] = price
+        last['high'] = max(last['high'], price)
+        last['low'] = min(last['low'], price)
+    return view
 
 
 # ── Market sessions ───────────────────────────────────────────────────────────
@@ -151,6 +172,7 @@ class AutopilotController:
                 'engine': None, 'mode': 'WATCH',
                 'backoff_until': 0.0,
                 'prev_close': None, 'prev_close_date': None,
+                'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
@@ -286,8 +308,18 @@ class AutopilotController:
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
             'manual_fire': lambda side: self.manual_fire(ticker, side),
             'cancel_all': lambda: self.cancel_all(ticker),
-            'ohlc': lambda: list(self.app._ohlc_data.get(ticker, [])),
+            'ohlc': lambda: self._ohlc_for(ticker),
         }
+
+    def _ohlc_for(self, ticker):
+        """5-day bars for the window: the watcher's own 5-minute refresh
+        (with the live tick folded into today's bar) when available,
+        otherwise the main panel's last Save & Refresh data."""
+        slot = self._slots.get(ticker)
+        view = slot.get('ohlc_view') if slot else None
+        if view:
+            return list(view)
+        return list(self.app._ohlc_data.get(ticker, []))
 
     # ── Card button / badge ───────────────────────────────────────────────────
 
@@ -387,6 +419,25 @@ class AutopilotController:
             pass
         return slot['prev_close']
 
+    def _refresh_ohlc(self, prov, ticker, slot, snap):
+        """Keep the window's 5-day candles honest: refetch them every
+        5 minutes, and fold the live tick into TODAY's bar every poll (the
+        panel already redraws each tick, so the fold costs nothing). The
+        frozen-candle-with-moving-Now-line mismatch is gone."""
+        now = time.time()
+        if now - slot['ohlc_ts'] >= _OHLC_REFRESH_S:
+            slot['ohlc_ts'] = now
+            try:
+                bars = prov.get_candles(ticker, count=6)
+                if bars:
+                    slot['ohlc'] = [dict(b) for b in bars[-5:]]
+            except Exception:
+                # keep the old bars; retry in a minute, not in five
+                slot['ohlc_ts'] = now - _OHLC_REFRESH_S + 60
+        base = slot['ohlc'] or self.app._ohlc_data.get(ticker) or []
+        slot['ohlc_view'] = merge_live_bar(base, snap.get('price'),
+                                           snap.get('trading_date'))
+
     def _real_snapshot(self, prov, seq, ticker, my_ids):
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         price = prov.get_prices([ticker]).get(ticker)
@@ -458,6 +509,7 @@ class AutopilotController:
         snap['prev_close'] = self._prev_close(prov, ticker, slot)
         snap['can_trade'] = (mode == 'LIVE')
         snap['phase'] = market_phase(ticker)
+        self._refresh_ohlc(prov, ticker, slot, snap)
 
         if slot['engine'] is None:
             slot['engine'] = GridEngine(
