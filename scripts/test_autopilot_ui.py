@@ -15,7 +15,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gui.autopilot_window import (AutopilotWindow, fills_text, next_line,
-                                  next_transitions)
+                                  next_transitions, scale_style)
 from gui.autopilot_ctrl import avg_completed_day_v, merge_live_bar
 from gui.candle_chart import (avg_bar_day_v, bounded_label_layout,
                               candle_color, required_label_pad)
@@ -201,6 +201,21 @@ ok(merge_live_bar([], 97.0, '2026-07-21') == [], 'empty bars stay empty')
 v = merge_live_bar([{'date': '07/21', 'open': 1.0, 'high': 1.0,
                      'low': 1.0, 'close': 1.0}], 1.2, '2026-07-21')
 ok(v[0]['high'] == 1.2, 'MM/DD date fallback matches Yahoo-style bars')
+
+print('— grid-scale identity —')
+styles = [scale_style(s) for s in (0.02, 0.025, 0.03, 0.035, 0.04)]
+colors = [c for c, _pt in styles]
+sizes = [pt for _c, pt in styles]
+ok(len(set(colors)) == 5 and len(set(sizes)) == 5,
+   'each offered scale gets its own color and size', str(styles))
+ok(sizes == sorted(sizes),
+   'wider grids read bigger (2% smallest → 4% biggest)', str(sizes))
+ok(colors[0] == '#8FB8DC' and colors[-1] == '#0A3468',
+   'the blue deepens with the scale (faint 2% → deep 4%)', str(colors))
+ok(scale_style(0.031) == scale_style(0.03),
+   'an off-list value snaps to the nearest offered scale')
+ok(scale_style(None) == scale_style(0.03),
+   'a missing scale falls back to the middle grid')
 
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')

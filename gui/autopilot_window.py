@@ -36,7 +36,7 @@ import tkinter.font as tkfont
 from tkinter import messagebox
 
 from core.calc import STOCK_NAMES, fmt_price
-from core.autopilot import LEVEL_CAP
+from core.autopilot import GRID_SCALES, LEVEL_CAP
 from gui.candle_chart import (CandlePanel, bounded_label_layout,
                               required_label_pad)
 
@@ -70,6 +70,111 @@ _STATE_CLR = {'WATCHING': '#0033AA', 'ORDER_PENDING': '#B8860B',
               'WAIT_OPEN': '#666666', 'ARMING': '#666666'}
 
 _FILLS_SHOWN = 8              # newest fills listed in the banner
+
+# Grid-scale identity: the tight grids read small and faint, the wide
+# grids big and deep — the number's weight tells the spacing at a glance.
+_SCALE_COLORS = ('#8FB8DC', '#5B93CC', '#2F73BE', '#12509E', '#0A3468')
+_SCALE_FONT_PT = (12, 13, 15, 17, 19)
+_SCALE_LOCKED_CLR = '#A8A8A8'
+_SCALE_IDLE_RING = '#B4B4B4'
+
+
+def scale_style(step, scales=GRID_SCALES):
+    """(text color, font size) for a grid scale — nearest offered scale
+    wins, so an unexpected value still renders sanely."""
+    scales = list(scales) or list(GRID_SCALES)
+    try:
+        step = float(step)
+    except (TypeError, ValueError):
+        step = scales[len(scales) // 2]
+    idx = min(range(len(scales)), key=lambda i: abs(scales[i] - step))
+    span = max(1, len(scales) - 1)
+    pos = idx / span                       # 0 … 1 across the offered range
+    ci = round(pos * (len(_SCALE_COLORS) - 1))
+    fi = round(pos * (len(_SCALE_FONT_PT) - 1))
+    return _SCALE_COLORS[ci], _SCALE_FONT_PT[fi]
+
+
+class ScaleSelector(tk.Frame):
+    """The grid-scale picker: a row of circles (o-o-O-o-o) over the chosen
+    scale, drawn in that scale's own color and size. Locked (a grid trade
+    exists today, or LIVE is on) greys the circles and ignores clicks."""
+
+    _R_SEL, _R_IDLE, _HIT_PX = 7, 4, 15
+
+    def __init__(self, parent, scales, on_pick, width=150):
+        super().__init__(parent)
+        self._scales = list(scales) or list(GRID_SCALES)
+        self._on_pick = on_pick
+        self._step = self._scales[len(self._scales) // 2]
+        self._locked = False
+        self._hits = []                    # [(x, step)]
+        self.canvas = tk.Canvas(self, width=width, height=22,
+                                highlightthickness=0)
+        self.canvas.pack()
+        self.canvas.bind('<Button-1>', self._on_click)
+        self._lbl = tk.Label(self, text='', font=('Segoe UI', 15, 'bold'))
+        self._lbl.pack()
+        self._draw()
+
+    # -- state in -----------------------------------------------------------
+
+    def set_state(self, step, locked):
+        self._step = step
+        self._locked = bool(locked)
+        self._draw()
+
+    @property
+    def locked(self):
+        return self._locked
+
+    def label_text(self):
+        return self._lbl.cget('text')
+
+    # -- drawing / hit test -------------------------------------------------
+
+    def _draw(self):
+        c = self.canvas
+        c.delete('all')
+        w = int(c.cget('width'))
+        n = len(self._scales)
+        pad, y = 14, 11
+        span = max(1, w - pad * 2)
+        xs = [pad + span * i / max(1, n - 1) for i in range(n)]
+        self._hits = list(zip(xs, self._scales))
+
+        for i in range(n - 1):             # the connecting rail
+            c.create_line(xs[i], y, xs[i + 1], y,
+                          fill=('#DADADA' if self._locked else '#C8C8C8'))
+        for x, s in self._hits:
+            sel = abs(s - (self._step or 0)) < 1e-9
+            color, _pt = scale_style(s, self._scales)
+            if self._locked:
+                fill = _SCALE_LOCKED_CLR if sel else 'white'
+                ring = _SCALE_LOCKED_CLR
+            else:
+                fill = color if sel else 'white'
+                ring = color if sel else _SCALE_IDLE_RING
+            r = self._R_SEL if sel else self._R_IDLE
+            c.create_oval(x - r, y - r, x + r, y + r,
+                          fill=fill, outline=ring, width=(2 if sel else 1))
+        c.config(cursor=('' if self._locked else 'hand2'))
+
+        color, pt = scale_style(self._step, self._scales)
+        try:
+            text = f'{float(self._step) * 100:g}%'
+        except (TypeError, ValueError):
+            text = '--'
+        self._lbl.config(text=text + (' 🔒' if self._locked else ''),
+                         fg=(_SCALE_LOCKED_CLR if self._locked else color),
+                         font=('Segoe UI', pt, 'bold'))
+
+    def _on_click(self, event):
+        if self._locked or not self._hits or not self._on_pick:
+            return
+        x, step = min(self._hits, key=lambda h: abs(h[0] - event.x))
+        if abs(x - event.x) <= self._HIT_PX:
+            self._on_pick(step)
 
 
 def _grid_by_level(ui):
@@ -172,15 +277,9 @@ class AutopilotWindow:
                                    command=self._on_live)
         self._live_btn.pack(fill='x')
         self._default_bg = self._live_btn.cget('bg')
-        self._scale_btn = tk.Menubutton(right, text='grid 3%', font=_F_INFO,
-                                        relief='raised', takefocus=0)
-        scale_menu = tk.Menu(self._scale_btn, tearoff=0)
-        for s in self.ap['scales']():
-            scale_menu.add_command(
-                label=f'{s * 100:g}%',
-                command=lambda ss=s: self._on_scale(ss))
-        self._scale_btn.config(menu=scale_menu)
-        self._scale_btn.pack(fill='x', pady=(4, 0))
+        self._scale = ScaleSelector(right, self.ap['scales'](),
+                                    self._on_scale)
+        self._scale.pack(fill='x', pady=(4, 0))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
@@ -294,11 +393,8 @@ class AutopilotWindow:
 
         # Scale selector: shows the stock's grid; locked while LIVE or once
         # a grid trade exists today (one grid per day).
-        step = ui.get('step') or 0.03
-        locked = mode == 'LIVE' or ui.get('scale_locked')
-        self._scale_btn.config(
-            text=f'grid {step * 100:g}%' + (' 🔒' if locked else ''),
-            state=('disabled' if locked else 'normal'))
+        self._scale.set_state(ui.get('step') or 0.03,
+                              mode == 'LIVE' or ui.get('scale_locked'))
 
         phase = ui.get('phase', 'CLOSED')
         txt, pclr = _PHASE_TXT.get(phase, (phase, '#888'))
