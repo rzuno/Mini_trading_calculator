@@ -65,10 +65,11 @@ from core.calc import trim_buy_price, trim_sell_price, round_half_up
 POLL_SECONDS = 5         # watcher tick (4 light reads per watched ticker)
 
 # ── Grid configuration (v0.2 defaults — edit here, then restart the bot) ────
-GRID_STEP_PCT = 0.03             # arithmetic level spacing (3% of anchor)
+GRID_STEP_PCT = 0.03             # DEFAULT arithmetic level spacing
+GRID_SCALES = (0.02, 0.025, 0.03, 0.035, 0.04)   # selectable per stock
 LEVEL_CAP = 5                    # zone = -5 … +5; outside is not chased
 GRID_WEIGHTS = (1, 2, 3, 4, 5)   # linear level weights (units per step)
-GAP_THRESHOLD = GRID_STEP_PCT    # opening gap ≥ 1 level → compressed init
+# The opening-gap threshold always equals the chosen step (gap ≥ 1 level).
 
 # Absolute inventory bounds (shares). CORE is never sold; MAX None = only
 # the cap bounds accumulation (W(5)=15 units above base).
@@ -86,7 +87,8 @@ _CROSS_EPS = 1e-9        # relative tolerance so an exact touch of a level
 _SAVE_FIELDS = ('trading_date', 'anchor', 'anchor_level', 'reference_close',
                 'opening_price', 'gap_mode', 'gap_pending', 'base_inventory',
                 'unit_qty', 'current_level', 'grid_ready', 'events',
-                'buy_value', 'sell_value', 'fills', 'last_shares')
+                'buy_value', 'sell_value', 'fills', 'bot_fills',
+                'last_shares', 'step')
 
 
 def grid_offsets(cap=LEVEL_CAP, step=GRID_STEP_PCT):
@@ -155,6 +157,7 @@ class GridEngine:
         self.state = 'ARMING'     # ARMING|WAIT_OPEN|WATCHING|ORDER_PENDING
         self.status = 'arming…'
         self.trading_date = trading_date
+        self.step = GRID_STEP_PCT     # per-stock grid scale, survives days
 
         # ── Adventure (per-day session) state ────────────────────────────
         self.anchor = None            # THE anchor price: prev close (L0) or
@@ -173,7 +176,8 @@ class GridEngine:
         self.events = []              # today's actual fills
         self.buy_value = 0.0
         self.sell_value = 0.0
-        self.fills = 0
+        self.fills = 0                # every fill, bot or manual
+        self.bot_fills = 0            # bot-attributed only → scale lock
 
         # UI exposure (rebuilt every poll).
         self.grid = []                # [{'level','price','target'}] cap→-cap
@@ -212,8 +216,13 @@ class GridEngine:
             self.current_level = int(self.current_level or 0)
             self.base_inventory = int(self.base_inventory or 0)
             self.unit_qty = int(self.unit_qty or 0)
+            self.bot_fills = int(self.bot_fills or 0)
             if self.last_shares is not None:
                 self.last_shares = int(self.last_shares)
+            step = float(self.step or GRID_STEP_PCT)
+            if not any(abs(step - s) < 1e-9 for s in GRID_SCALES):
+                step = GRID_STEP_PCT
+            self.step = step
             if self.grid_ready and (not self.anchor or self.unit_qty <= 0):
                 self.grid_ready = False     # old/foreign store format
         except (TypeError, ValueError):
@@ -236,8 +245,8 @@ class GridEngine:
         # Round away binary float noise (100×1.03 = 103.000…01) BEFORE any
         # tick trim, so an exact touch crosses and the ceil/floor trims
         # don't drift a cent off the strategy line.
-        return round(level_raw_price(self.anchor, level, self.anchor_level),
-                     6)
+        return round(level_raw_price(self.anchor, level, self.anchor_level,
+                                     step=self.step), 6)
 
     def _target(self, level):
         return target_inventory(level, self.base_inventory, self.unit_qty)
@@ -279,6 +288,14 @@ class GridEngine:
                       f'sell {self._fp(self.sell_value)} '
                       f'(net {self._fp(net)}), end level '
                       f'{self.current_level:+d}')
+        self._reset_adventure()
+        if not first:
+            self._log(f'new adventure day {d} — grid rebuilds at the '
+                      f'regular open ({self.step * 100:g}% grid)')
+
+    def _reset_adventure(self):
+        """Blank tactical state for a fresh grid (day roll or scale change).
+        The chosen step and the restart bookkeeping survive."""
         self.anchor = None
         self.anchor_level = 0
         self.reference_close = None
@@ -291,11 +308,34 @@ class GridEngine:
         self.buy_value = 0.0
         self.sell_value = 0.0
         self.fills = 0
+        self.bot_fills = 0
         self._pending = None
         self.dirty = True
-        if not first:
-            self._log(f'new adventure day {d} — grid rebuilds at the '
-                      f'regular open')
+
+    def set_scale(self, step):
+        """Choose the grid spacing (one of GRID_SCALES). ONE GRID PER DAY:
+        allowed only while this adventure has no bot trade and no unresolved
+        order — after the first grid trade the scale locks until the next
+        adventure. An allowed change resets the grid completely and
+        re-initializes on the next poll, as if the day just started."""
+        try:
+            step = float(step)
+        except (TypeError, ValueError):
+            return False, 'bad scale value'
+        if not any(abs(step - s) < 1e-9 for s in GRID_SCALES):
+            return False, f'scale {step * 100:g}% is not offered'
+        if abs(step - self.step) < 1e-9:
+            return True, f'grid scale is already {step * 100:g}%'
+        if self.bot_fills > 0 or self._pending:
+            return False, (f'grid trades already made today on the '
+                           f'{self.step * 100:g}% grid — the scale is '
+                           f'locked until the next adventure')
+        old = self.step
+        self.step = step
+        self._reset_adventure()
+        self._log(f'grid scale {old * 100:g}% → {step * 100:g}% — the '
+                  f'adventure re-initializes on the new grid')
+        return True, f'grid scale {step * 100:g}% — the grid rebuilds now'
 
     # ── Fill detection (broker share diffs are the truth) ────────────────────
 
@@ -346,6 +386,7 @@ class GridEngine:
                 else:
                     self.sell_value += value
                 self.fills += 1
+                self.bot_fills += 1
                 lvl = pend.get('level')
                 kind = (f"{pend['side']} L{lvl:+d}" if lvl is not None
                         else pend['side'])
@@ -392,6 +433,8 @@ class GridEngine:
         else:
             self.sell_value += value
         self.fills += 1
+        if pend:
+            self.bot_fills += 1       # grid trade → the scale locks today
 
         if pend and pend.get('level') is not None:
             kind = f'{side} L{pend["level"]:+d}'
@@ -465,17 +508,18 @@ class GridEngine:
 
         # First regular quote of the day → fix the coordinate system.
         # Normal day: the anchor IS the previous close, sitting at L0.
-        # Gap day (open beyond ±3% of it): the anchor IS the opening price
-        # itself, sitting at L∓1 — every level is 3%-of-the-open away.
+        # Gap day (open beyond ±1 step of it): the anchor IS the opening
+        # price itself, sitting at L∓1 — every level one step-of-the-open
+        # away. The threshold always equals the chosen grid step.
         self.opening_price = price
         gap = price / ref - 1.0
-        if gap <= -GAP_THRESHOLD:
+        if gap <= -self.step:
             self.anchor = price
             self.anchor_level = -1
             self.current_level = -1
             self.gap_mode = 'DOWN'
             self.gap_pending = True     # the minimum weight-1 BUY is due
-        elif gap >= GAP_THRESHOLD:
+        elif gap >= self.step:
             self.anchor = price
             self.anchor_level = +1
             self.current_level = +1
@@ -495,13 +539,15 @@ class GridEngine:
                   f'{self._fp(self.anchor)} at L{self.anchor_level:+d} '
                   f'({self.gap_mode.lower()} gap {gap * 100:+.2f}%), '
                   f'base {shares} sh, unit {self.unit_qty} sh, '
-                  f'level {self.current_level:+d}')
+                  f'level {self.current_level:+d}, '
+                  f'grid {self.step * 100:g}%')
         return True
 
     def _preview_grid(self, ref, shares, unit):
         """Display-only grid around the prev close before the open."""
         u = max(1, round_half_up(unit / ref)) if unit > 0 else 0
-        self.grid = [{'level': k, 'price': level_raw_price(ref, k),
+        self.grid = [{'level': k,
+                      'price': level_raw_price(ref, k, step=self.step),
                       'target': target_inventory(k, shares, u),
                       'anchor': k == 0}
                      for k in range(LEVEL_CAP, -LEVEL_CAP - 1, -1)]

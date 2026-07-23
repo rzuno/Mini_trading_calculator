@@ -44,9 +44,10 @@ resets.
 strategy_id: DAILY_V_HAT_LINEAR_GRID
 level_cap: 5                       # CHANGED from 3 → 5 (user decision)
 grid_type: ARITHMETIC_PERCENT_OF_ANCHOR
-grid_step: 0.03                    # offsets 3/6/9/12/15% of the anchor
+grid_scales: [2%, 2.5%, 3%, 3.5%, 4%]   # selectable PER STOCK, see §2.1
+grid_step_default: 0.03
 grid_weights: [1, 2, 3, 4, 5]      # linear; cumulative W = 1,3,6,10,15
-opening_gap_threshold: 0.03        # = the first offset
+opening_gap_threshold: = the chosen step (gap ≥ 1 level)
 session_anchor_source: PREV_CLOSE_AT_L0_OR_GAP_OPEN_AT_L1   # see §5.1
 daily_rebase: true
 one_action_per_poll: true
@@ -57,10 +58,37 @@ poll_interval_seconds: 5
 trade_session: REGULAR_ONLY
 ```
 
-These constants live at the top of `core/autopilot.py`
-(`GRID_STEP_PCT`, `LEVEL_CAP`, `GRID_WEIGHTS`, `MIN_INVENTORY`,
-`MAX_INVENTORY`, `CORE_INVENTORY`). Edit there and restart the bot;
-changing them during a live session is prohibited.
+Structural constants live at the top of `core/autopilot.py`
+(`GRID_SCALES`, `LEVEL_CAP`, `GRID_WEIGHTS`, `MIN_INVENTORY`,
+`MAX_INVENTORY`, `CORE_INVENTORY`). The SCALE is chosen in the window;
+everything else is edit-and-restart.
+
+### 2.1 Grid scale — one grid per day
+
+Some stocks wobble 3–4% a day, some 10%: the spacing must be adaptive.
+The selector sits directly UNDER the LIVE button (`grid 3%`), and the
+choice is remembered PER STOCK across days (Samsung on 2% stays on 2%
+tomorrow).
+
+```text
+allowed   while this adventure has NO grid trade and no unresolved
+          order, and LIVE is off.  Changing the scale then RESETS the
+          grid completely and re-initializes on the next poll exactly
+          like a fresh day-start on the new step (anchor = prev close
+          if price is inside ±step of it, else compressed at the
+          current quote as L∓1).  Nothing carries over — levels of one
+          scale mean nothing on another.
+
+locked    the moment the first grid trade of the day exists (or an
+          order is unresolved): the selector greys out (grid 3% 🔒)
+          until the next adventure.  ONE GRID PER DAY — records from a
+          3% ladder must never steer a 2% ladder.  Manual (folded)
+          fills do NOT lock it; only the bot's own grid trades do.
+```
+
+The scale-picking indicator is the 5-day average day-V (§8): read
+`avg/3` and choose the nearest scale (9% average → 3% grid, 6% → 2%).
+Automating that mapping is a possible future step; today it is manual.
 
 **The cap means "stop trading", not "buy no more":** the chased zone is
 `-5 … 0 … +5`. Outside the zone NOTHING is chased in either direction —
@@ -340,6 +368,24 @@ The 5-day candles are kept honest: the watcher refetches them every
 5 minutes, and between refetches the live tick is folded into TODAY's
 bar (close follows, high/low stretch) — the candle moves with the Now
 line instead of freezing at the last main-panel refresh.
+
+The candle panel draws the SAME grid rows as the live chart (one row per
+level, built by one code path): the anchor and a coinciding watch line
+merge into a single labeled row — e.g. `L+1 (A) 110.00  SELL 1` on an
+up-gap day — never two superposed lines, and the current level always
+shows its `← here` marker. Far soft levels appear only when they fall
+inside the candles' own price range.
+
+The panel header shows the scale indicator instead of the old gear:
+
+```text
+avg day V x.x% → /3 = y.y% grid
+```
+
+`x` = the mean range ((H−L)/L) of the past 5 COMPLETED days — today's
+still-growing bar is excluded (the watcher fetches one extra bar for
+this). `x/3` is the grid-scale hint the commander reads when choosing
+2/2.5/3/3.5/4%. Purely an indicator for now; no automation hangs off it.
 
 The old right-hand status/fills column and the manual Buy/Sell/Cancel
 buttons were removed (2026-07-21) — the banner carries everything. The

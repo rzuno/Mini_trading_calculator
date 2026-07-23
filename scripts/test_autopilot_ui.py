@@ -16,9 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gui.autopilot_window import (AutopilotWindow, fills_text, next_line,
                                   next_transitions)
-from gui.autopilot_ctrl import merge_live_bar
-from gui.candle_chart import (bounded_label_layout, candle_color,
-                              required_label_pad)
+from gui.autopilot_ctrl import avg_completed_day_v, merge_live_bar
+from gui.candle_chart import (avg_bar_day_v, bounded_label_layout,
+                              candle_color, required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
 
 
@@ -30,6 +30,10 @@ def ok(cond, name, info=''):
     assert cond, f'FAIL: {name} {info}'
     passed += 1
     print(f'  ok  {name}')
+
+
+def near(a, b, eps=1e-6):
+    return a is not None and abs(a - b) < eps
 
 
 def grid_ui(anchor_level=0, **over):
@@ -152,6 +156,31 @@ ok(anchor == 'e' and wrap is None and x - 100 >= 0,
 x, anchor, wrap = bounded_label_layout(160, 300)
 ok(anchor == 'w' and x >= 0 and x + wrap <= 160,
    'label wider than the canvas receives a bounded wrap width')
+
+print('— gap-day chart rows (superposition fix) —')
+gap = grid_ui(anchor_level=1, level=0, shares=10)
+rows = window._grid_rows(gap)
+a_rows = [r for r in rows if '(A)' in r[2]]
+ok(len(a_rows) == 1 and a_rows[0][2].startswith('L+1 (A)')
+   and 'SELL' in a_rows[0][2],
+   'anchor + coinciding watch line merge into ONE row (no superposition)',
+   str([r[2] for r in a_rows]))
+here = [r for r in rows if '← here' in r[2]]
+ok(len(here) == 1 and here[0][2].startswith('L+0'),
+   'the current level L+0 is marked on the chart', str(here))
+
+print('— avg completed-day V (scale indicator) —')
+bars6 = ([{'date': f'07/{14 + i}', 'ts': f'2026-07-{14 + i}T00:00:00',
+           'open': 100, 'high': 100.0 + i + 1, 'low': 100.0, 'close': 100}
+          for i in range(5)]                      # day ranges 1% … 5%
+         + [{'date': '07/21', 'ts': '2026-07-21T00:00:00', 'open': 100,
+             'high': 130.0, 'low': 100.0, 'close': 120}])   # today, growing
+v = avg_completed_day_v(bars6, '2026-07-21')
+ok(near(v, 3.0), "today's in-progress bar is excluded (avg of 1..5% = 3%)")
+v = avg_completed_day_v(bars6[:5], '2026-07-21')
+ok(near(v, 3.0), 'works when today has no bar yet')
+ok(avg_completed_day_v([], '2026-07-21') is None, 'no bars → no indicator')
+ok(near(avg_bar_day_v(bars6[:5]), 3.0), 'panel fallback averages its bars')
 
 print('— live candle fold —')
 bars = [

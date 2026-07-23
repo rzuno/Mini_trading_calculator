@@ -37,7 +37,7 @@ from datetime import datetime, date, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-from core.autopilot import GridEngine, POLL_SECONDS
+from core.autopilot import GridEngine, GRID_SCALES, POLL_SECONDS
 from core.calc import fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
@@ -50,6 +50,21 @@ _BACKOFF_OTHER = 60
 _TICKS_KEPT = 7200              # ~10h of 5s ticks for the live chart
 _FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one warning
 _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
+
+
+def avg_completed_day_v(bars, trading_date):
+    """Mean of the last five COMPLETED days' ranges ((H−L)/L in %). Today's
+    in-progress bar is excluded — its range is still growing. This is the
+    scale-picking indicator: the commander reads avg/3 as the grid hint."""
+    today_iso = trading_date or ''
+    today_md = (today_iso[5:].replace('-', '/')
+                if len(today_iso) >= 10 else None)
+    done = [b for b in (bars or [])
+            if not (str(b.get('ts') or '')[:10] == today_iso
+                    or (today_md and b.get('date') == today_md))]
+    vs = [(b['high'] - b['low']) / b['low'] * 100.0
+          for b in done[-5:] if b.get('low')]
+    return (sum(vs) / len(vs)) if vs else None
 
 
 def merge_live_bar(ohlc, price, trading_date):
@@ -173,6 +188,7 @@ class AutopilotController:
                 'backoff_until': 0.0,
                 'prev_close': None, 'prev_close_date': None,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
+                'day_v_avg': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
@@ -222,6 +238,28 @@ class AutopilotController:
     def ui_state(self, ticker):
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
+
+    # ── Grid scale (UI thread, from the Autopilot window) ────────────────────
+
+    def set_scale(self, ticker, step):
+        """Choose the grid spacing for this stock (persists across days).
+        Refused while LIVE, and — one grid per day — after the first grid
+        trade of the adventure."""
+        slot = self._slots.get(ticker)
+        if not slot:
+            return False, 'not watching'
+        if slot['mode'] == 'LIVE':
+            return False, 'turn LIVE off before changing the grid scale'
+        engine = slot.get('engine')
+        if engine is None:
+            return False, 'still arming — try again in a moment'
+        ok, msg = engine.set_scale(step)
+        self._log(ticker, f'scale request {step * 100:g}%: {msg}')
+        if ok and getattr(engine, 'dirty', False):
+            if self._save_state(ticker, engine):
+                engine.dirty = False
+        self._wake.set()
+        return ok, msg
 
     # ── Manual fire / cancel (UI thread, from the Autopilot window) ──────────
 
@@ -309,6 +347,8 @@ class AutopilotController:
             'manual_fire': lambda side: self.manual_fire(ticker, side),
             'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
+            'set_scale': lambda s: self.set_scale(ticker, s),
+            'scales': lambda: list(GRID_SCALES),
         }
 
     def _ohlc_for(self, ticker):
@@ -428,9 +468,13 @@ class AutopilotController:
         if now - slot['ohlc_ts'] >= _OHLC_REFRESH_S:
             slot['ohlc_ts'] = now
             try:
-                bars = prov.get_candles(ticker, count=6)
+                # 7 bars: 5 COMPLETED days for the avg-day-V indicator plus
+                # today's in-progress bar (and one spare for holidays).
+                bars = prov.get_candles(ticker, count=7)
                 if bars:
                     slot['ohlc'] = [dict(b) for b in bars[-5:]]
+                    slot['day_v_avg'] = avg_completed_day_v(
+                        bars, snap.get('trading_date'))
             except Exception:
                 # keep the old bars; retry in a minute, not in five
                 slot['ohlc_ts'] = now - _OHLC_REFRESH_S + 60
@@ -631,6 +675,11 @@ class AutopilotController:
             'grid_ready': getattr(engine, 'grid_ready', False),
             'anchor': engine.anchor if engine else None,
             'anchor_level': getattr(engine, 'anchor_level', 0),
+            'step': getattr(engine, 'step', 0.03),
+            'scale_locked': bool(engine
+                                 and (getattr(engine, 'bot_fills', 0) > 0
+                                      or getattr(engine, '_pending', None))),
+            'day_v_avg': slot.get('day_v_avg'),
             'reference_close': getattr(engine, 'reference_close', None),
             'opening_price': getattr(engine, 'opening_price', None),
             'gap_mode': getattr(engine, 'gap_mode', 'NONE'),

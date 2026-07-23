@@ -24,8 +24,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.autopilot import (GridEngine, LEVEL_CAP, GRID_STEP_PCT,
-                            POLL_SECONDS, grid_offsets, cum_weight,
-                            level_raw_price, target_inventory)
+                            GRID_SCALES, POLL_SECONDS, grid_offsets,
+                            cum_weight, level_raw_price, target_inventory)
 
 T = 'TEST'                 # USD-style ticker: cent trims keep prices exact
 D1, D2 = '2026-07-21', '2026-07-22'
@@ -456,6 +456,64 @@ ok(e2.current_level == -1 and e2.base_inventory == 15,
 ok(b.shares == 16
    and target_inventory(-1, e2.base_inventory, e2.unit_qty) == 16,
    'inventory stays exactly consistent with the shifted targets')
+
+# ── Grid scale: 2–4%, one grid per day ──────────────────────────────────────
+print('— grid scale —')
+ok(GRID_SCALES == (0.02, 0.025, 0.03, 0.035, 0.04),
+   'offered scales 2/2.5/3/3.5/4%')
+
+e, b = fresh()
+settle(e, b, 100.0)
+okd, msg = e.set_scale(0.02)
+ok(okd and e.step == 0.02 and not e.grid_ready,
+   'scale change before any trade resets the grid completely')
+settle(e, b, 100.0)                       # re-initializes on the 2% grid
+grid = {g['level']: g for g in e.grid}
+ok(near(grid[1]['price'], 102.0) and near(grid[-5]['price'], 90.0),
+   '2% levels hang off the same prev-close anchor')
+r = run_path(e, b, [98.0, 100.0])
+ok([x[1] for x in r] == [11, 10], 'the V tooth now trades at ±2%')
+okd, msg = e.set_scale(0.03)
+ok(not okd and e.step == 0.02 and 'locked' in msg,
+   'after the first grid trade the scale locks for the day', msg)
+
+e2, b2 = fresh()
+settle(e2, b2, 100.0)
+acts = e2.poll(make_snap(94.0, b2))       # BUY placed, still unfilled
+b2.place(acts[0][1], acts[0][2], acts[0][3])
+okd, _m = e2.set_scale(0.02)
+ok(not okd, 'an unresolved order also locks the scale')
+
+e3, b3 = fresh()
+settle(e3, b3, 100.0)
+b3.shares += 4                             # manual fold — not a grid trade
+e3.poll(make_snap(100.0, b3))
+okd, _m = e3.set_scale(0.04)
+ok(okd and e3.step == 0.04, 'manual folds never lock the scale')
+
+e4, b4 = fresh()
+settle(e4, b4, 100.0)
+e4.set_scale(0.02)
+run_path(e4, b4, [98.0])                   # one 2% grid trade → locked
+d = e4.to_dict()
+e5 = GridEngine(T, saved=d)
+ok(e5.step == 0.02 and e5.bot_fills == 1,
+   'the chosen scale and its lock survive a restart')
+settle(e5, b4, 98.0, date=D2, prev_close=98.0)
+ok(e5.step == 0.02 and e5.bot_fills == 0 and e5.anchor == 98.0,
+   'the next adventure REMEMBERS the 2% scale and unlocks it')
+okd, _m = e5.set_scale(0.03)
+ok(okd and e5.step == 0.03, 'a fresh day may pick a new scale before trading')
+
+e6, b6 = fresh()
+e6.set_scale(0.02)
+settle(e6, b6, 97.5)                       # -2.5% open
+ok(e6.gap_mode == 'DOWN' and e6.anchor == 97.5 and e6.anchor_level == -1,
+   'a -2.5% open IS a gap on the 2% grid (threshold = the step)')
+e7, b7 = fresh()
+settle(e7, b7, 97.5)
+ok(e7.gap_mode == 'NONE' and e7.anchor == 100.0,
+   'the same open stays inside the band on the 3% grid')
 
 # ── KR tick trimming ────────────────────────────────────────────────────────
 print('— KR ticks —')

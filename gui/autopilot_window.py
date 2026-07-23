@@ -165,10 +165,22 @@ class AutopilotWindow:
         self._state_lbl = tk.Label(head, text='', font=_F_TITLE)
         self._state_lbl.pack(side='left', padx=(16, 0))
 
-        self._live_btn = tk.Button(head, text='LIVE', font=_F_BTN, width=8,
+        # LIVE with the grid-scale selector directly under it.
+        right = tk.Frame(head)
+        right.pack(side='right', padx=(6, 0))
+        self._live_btn = tk.Button(right, text='LIVE', font=_F_BTN, width=8,
                                    command=self._on_live)
-        self._live_btn.pack(side='right', padx=(6, 0))
+        self._live_btn.pack(fill='x')
         self._default_bg = self._live_btn.cget('bg')
+        self._scale_btn = tk.Menubutton(right, text='grid 3%', font=_F_INFO,
+                                        relief='raised', takefocus=0)
+        scale_menu = tk.Menu(self._scale_btn, tearoff=0)
+        for s in self.ap['scales']():
+            scale_menu.add_command(
+                label=f'{s * 100:g}%',
+                command=lambda ss=s: self._on_scale(ss))
+        self._scale_btn.config(menu=scale_menu)
+        self._scale_btn.pack(fill='x', pady=(4, 0))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
@@ -233,13 +245,15 @@ class AutopilotWindow:
         if dn and dn['side'] != '—':
             detail.append(f"  down L{dn['level']:+d}: {dn['side']} "
                           f"{dn['qty']} @ {fmt_price(dn['price'], self.ccy)}")
+        step = ui.get('step') or 0.03
         detail += [
             '',
-            f"Zone -{LEVEL_CAP}…+{LEVEL_CAP} around anchor "
-            f"{fmt_price(ui.get('anchor'), self.ccy)}, unit "
+            f"Zone -{LEVEL_CAP}…+{LEVEL_CAP} in {step * 100:g}% steps "
+            f"around anchor {fmt_price(ui.get('anchor'), self.ccy)}, unit "
             f"{ui.get('unit_qty', 0)} sh. One order at a time; every fill "
             f"re-aims the two adjacent levels; V and ^ are both harvested. "
-            f"LIVE drops back to WATCH when the market closes.",
+            f"The scale locks after the first grid trade; LIVE drops back "
+            f"to WATCH when the market closes.",
         ]
         if not messagebox.askyesno('Autopilot LIVE', '\n'.join(detail),
                                    parent=self.win):
@@ -247,6 +261,11 @@ class AutopilotWindow:
         ok, msg = self.ap['set_mode']('LIVE')
         if not ok:
             messagebox.showwarning('Autopilot', msg, parent=self.win)
+
+    def _on_scale(self, step):
+        ok, msg = self.ap['set_scale'](step)
+        if not ok:
+            messagebox.showwarning('Grid scale', msg, parent=self.win)
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -272,6 +291,14 @@ class AutopilotWindow:
         self._live_btn.config(
             bg=(_LIVE_BG if mode == 'LIVE' else self._default_bg),
             fg=('white' if mode == 'LIVE' else 'black'))
+
+        # Scale selector: shows the stock's grid; locked while LIVE or once
+        # a grid trade exists today (one grid per day).
+        step = ui.get('step') or 0.03
+        locked = mode == 'LIVE' or ui.get('scale_locked')
+        self._scale_btn.config(
+            text=f'grid {step * 100:g}%' + (' 🔒' if locked else ''),
+            state=('disabled' if locked else 'normal'))
 
         phase = ui.get('phase', 'CLOSED')
         txt, pclr = _PHASE_TXT.get(phase, (phase, '#888'))
@@ -379,29 +406,33 @@ class AutopilotWindow:
         return rows
 
     def _refresh_candles(self):
+        """The candle panel draws the SAME grid rows as the live chart (one
+        row per level — the anchor and a coinciding watch line are merged,
+        never superposed). Bold rows (anchor + the two watch lines) and the
+        ← here marker always show; far soft levels only when they fall
+        inside the candles' own price range."""
         ui = self.ui
         ohlc = self.ap['ohlc']() or []
         refs = []
         if ui and ui.get('grid_ready'):
-            up, dn = next_transitions(ui)
-            a_lvl = ui.get('anchor_level') or 0
-            refs.append({'label': f"L{a_lvl:+d} (A) "
-                                  f"{fmt_price(ui.get('anchor'), self.ccy)}",
-                         'price': ui.get('anchor'), 'color': _CLR['anchor'],
-                         'dash': (5, 4), 'width': 2})
-            no_army = ui.get('buy_state') == 'EXHAUSTED'
-            for t in (up, dn):
-                if not t or t['side'] == '—':
+            span = [b['low'] for b in ohlc] + [b['high'] for b in ohlc]
+            if ui.get('price'):
+                span.append(ui['price'])
+            lo, hi = (min(span), max(span)) if span else (None, None)
+            for price, color, text, bold in self._grid_rows(ui):
+                keep = (bold or '← here' in text
+                        or (lo is not None and lo <= price <= hi))
+                if not keep:
                     continue
-                color = _CLR['up'] if t['side'] == 'SELL' else _CLR['dn']
-                label = (f"L{t['level']:+d} {t['side']} {t['qty']} @ "
-                         f"{fmt_price(t['price'], self.ccy)}")
-                if t['side'] == 'BUY' and no_army:
-                    color, label = _NO_ARMY_CLR, f'✕ {label} (no army)'
-                refs.append({'label': label, 'price': t['price'],
-                             'color': color, 'dash': (2, 4), 'width': 1.6})
+                anchor_row = '(A)' in text
+                refs.append({'label': text, 'price': price, 'color': color,
+                             'dash': ((5, 4) if anchor_row else
+                                      (2, 4) if bold else (3, 6)),
+                             'width': (2 if anchor_row else
+                                       1.8 if bold else 1.1)})
         self.candle_panel.update(ohlc=ohlc, ref_lines=refs,
-                                 current=(ui or {}).get('price'))
+                                 current=(ui or {}).get('price'),
+                                 day_v_avg=(ui or {}).get('day_v_avg'))
 
     # ── Live chart ────────────────────────────────────────────────────────────
 
