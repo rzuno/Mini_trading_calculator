@@ -17,7 +17,7 @@ STOCK_NAMES = {
     'AMZN':  'Amazon',
     'STX':   'Seagate',
     'INTC':  'Intel',
-    'ORCL':  'Oracle',
+    'SKHY':  'SK Hynix ADR',
 }
 
 # ── Fixed stock display order ────────────────────────────────────────────────

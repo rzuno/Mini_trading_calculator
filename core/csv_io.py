@@ -47,7 +47,7 @@ _PORTFOLIO = [
     ('AMZN',  'Major'),
     ('STX',   'Major'),
     ('INTC',  'Major'),
-    ('ORCL',  'Major'),
+    ('SKHY',  'Major'),
 ]
 
 

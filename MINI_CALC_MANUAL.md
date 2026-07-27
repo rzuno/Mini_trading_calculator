@@ -42,7 +42,7 @@ It deliberately omits the main program's perk engine, anchor tracking, regime de
 | 13 | AMZN | Amazon | USD | No |
 | 14 | STX | Seagate | USD | No |
 | 15 | INTC | Intel | USD | No |
-| 16 | ORCL | Oracle | USD | No |
+| 16 | SKHY | SK Hynix ADR | USD | No |
 
 To add a stock: add a name in `STOCK_NAMES` (`core/calc.py`), a default in `_PORTFOLIO` (`core/csv_io.py`), and a row in `data/positions.csv`.
 
