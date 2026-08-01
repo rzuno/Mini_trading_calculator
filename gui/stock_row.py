@@ -656,8 +656,10 @@ class StockRow:
 
     def line_config(self) -> dict:
         """The campaign parameters the bot must follow — exactly what this card
-        shows right now. One gearbox, one source."""
-        return {'gear': self._get_gear(), 'exit_tier': self._get_tier()}
+        shows right now. One gearbox, one source. `auto` rides along so the
+        cockpit's controls can mirror the card's AUTO/MANUAL state."""
+        return {'gear': self._get_gear(), 'exit_tier': self._get_tier(),
+                'auto': self.auto_var.get()}
 
     def current_shares(self) -> int:
         try:

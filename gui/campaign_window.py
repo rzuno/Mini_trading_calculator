@@ -10,12 +10,25 @@ follows exactly the lines the CARD draws — same gear, same exit tier.
            to WATCH at the close).
 
 There are no manual Buy/Sell buttons: the point of the bot is that the offer
-goes out when the curve touches the line. The only intervention left is
-"Cancel all", the escape hatch.
+goes out when the curve touches the line.
+
+**Cancel resting** is the one order-level intervention, and it exists for a
+specific reason: the bot never re-prices an order it has already sent. One
+order per side at a time, and while it rests that side is blocked. So if the
+gear shifts (or the tier changes) while a chase is resting, the resting order
+sits at the OLD price and the new line cannot arm until it is gone. Cancelling
+it lets the next poll re-arm at the current line. It is also the way to pull a
+line you no longer want before the market reaches it. It touches only resting
+(unfilled) orders — a filled trade cannot be cancelled.
+
+The gear and exit tier are chosen here as well as on the card. Both write to
+the CARD, which is the single source of truth; the card's own trace pushes the
+change straight back to the engine, so the lines move on the next poll.
 
 Layout is ONE information banner over TWO charts, plus the campaign log:
 
-    header   name · campaign state · market phase · LIVE
+    header   name · campaign state · market phase · Cancel resting · LIVE
+    gearbox  AUTO · G1..G5 · T1/T2/T3 · V and the gear it recommends
     banner   gear line (G/tier · load% / chase% ×frac · vantage)
              position · reserve · campaign age / chases / low
              ▲ the EXIT   ▼ the next buy and its size, then the ones after
@@ -34,7 +47,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox
 
-from core.calc import STOCK_NAMES, fmt_price
+from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, exit_pct, fmt_price,
+                       gear_button_color, gear_button_fg, gear_params,
+                       select_auto_gear)
 from gui.candle_chart import (CandlePanel, bounded_label_layout,
                               required_label_pad)
 
@@ -42,6 +57,8 @@ _F_TITLE = ('Segoe UI', 17, 'bold')
 _F_STAT  = ('Segoe UI', 13)
 _F_BTN   = ('Segoe UI', 13, 'bold')
 _F_INFO  = ('Segoe UI', 12)
+_F_SM    = ('Segoe UI', 10)
+_F_SM_B  = ('Segoe UI', 10, 'bold')
 _F_AXIS  = ('Segoe UI', 10)
 _F_REF   = ('Segoe UI', 11, 'bold')
 _F_LOG   = ('Consolas', 11)
@@ -78,8 +95,10 @@ _KIND_CLR = {'LOAD': '#0033AA', 'RELOAD': '#E08000', 'CHASE': '#3366CC',
 _VANTAGE_SRC = {'high5': 'High5', 'close': 'prev close',
                 'reload': 'sell fill'}
 
-# Buy lines in the order they would fire, armed first.
-_BUY_KEYS = ('load', 'chase', 'chase2', 'chase3')
+# Buy lines in the order they would fire, armed first. A DEPLOYED campaign
+# arms 'chase' and projects chase2/chase3; a FLAT one arms 'load' and projects
+# the whole ladder from chase1 — the same two chases its card prints.
+_BUY_KEYS = ('load', 'chase', 'chase1', 'chase2', 'chase3')
 
 
 def campaign_line(ui, currency):
@@ -206,11 +225,40 @@ class CampaignWindow:
                                    command=self._on_live)
         self._live_btn.pack(side='right', padx=(6, 0))
         self._default_bg = self._live_btn.cget('bg')
-        self._cancel_btn = tk.Button(head, text='Cancel all', font=_F_INFO,
+        # Only ever enabled when something is actually resting — the button
+        # naming the count is what explains what it is for.
+        self._cancel_btn = tk.Button(head, text='no resting orders',
+                                     font=_F_INFO, state='disabled',
                                      command=self._do_cancel)
         self._cancel_btn.pack(side='right', padx=(6, 0))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
+
+        # ── Gearbox strip: the same choice as the card, at the cockpit ────────
+        box = tk.Frame(self.win, padx=12, pady=3)
+        box.pack(fill='x')
+        self._auto_btn = tk.Button(box, text='AUTO', font=_F_SM_B, width=7,
+                                   command=self._on_auto)
+        self._auto_btn.pack(side='left', padx=(0, 10))
+        tk.Label(box, text='gear', font=_F_SM, fg='#888').pack(side='left')
+        self._gear_btns = {}
+        for g in sorted(GEARS):
+            b = tk.Button(box, text=str(g), font=_F_SM_B, width=2, bd=1,
+                          takefocus=0, command=lambda g=g: self._on_gear(g))
+            b.pack(side='left', padx=1)
+            self._gear_btns[g] = b
+        self._gear_txt = tk.Label(box, text='', font=_F_SM, fg='#666')
+        self._gear_txt.pack(side='left', padx=(8, 16))
+
+        tk.Label(box, text='exit', font=_F_SM, fg='#888').pack(side='left')
+        self._tier_btns = {}
+        for t in EXIT_TIERS:
+            b = tk.Button(box, text=f'T{t}', font=_F_SM_B, width=6, bd=1,
+                          takefocus=0, command=lambda t=t: self._on_tier(t))
+            b.pack(side='left', padx=1)
+            self._tier_btns[t] = b
+        self._vol_lbl = tk.Label(box, text='', font=_F_SM, fg='#666')
+        self._vol_lbl.pack(side='left', padx=(16, 0))
 
         # ── Banner ────────────────────────────────────────────────────────────
         self._gear_lbl = tk.Label(self.win, text='', font=_F_BTN,
@@ -311,13 +359,74 @@ class CampaignWindow:
             messagebox.showwarning('Autopilot', msg, parent=self.win)
 
     def _do_cancel(self):
-        if not messagebox.askyesno(
-                'Cancel', f'Cancel EVERY live order on {self.ticker}?',
-                parent=self.win):
+        orders = (self.ui or {}).get('orders') or []
+        if not orders:
+            return
+        lines = [f'Cancel {len(orders)} resting order(s) on {self.ticker}?',
+                 '']
+        for o in orders:
+            lines.append(f"  {o.get('side', '?')} {o.get('qty_open', '?')} @ "
+                         f"{fmt_price(o.get('price'), self.ccy)}")
+        lines += ['',
+                  'Only unfilled orders are cancelled; anything already '
+                  'traded stays. The bot re-arms the current line on its '
+                  'next poll.']
+        if not messagebox.askyesno('Cancel resting orders', '\n'.join(lines),
+                                   parent=self.win):
             return
         ok, msg = self.ap['cancel_all']()
         if not ok:
             messagebox.showwarning('Cancel', msg, parent=self.win)
+
+    # ── Gearbox strip ─────────────────────────────────────────────────────────
+
+    def _on_auto(self):
+        """Hand the gear back to volatility."""
+        self.ap['set_auto']()
+
+    def _on_gear(self, gear):
+        """Picking a gear is a manual choice — the controller flips the card
+        off AUTO so volatility does not overwrite it on the next fetch."""
+        self.ap['set_gear'](gear)
+
+    def _on_tier(self, tier):
+        self.ap['set_tier'](tier)
+
+    def _update_gearbox(self, ui):
+        c = ui.get('campaign') or {}
+        gear = c.get('gear')
+        tier = c.get('exit_tier')
+        auto = bool(ui.get('card_auto', True))
+
+        self._auto_btn.config(
+            text='AUTO' if auto else 'MANUAL',
+            bg=('#2E8B57' if auto else '#E6B800'),
+            fg=('white' if auto else 'black'),
+            activebackground=('#2E8B57' if auto else '#E6B800'))
+        for g, b in self._gear_btns.items():
+            picked = (g == gear)
+            b.config(bg=(gear_button_color(g) if picked else self._default_bg),
+                     fg=(gear_button_fg(g) if picked else '#666'),
+                     relief=('sunken' if picked else 'raised'))
+        if gear:
+            g = gear_params(gear)
+            self._gear_txt.config(
+                text=f"{g['name']}  -{g['load']}% / -{g['chase']}% ×{g['frac']}"
+                     + ('' if auto else '  (manual)'))
+            for t, b in self._tier_btns.items():
+                picked = (t == tier)
+                b.config(text=f'T{t} +{exit_pct(gear, t)}%',
+                         bg=(_CLR['exit'] if picked else self._default_bg),
+                         fg=('white' if picked else '#666'),
+                         relief=('sunken' if picked else 'raised'))
+
+        v = ui.get('vol5')
+        if v is None:
+            self._vol_lbl.config(text='V --')
+        else:
+            rec = select_auto_gear(v)
+            tail = '' if (auto or rec == gear) else f' (AUTO would pick G{rec})'
+            self._vol_lbl.config(text=f'V {v:.1f}% → G{rec}{tail}')
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -348,6 +457,13 @@ class CampaignWindow:
         mkt = 'KR' if self.ticker.endswith('.KS') else 'US'
         self._phase_lbl.config(text=f'{mkt} market: {txt}', fg=pclr)
 
+        orders = ui.get('orders') or []
+        self._cancel_btn.config(
+            text=(f'Cancel {len(orders)} resting' if orders
+                  else 'no resting orders'),
+            state=('normal' if orders else 'disabled'))
+
+        self._update_gearbox(ui)
         self._gear_lbl.config(text=campaign_line(ui, self.ccy))
         self._age_lbl.config(text=campaign_age_line(ui, self.ccy))
         self._info_lbl.config(text=self._info_text(ui))
@@ -467,7 +583,7 @@ class CampaignWindow:
                              'width': (1.8 if bold else 1.1)})
         self.candle_panel.update(ohlc=ohlc, ref_lines=refs,
                                  current=(ui or {}).get('price'),
-                                 day_v_avg=(ui or {}).get('day_v_avg'))
+                                 vol5=(ui or {}).get('vol5'))
 
     # ── Live chart ────────────────────────────────────────────────────────────
 

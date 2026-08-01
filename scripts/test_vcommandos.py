@@ -24,9 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.calc import (GEARS, RELOAD_DROP_PCT, add_ratio, calc_chase_cascade,
                        calc_exit, calc_exit_lines, calc_load_ladder,
                        calc_load_price, calc_load_shares, calc_reload_price,
-                       chase_drop, effective_entry_gear, exit_pct, load_drop,
-                       normalize_gear, select_auto_gear, tier_for_exit_pct,
-                       weight_min_gear)
+                       calc_volatility, chase_drop, effective_entry_gear,
+                       exit_pct, load_drop, normalize_gear, select_auto_gear,
+                       tier_for_exit_pct, weight_min_gear)
 from core.vcommandos import CampaignEngine
 
 T = 'TEST'                 # USD-style ticker: cent trims keep prices exact
@@ -72,15 +72,19 @@ ok(all(exit_pct(g, 2) == MANUAL_GEARS[g][3][1] for g in MANUAL_GEARS),
 ok(tier_for_exit_pct(3, 5) == 2 and tier_for_exit_pct(3, 99) is None,
    'a stored exit percent maps back to its tier')
 
-print('— volatility → gear (manual §17, raised cut points) —')
-CUTS = [(0.0, 1), (14.9, 1), (15.0, 1), (15.1, 2), (20.0, 2), (20.1, 3),
-        (25.0, 3), (25.1, 4), (30.0, 4), (30.1, 5), (55.0, 5)]
+print('— volatility → gear (manual §17) —')
+# V = 100 × (High5 − Low5) / High5 — the span of the whole 5-day window.
+CUTS = [(0.0, 1), (9.9, 1), (10.0, 1), (10.1, 2), (15.0, 2), (15.1, 3),
+        (20.0, 3), (20.1, 4), (25.0, 4), (25.1, 5), (55.0, 5)]
 for v, g in CUTS:
     ok(select_auto_gear(v) == g, f'V {v}% → G{g}')
 ok(select_auto_gear(None) == 1,
    'unknown volatility never guesses its way into the doubling gear')
-ok(select_auto_gear(22.0) == 3,
-   'the raised rule keeps a 22% stock off G5 (the old ladder gave it G5)')
+ok(select_auto_gear(25.1) == 5 and select_auto_gear(25.0) == 4,
+   'G5 — the share-doubling gear — arms only above a 25% range')
+ok(near(calc_volatility(104.0, 92.0), 11.538, 0.001)
+   and select_auto_gear(calc_volatility(104.0, 92.0)) == 2,
+   'V is computed from the 5-day high and low, then read off the ladder')
 
 print('— heavy-unit entry floor —')
 ok(weight_min_gear(900, 1000) == 1 and weight_min_gear(1300, 1000) == 2
@@ -88,7 +92,7 @@ ok(weight_min_gear(900, 1000) == 1 and weight_min_gear(1300, 1000) == 2
    'one chunky share floors the entry gear')
 ok(effective_entry_gear(5.0, 2600, 1000) == 5,
    'a calm but chunky stock still enters on G5')
-ok(effective_entry_gear(35.0, 100, 1000) == 5,
+ok(effective_entry_gear(30.0, 100, 1000) == 5,
    'a violent stock reaches G5 on volatility alone')
 
 print('— legacy migration —')
@@ -294,6 +298,25 @@ flat_e, flat_b, flat_card = fresh(gear=3)
 settle(flat_e, flat_b, 95.0, card=flat_card)
 ok(flat_e.lines['load']['armed'] and not flat_e.lines['pexit']['armed'],
    "a flat card arms the LOAD and marks its exit a projection")
+ok('chase1' in flat_e.lines and 'chase2' in flat_e.lines,
+   'a FLAT stock publishes chase 1 AND chase 2 — the LOAD is the armed line '
+   'there, so chase 1 is a projection like the rest',
+   str(list(flat_e.lines)))
+ok('chase' not in flat_e.lines,
+   "and no bare 'chase' key, which only a deployed campaign arms")
+fl_load = line(flat_e, 'load')
+fl_c1, fl_c2 = line(flat_e, 'chase1'), line(flat_e, 'chase2')
+ok(fl_load[0] > fl_c1[0] > fl_c2[0],
+   'the flat ladder descends LOAD → chase 1 → chase 2',
+   f'{fl_load[0]} {fl_c1[0]} {fl_c2[0]}')
+card_ladder, _lp, _lq = calc_load_ladder(100.0, 3, UNIT, chases=2)
+ok(near(fl_c1[0], card_ladder[1]['price'], 0.02)
+   and fl_c1[1] == card_ladder[1]['qty'],
+   "and matches the flat CARD's own Chase 1 line exactly",
+   f"{fl_c1} vs {card_ladder[1]}")
+ok(near(fl_c2[0], card_ladder[2]['price'], 0.02)
+   and fl_c2[1] == card_ladder[2]['qty'],
+   "and its Chase 2 line too")
 
 print('— same-day reload —')
 e, b, card = fresh(gear=3)

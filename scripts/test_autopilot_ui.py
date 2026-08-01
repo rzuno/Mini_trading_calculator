@@ -20,12 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tkinter as tk
 
-from core.calc import fmt_price
+from core.calc import calc_volatility, fmt_price, select_auto_gear
 from gui.campaign_window import (CampaignWindow, buy_lines, campaign_age_line,
                                  campaign_line, fill_log_rows, next_line)
-from gui.autopilot_ctrl import (AutopilotController, avg_completed_day_v,
-                                merge_live_bar)
-from gui.candle_chart import (avg_bar_day_v, bounded_label_layout,
+from gui.autopilot_ctrl import AutopilotController, merge_live_bar
+from gui.candle_chart import (bar_range_v, bounded_label_layout,
                               candle_color, required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
 
@@ -79,7 +78,8 @@ def deployed_ui(**over):
         ],
         'price': 91.2, 'shares': 31, 'avg_cost': 92.0,
         'buying_power': 4200.0, 'unit_cash': 1000.0, 'orders': [],
-        'ticks': [(1.0, 92.0), (2.0, 91.5), (3.0, 91.2)], 'day_v_avg': 3.1,
+        'ticks': [(1.0, 92.0), (2.0, 91.5), (3.0, 91.2)], 'vol5': 18.0,
+        'card_auto': True,
     }
     ui.update(over)
     return ui
@@ -100,7 +100,9 @@ def flat_ui(**over):
         'lines': {
             'load':   {'price': 92.0, 'qty': 11, 'kind': 'load',
                        'label': 'LOAD -8%', 'armed': True},
-            'chase2': {'price': 86.48, 'qty': 8, 'kind': 'chase2',
+            'chase1': {'price': 86.48, 'qty': 8, 'kind': 'chase1',
+                       'label': 'chase 1', 'armed': False},
+            'chase2': {'price': 84.26, 'qty': 14, 'kind': 'chase2',
                        'label': 'chase 2', 'armed': False},
             'pexit':  {'price': 96.60, 'qty': 11, 'kind': 'pexit',
                        'label': 'exit if loaded T2 +5%', 'armed': False},
@@ -108,7 +110,7 @@ def flat_ui(**over):
         'crossed': {'BUY': None, 'SELL': None}, 'events': [],
         'price': 95.0, 'shares': 0, 'avg_cost': 0.0,
         'buying_power': 4200.0, 'unit_cash': 1000.0, 'orders': [],
-        'ticks': [], 'day_v_avg': 3.1,
+        'ticks': [], 'vol5': 18.0, 'card_auto': True,
     }
     ui.update(over)
     return ui
@@ -144,6 +146,11 @@ ok('[NO ARMY]' in next_line(deployed_ui(buy_state='EXHAUSTED'), 'USD'),
 fnxt = next_line(flat_ui(), 'USD')
 ok('▲ exit if loaded 96.60 × 11' in fnxt and '▼ LOAD -8% 92.00 × 11' in fnxt,
    'a flat card shows the LOAD and marks its exit as projected', fnxt)
+ok('then 86.48 × 8  ·  84.26 × 14' in fnxt,
+   'a FLAT stock shows chase 1 as well as chase 2 — chase 1 is a projection '
+   'there, not the armed line', fnxt)
+ok([e['kind'] for e in buy_lines(flat_ui())] == ['load', 'chase1', 'chase2'],
+   'the flat ladder is LOAD then chase 1 then chase 2')
 ok(next_line({'lines': {}}, 'USD') == '▲ no exit line      ▼ no buy line',
    'a bare ui degrades to a readable placeholder')
 
@@ -223,18 +230,21 @@ x, anchor, wrap = bounded_label_layout(160, 300)
 ok(anchor == 'w' and x >= 0 and x + wrap <= 160,
    'label wider than the canvas receives a bounded wrap width')
 
-print('— avg completed-day V —')
-bars6 = ([{'date': f'07/{14 + i}', 'ts': f'2026-07-{14 + i}T00:00:00',
-           'open': 100, 'high': 100.0 + i + 1, 'low': 100.0, 'close': 100}
-          for i in range(5)]                      # day ranges 1% … 5%
-         + [{'date': '07/19', 'ts': '2026-07-19T00:00:00', 'open': 100,
-             'high': 150.0, 'low': 100.0, 'close': 120}])   # today, 50%
-ok(near(avg_completed_day_v(bars6, '2026-07-19'), 3.0),
-   "today's in-progress bar is excluded (avg of 1..5% = 3%)")
-ok(near(avg_completed_day_v(bars6[:5], '2026-07-19'), 3.0),
-   'works when today has no bar yet')
-ok(avg_completed_day_v([], '2026-07-19') is None, 'no bars → no indicator')
-ok(near(avg_bar_day_v(bars6[:5]), 3.0), 'panel fallback averages its bars')
+print('— V: the 5-day range, the number the gear is read off —')
+bars = [{'date': f'07/1{i}', 'ts': f'2026-07-1{i}T00:00:00', 'open': 100,
+         'high': 100.0 + i, 'low': 96.0 - i, 'close': 99.0}
+        for i in range(5)]                    # high 104, low 92
+ok(near(bar_range_v(bars), calc_volatility(104.0, 92.0)),
+   'the panel fallback measures the whole window, not a per-day average',
+   f'{bar_range_v(bars):.2f}')
+ok(near(bar_range_v(bars), 100 * (104.0 - 92.0) / 104.0),
+   'V = 100 × (High5 − Low5) / High5')
+ok(bar_range_v([]) is None and bar_range_v(None) is None,
+   'no bars → no V')
+ok(select_auto_gear(bar_range_v(bars)) == 2,
+   'the panel and the gearbox read the same number the same way '
+   '(11.5% → G2 on the 10/15/20/25 ladder)',
+   str(bar_range_v(bars)))
 
 print('— live candle fold —')
 today = [{'date': '07/19', 'ts': '2026-07-19T00:00:00', 'open': 100,
@@ -248,6 +258,21 @@ ok(merge_live_bar(today, 107.0, '2026-07-20')[-1]['close'] == 101.0,
    'no fold when the last bar is not today')
 ok(merge_live_bar([], 107.0, '2026-07-19') == [], 'empty bars stay empty')
 
+print('— cockpit gearbox strip —')
+picked = []
+_gearbox_ap = {
+    'set_gear': lambda g: picked.append(('gear', g)),
+    'set_tier': lambda t: picked.append(('tier', t)),
+    'set_auto': lambda: picked.append(('auto', True)),
+}
+window.ap = _gearbox_ap
+window._on_gear(5)
+window._on_tier(3)
+window._on_auto()
+ok(picked == [('gear', 5), ('tier', 3), ('auto', True)],
+   'the cockpit gear/tier/AUTO buttons call straight through to the card',
+   str(picked))
+
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
 
@@ -257,14 +282,24 @@ print('— controller: a poll reaches the screen —')
 
 
 class _StubRow:
+    """Stands in for StockRow: the tk vars the cockpit writes through, and
+    the line_config the controller reads back."""
+
     def __init__(self, ticker, gear=3, tier=2):
         self.ticker = ticker
-        self._cfg = {'gear': gear, 'exit_tier': tier}
+        self.gear_var = tk.IntVar(value=gear)
+        self.tier_var = tk.IntVar(value=tier)
+        self.auto_var = tk.BooleanVar(value=True)
         self.badges = []
         self.live_price = None
 
+    gear = property(lambda self: self.gear_var.get())
+    tier = property(lambda self: self.tier_var.get())
+    auto = property(lambda self: self.auto_var.get())
+
     def line_config(self):
-        return dict(self._cfg)
+        return {'gear': self.gear_var.get(), 'exit_tier': self.tier_var.get(),
+                'auto': self.auto_var.get()}
 
     def set_autopilot(self, key):
         self.badges.append(key)
@@ -297,6 +332,7 @@ class _FakeProvider:
         return self.bp
 
     def get_completed_daily_bars(self, ticker, count):
+        # high5 = 104, low5 = 86 → V = 100 × 18 / 104
         return [{'ts': f'2026-07-2{i}T00:00:00', 'date': f'07/2{i}',
                  'open': 100.0, 'high': 100.0 + i, 'low': 90.0 - i,
                  'close': 95.0} for i in range(5)]
@@ -327,13 +363,16 @@ class _StubApp:
 _root = tk.Tk()
 _root.withdraw()
 _prov = _FakeProvider()
-ctrl = AutopilotController(_StubApp(_root, _prov))
+_app = _StubApp(_root, _prov)
+_card = _app.deployed_rows[0]
+ctrl = AutopilotController(_app)
 ctrl._log = lambda *a: None            # keep the test out of logs/
 ctrl._store = {}
 ctrl._save_state = lambda *a: True     # never touch data/
 
 ok(ctrl.watch('NVDA')[0], 'watching arms the campaign engine')
-ok(ctrl._slots['NVDA']['card'] == {'gear': 3, 'exit_tier': 2},
+ok(ctrl._slots['NVDA']['card'] == {'gear': 3, 'exit_tier': 2,
+                                   'auto': True},
    "watching pulls the card's gear config immediately")
 
 slot = ctrl._slots['NVDA']
@@ -370,6 +409,30 @@ ok(ui['crossed']['SELL'] and not ui['crossed']['BUY'],
    'crossing the exit in WATCH marks the line, and sends nothing')
 ok('not sent' in ui['status'], 'WATCH says plainly that it did not send',
    ui['status'])
+
+# The cockpit's gear buttons write to the CARD, which is the source.
+row = ctrl.app.deployed_rows[0] if hasattr(ctrl, 'app') else None
+ctrl.set_card_gear('NVDA', gear=5)
+_root.update()
+ok(_card.gear == 5 and _card.auto is False,
+   'picking a gear in the cockpit writes to the card and drops AUTO',
+   f'gear={_card.gear} auto={_card.auto}')
+ctrl.set_card_gear('NVDA', tier=3)
+_root.update()
+ok(_card.tier == 3, 'picking a tier in the cockpit writes to the card')
+ctrl.set_card_gear('NVDA', auto=True)
+_root.update()
+ok(_card.auto is True, 'AUTO hands the gear back to volatility')
+
+ctrl._cycle('NVDA', slot)
+_root.update()
+ui = ctrl.ui_state('NVDA')
+ok(ui['campaign']['gear'] == 5 and ui['campaign']['exit_tier'] == 3,
+   'and the engine picks the change up on the very next poll',
+   str((ui['campaign']['gear'], ui['campaign']['exit_tier'])))
+ok(near(ui['vol5'], calc_volatility(104.0, 86.0), 0.01),
+   "the payload carries the strategy's V, from the 5-day high and low",
+   str(ui['vol5']))
 
 ctrl.disable('NVDA')
 ok(not ctrl.is_enabled('NVDA'), 'disable stops the watch')

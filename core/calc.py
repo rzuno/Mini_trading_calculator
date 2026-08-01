@@ -68,25 +68,25 @@ def display_name(ticker: str) -> str:
 #             normalized table (manual Part II). It is NOT a cap: the army is.
 GEARS = {
     1: {'name': 'Smooth',   'load':  6, 'chase': 4, 'ratio': 1 / 2,
-        'frac': '1/2', 'tiers': (1, 3, 5), 'vol_max': 15.0, 'max_chase': 8,
+        'frac': '1/2', 'tiers': (1, 3, 5), 'vol_max': 10.0, 'max_chase': 8,
         'color': '#D8ECFF', 'fg': 'black'},
     2: {'name': 'Moderate', 'load':  7, 'chase': 5, 'ratio': 2 / 3,
-        'frac': '2/3', 'tiers': (2, 4, 6), 'vol_max': 20.0, 'max_chase': 7,
+        'frac': '2/3', 'tiers': (2, 4, 6), 'vol_max': 15.0, 'max_chase': 7,
         'color': '#9ED0FF', 'fg': 'black'},
     3: {'name': 'Balanced', 'load':  8, 'chase': 6, 'ratio': 3 / 4,
-        'frac': '3/4', 'tiers': (3, 5, 7), 'vol_max': 25.0, 'max_chase': 6,
+        'frac': '3/4', 'tiers': (3, 5, 7), 'vol_max': 20.0, 'max_chase': 6,
         'color': '#5FA7EF', 'fg': 'black'},
     4: {'name': 'Deep',     'load':  9, 'chase': 7, 'ratio': 4 / 5,
-        'frac': '4/5', 'tiers': (4, 6, 8), 'vol_max': 30.0, 'max_chase': 6,
+        'frac': '4/5', 'tiers': (4, 6, 8), 'vol_max': 25.0, 'max_chase': 6,
         'color': '#2478D4', 'fg': 'white'},
     5: {'name': 'Extreme',  'load': 10, 'chase': 8, 'ratio': 1.0,
         'frac': '1.0', 'tiers': (5, 7, 9), 'vol_max': None, 'max_chase': 5,
         'color': '#123E8A', 'fg': 'white'},
 }
 
-# 5-day range (%) cut points, upper bound INCLUSIVE. Raised from the old
-# 8/12/16/20 ladder so that gear 5 — which doubles the share count on every
-# chase — is reserved for genuinely violent stocks instead of ordinary ones.
+# 5-day range (%) cut points, upper bound INCLUSIVE: G1 ≤10, G2 ≤15, G3 ≤20,
+# G4 ≤25, G5 above 25. Tuned from the original 8/12/16/20 so that gear 5 —
+# which doubles the share count on every chase — only arms above a 25% range.
 VOL_THRESHOLDS = tuple(GEARS[g]['vol_max'] for g in (1, 2, 3, 4))
 
 DEFAULT_GEAR = 3

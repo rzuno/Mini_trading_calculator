@@ -1,24 +1,28 @@
-"""Embeddable 5-day candle panel — the informational half of the Autopilot
-window (the old standalone Graph popup is gone; same logic, one window).
+"""Embeddable 5-day candle panel — the informational half of the campaign
+cockpit.
 
-Shows the 5-day candles with the average COMPLETED-day V (and its /3 grid
-hint — the scale-picking indicator), plus whatever reference lines the
-caller passes (the watcher's grid rows, current price). Purely
-informational: no order buttons live here.
+Shows the 5-day candles with **V, the strategy's own volatility number** —
+100×(High5−Low5)/High5, the very figure the automatic gear is chosen from —
+plus whatever reference lines the caller passes (the campaign's lines, the
+current price). Purely informational: no order buttons live here.
 """
 
 import tkinter as tk
 import tkinter.font as tkfont
 
-from core.calc import fmt_price
+from core.calc import calc_volatility, fmt_price, select_auto_gear
 
 
-def avg_bar_day_v(bars):
-    """Fallback avg day range ((H−L)/L %) over the given bars — used only
-    when the watcher has not supplied the completed-days average yet."""
-    vs = [(b['high'] - b['low']) / b['low'] * 100.0
-          for b in (bars or []) if b.get('low')]
-    return (sum(vs) / len(vs)) if vs else None
+def bar_range_v(bars):
+    """V over the given bars: 100×(high−low)/high across the whole window —
+    the same measure `core.calc.calc_volatility` applies to the fetched 5-day
+    high/low. Used only as a fallback when the watcher has not supplied its
+    own figure yet."""
+    highs = [b['high'] for b in (bars or []) if b.get('high')]
+    lows = [b['low'] for b in (bars or []) if b.get('low')]
+    if not highs or not lows:
+        return None
+    return calc_volatility(max(highs), min(lows))
 
 _F_STAT = ('Segoe UI', 12, 'bold')
 _F_DAY  = ('Segoe UI', 10)
@@ -70,7 +74,7 @@ class CandlePanel(tk.Frame):
         self.ohlc = []
         self.ref_lines = []     # [{'label','price','color','dash','width'}]
         self.current = None
-        self.day_v_avg = None   # completed-days avg V from the watcher
+        self.vol5 = None        # 5-day range V from the watcher
         self._ref_font = tkfont.Font(root=self, font=_F_REF)
         self._row_wrap = max(100, width - 10)
 
@@ -93,14 +97,13 @@ class CandlePanel(tk.Frame):
 
     # ── Data in ───────────────────────────────────────────────────────────────
 
-    def update(self, ohlc=None, ref_lines=None, current=None,
-               day_v_avg=None):
+    def update(self, ohlc=None, ref_lines=None, current=None, vol5=None):
         if ohlc is not None:
             self.ohlc = list(ohlc)
         if ref_lines is not None:
             self.ref_lines = [r for r in ref_lines if r.get('price')]
         self.current = current
-        self.day_v_avg = day_v_avg
+        self.vol5 = vol5
         self._update_stats()
         self._draw()
 
@@ -112,15 +115,17 @@ class CandlePanel(tk.Frame):
             return
         hi = max(d['high'] for d in self.ohlc)
         lo = min(d['low'] for d in self.ohlc)
-        # Scale indicator: mean of the past 5 COMPLETED days' ranges (from
-        # the watcher; today's growing bar excluded) and its /3 grid hint.
-        v = self.day_v_avg
+        # V is the strategy's own volatility: the span of the whole 5-day
+        # window as a percent of its high — the number the automatic gear is
+        # read off, not a per-day average.
+        v = self.vol5
         if v is None:
-            v = avg_bar_day_v(self.ohlc) or 0.0
+            v = bar_range_v(self.ohlc)
+        v_txt = (f'V {v:.1f}% → G{select_auto_gear(v)}' if v is not None
+                 else 'V --')
         self._stat.config(
             text=f'5D  High {fmt_price(hi, self.ccy)}   '
-                 f'Low {fmt_price(lo, self.ccy)}   '
-                 f'avg day V {v:.1f}% → /3 = {v / 3:.1f}% grid')
+                 f'Low {fmt_price(lo, self.ccy)}   {v_txt}')
         for child in self._days.winfo_children():
             child.destroy()
         for d in self.ohlc:

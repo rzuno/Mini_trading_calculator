@@ -41,7 +41,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from core.vcommandos import CampaignEngine, POLL_SECONDS, STRATEGY_ID
-from core.calc import fmt_order_price
+from core.calc import calc_volatility, clamp_gear, clamp_tier, fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
@@ -53,21 +53,6 @@ _BACKOFF_OTHER = 60
 _TICKS_KEPT = 7200              # ~10h of 5s ticks for the live chart
 _FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one warning
 _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
-
-
-def avg_completed_day_v(bars, trading_date):
-    """Mean of the last five COMPLETED days' ranges ((H−L)/L in %). Today's
-    in-progress bar is excluded — its range is still growing. This is the
-    a plain volatility read-out under the candle panel."""
-    today_iso = trading_date or ''
-    today_md = (today_iso[5:].replace('-', '/')
-                if len(today_iso) >= 10 else None)
-    done = [b for b in (bars or [])
-            if not (str(b.get('ts') or '')[:10] == today_iso
-                    or (today_md and b.get('date') == today_md))]
-    vs = [(b['high'] - b['low']) / b['low'] * 100.0
-          for b in done[-5:] if b.get('low')]
-    return (sum(vs) / len(vs)) if vs else None
 
 
 def merge_live_bar(ohlc, price, trading_date):
@@ -203,9 +188,9 @@ class AutopilotController:
             self._slots[ticker] = {
                 'engine': None, 'mode': 'WATCH', 'card': None,
                 'backoff_until': 0.0,
-                'prev_close': None, 'high5': None, 'daily_date': None,
+                'prev_close': None, 'high5': None, 'vol5': None,
+                'daily_date': None,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
-                'day_v_avg': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
@@ -246,6 +231,35 @@ class AutopilotController:
                 self.set_card_config(ticker, row.line_config())
             except Exception:
                 pass
+
+    def set_card_gear(self, ticker, gear=None, tier=None, auto=None):
+        """The cockpit's gear/tier buttons write to the CARD — the single
+        source of truth — and the card's own trace pushes the new config
+        straight back through set_card_config. Picking a gear is a manual
+        choice, so it also flips the card off AUTO; the AUTO button hands
+        the choice back to volatility."""
+        def apply():
+            row = self._find_row(ticker)
+            if row is None:
+                return
+            try:
+                if auto is not None:
+                    row.auto_var.set(bool(auto))
+                if gear is not None:
+                    row.auto_var.set(False)
+                    row.gear_var.set(clamp_gear(gear))
+                if tier is not None:
+                    row.tier_var.set(clamp_tier(tier))
+            except tk.TclError:
+                return
+            # Read it straight back so the very next poll uses it, instead of
+            # waiting for the card's own compute to push on the poll after.
+            self._pull_card_config(ticker)
+            self._wake.set()          # let the engine trade on it this second
+        try:
+            self.root.after(0, apply)
+        except (RuntimeError, tk.TclError):
+            pass
 
     def set_mode(self, ticker, mode):
         """WATCH ↔ LIVE. LIVE only during regular market hours."""
@@ -329,6 +343,9 @@ class AutopilotController:
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
             'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
+            'set_gear': lambda g: self.set_card_gear(ticker, gear=g),
+            'set_tier': lambda t: self.set_card_gear(ticker, tier=t),
+            'set_auto': lambda: self.set_card_gear(ticker, auto=True),
         }
 
     def _ohlc_for(self, ticker):
@@ -431,7 +448,9 @@ class AutopilotController:
     def _daily_vantage(self, prov, ticker, slot):
         """(prev_close, High5) from the last five COMPLETED sessions, fetched
         once per trading day. High5 is the campaign's standard flat-state
-        vantage (Gearbox manual §9.1); prev_close is the fallback."""
+        vantage (Gearbox manual §9.1); prev_close is the fallback. The same
+        bars give the strategy's V — 100×(High5−Low5)/High5, the number the
+        automatic gear is chosen from — for the cockpit read-out."""
         today = self._trading_date(ticker)
         if slot['daily_date'] != today:
             try:
@@ -439,7 +458,10 @@ class AutopilotController:
                 if bars:
                     slot['prev_close'] = bars[-1]['close']
                     highs = [b['high'] for b in bars[-5:] if b.get('high')]
+                    lows = [b['low'] for b in bars[-5:] if b.get('low')]
                     slot['high5'] = max(highs) if highs else None
+                    slot['vol5'] = calc_volatility(
+                        slot['high5'], min(lows) if lows else None)
                     slot['daily_date'] = today
             except Exception:
                 pass
@@ -454,13 +476,9 @@ class AutopilotController:
         if now - slot['ohlc_ts'] >= _OHLC_REFRESH_S:
             slot['ohlc_ts'] = now
             try:
-                # 7 bars: 5 COMPLETED days for the avg-day-V indicator plus
-                # today's in-progress bar (and one spare for holidays).
-                bars = prov.get_candles(ticker, count=7)
+                bars = prov.get_candles(ticker, count=6)
                 if bars:
                     slot['ohlc'] = [dict(b) for b in bars[-5:]]
-                    slot['day_v_avg'] = avg_completed_day_v(
-                        bars, snap.get('trading_date'))
             except Exception:
                 # keep the old bars; retry in a minute, not in five
                 slot['ohlc_ts'] = now - _OHLC_REFRESH_S + 60
@@ -667,7 +685,8 @@ class AutopilotController:
             'crossed': dict(getattr(engine, 'crossed', {}) or {}),
             'events': list(getattr(engine, 'events', []) or []),
             'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
-            'day_v_avg': slot.get('day_v_avg'),
+            'vol5': slot.get('vol5'),
+            'card_auto': bool((slot.get('card') or {}).get('auto', True)),
             'mode': slot['mode'],
             'badge_key': badge_key,
             'phase': market_phase(ticker),

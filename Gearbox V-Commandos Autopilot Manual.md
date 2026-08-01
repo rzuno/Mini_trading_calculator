@@ -1,11 +1,13 @@
 # Gearbox V-Commandos Autopilot Manual
 
-**Version:** 0.3.0 — *as built*
+**Version:** 0.4.0 — *as built*
 **Strategy ID:** `V_COMMANDOS_GEARBOX` — the only strategy in the app
 **Subtitle:** Fixed-Gear V-Campaign Trading System
-**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Verified offline by `scripts/test_vcommandos.py` (100 checks) and `scripts/test_autopilot_ui.py` (62). Not yet run live.
+**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Verified offline by `scripts/test_vcommandos.py` (106 checks) and `scripts/test_autopilot_ui.py` (70). Not yet run live.
 
-> **v0.3.0 changes are listed in §22.** In short: **there is no capital cap** — the army is the only wall (§8); the **gear is no longer pinned** by a live campaign (§11); the daily v^ grid was **removed** so this bot can be stabilised alone (§3); the cockpit was rebuilt around the price curve and now shows the next buy *and the ones after it* (§15); and the crash that made the whole autopilot silently do nothing was fixed.
+> **v0.4.0 changes are listed in §22.** The gear ladder is now **10/15/20/25** — G5 arms above a 25% range (§6). V is **one number, everywhere**: 100×(High5−Low5)/High5, the same figure the card, the cockpit and the candle panel all show (§17). Gear and exit tier are choosable **in the cockpit** as well as on the card (§15). A FLAT stock now publishes chase 1 as well as chase 2 — it was silently dropped (§10).
+>
+> v0.3.0 before it: no capital cap, the army is the only wall (§8); the gear is not pinned by a live campaign (§11); the daily v^ grid removed (§3); manual Buy/Sell removed (§19).
 
 ---
 
@@ -166,13 +168,13 @@ The program calculates the new average and all next lines from actual broker fil
 
 | Gear | Name | 5D range | LOAD | CHASE | Add ratio | Exit Tiers | Default | Chases in the 32u table | Final BUY | Capital |
 |---:|:--|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | Smooth   | ≤ 15% | −6% | −4% | ×1/2 | 1%/3%/5% | Tier 2 | 8 | 82.15 | 23.02u |
-| 2 | Moderate | ≤ 20% | −7% | −5% | ×2/3 | 2%/4%/6% | Tier 2 | 7 | 78.26 | 31.01u |
-| 3 | Balanced | ≤ 25% | −8% | −6% | ×3/4 | 3%/5%/7% | Tier 2 | 6 | 75.92 | 24.57u |
-| 4 | Deep     | ≤ 30% | −9% | −7% | ×4/5 | 4%/6%/8% | Tier 2 | 6 | 72.26 | 28.14u |
-| 5 | Extreme  | > 30% | −10% | −8% | ×1 | 5%/7%/9% | Tier 2 | 5 | 70.33 | 26.09u |
+| 1 | Smooth   | ≤ 10% | −6% | −4% | ×1/2 | 1%/3%/5% | Tier 2 | 8 | 82.15 | 23.02u |
+| 2 | Moderate | ≤ 15% | −7% | −5% | ×2/3 | 2%/4%/6% | Tier 2 | 7 | 78.26 | 31.01u |
+| 3 | Balanced | ≤ 20% | −8% | −6% | ×3/4 | 3%/5%/7% | Tier 2 | 6 | 75.92 | 24.57u |
+| 4 | Deep     | ≤ 25% | −9% | −7% | ×4/5 | 4%/6%/8% | Tier 2 | 6 | 72.26 | 28.14u |
+| 5 | Extreme  | > 25% | −10% | −8% | ×1 | 5%/7%/9% | Tier 2 | 5 | 70.33 | 26.09u |
 
-Bounds are **inclusive** on the upper edge: exactly 20.0% is gear 2, 20.1% is gear 3.
+Bounds are **inclusive** on the upper edge: exactly 15.0% is gear 2, 15.1% is gear 3.
 
 The last three columns are the normalized reference ladder (§21, Appendix A): how far a campaign would run **if** 32 units were spent on it. They are a yardstick for comparing gears, **not a cap** — see §8.
 
@@ -187,17 +189,19 @@ Alphabet may use Gear 1 or 2.
 Samsung may use Gear 2 or 3 depending on the observed V depth.
 ```
 
-### 6.1 Why the cut points were raised
+### 6.1 Where the cut points sit
 
-The previous ladder was 8 / 12 / 16 / 20. Under it a stock with a perfectly ordinary 22% five-day range was handed **gear 5** — the gear that buys the entire position again on every chase and can consume 26 units. Gear 5 is a weapon for a stock that actually moves 30%+ in a week; handing it to a merely-normal stock is how a martingale runs out of funding before the V completes.
+The original ladder was 8 / 12 / 16 / 20. Under it a stock with an ordinary 22% five-day range was handed **gear 5** — the gear that buys the entire position again on every chase. Gear 5 is a weapon for a stock that genuinely swings; handing it to a merely-normal stock is how a martingale runs out of funding before the V completes.
 
-Raising the ladder to 15 / 20 / 25 / 30 means:
+The ladder is now **10 / 15 / 20 / 25**:
 
 ```text
-G5 now requires a 5-day range above 30%   (was: above 20%)
-G4 now requires above 25%                 (was: above 16%)
-most ordinary sessions land on G1 or G2   — shallow ladders, cheap campaigns
+G5 requires a 5-day range above 25%   (was: above 20%)
+G4 requires above 20%                 (was: above 16%)
+G1 keeps only the genuinely quiet     (≤ 10%)
 ```
+
+It sits deliberately between the two earlier attempts. The first pass at raising it (15/20/25/30) went too far the other way: with a 30% floor, G5 almost never armed and ordinary volatility all collapsed onto G1's shallow −6%/−4% ladder, which is too timid to lower an average meaningfully. 10/15/20/25 keeps G5 for real violence while letting the middle gears do the everyday work.
 
 This is the answer to the funding problem: **not a capital-allocation layer on top of the strategy, but a gearbox that stops selecting the expensive gear by accident.** It is also why no cap is needed (§8.2) — deployment is governed where the choice is still free, before the LOAD.
 
@@ -374,7 +378,16 @@ continue watching EXIT only
 
 and re-check every poll, so buying resumes by itself when cash returns.
 
-Beyond the armed CHASE the engine also publishes the **next two projected chases**, folded into the running average exactly as the campaign would run them. They are drawn soft on both charts and named in the banner. Nothing is ever ordered from a projection — they exist so the depth of the ladder ahead is visible before it is needed.
+Beyond the armed line the engine publishes **two more projected buys**, folded into the running average exactly as the campaign would run them. They are drawn soft on both charts and named in the banner. Nothing is ever ordered from a projection — they exist so the depth of the ladder ahead is visible before it is needed.
+
+Which lines those are depends on the state, and the numbering follows the card:
+
+```text
+DEPLOYED   armed 'chase'  +  projected 'chase2', 'chase3'
+FLAT       armed 'load'   +  projected 'chase1', 'chase2'
+```
+
+A FLAT stock has no chase armed — the LOAD is its live line — so **chase 1 is a projection there**, exactly as the flat card prints `Load / Chase 1 / Chase 2`. (Until v0.4.0 the engine numbered projections from 2 in both states, so a flat stock's chart drew chases 2 and 3 and silently omitted chase 1.)
 
 **Order priority:** when both lines are crossed in the same poll, the **EXIT wins** — the campaign always prefers to finish. Any resting buy of ours is cancelled first.
 
@@ -585,7 +598,9 @@ Not yet computed: trading-days-open, fees, taxes, net profit, return on maximum 
 Opened by the card's V-COMMANDOS button; opening it arms WATCH.
 
 ```text
-header   name · campaign state · market phase · Cancel all · LIVE
+header   name · campaign state · market phase · Cancel N resting · LIVE
+gearbox  [AUTO] gear [1][2][3][4][5] Balanced -8%/-6% ×3/4
+                exit [T1 +3%][T2 +5%][T3 +7%]      V 18.2% → G3
 banner   G3 Balanced · LOAD -8% · CHASE -6% ×3/4 · EXIT T2 +5% (full)
                      · vantage 100.00 (High5)
          campaign id · since · chases · low · peak
@@ -598,9 +613,28 @@ charts   live tick curve inside the campaign | 5-day candle panel
 log      RECORDED FILLS, grouped by trading day
 ```
 
+### 15.1 The gearbox strip
+
+Gear and exit tier are choosable here as well as on the card — the cockpit is where the campaign is actually being watched, so it is where the decision usually wants to be made.
+
+Both controls **write to the CARD**, which stays the single source of truth; the controller reads the card straight back, so the engine uses the new lines on its very next poll. Picking a gear also flips the card off AUTO (a manual choice must not be overwritten by the next volatility read); the **AUTO** button hands the choice back to volatility. The strip shows V and the gear it recommends, so a manual pick can always be compared against what AUTO would have done.
+
+### 15.2 What "Cancel N resting" is for
+
+The bot **never re-prices an order it has already sent.** One order per side at a time, and while it rests, that side is blocked. So:
+
+```text
+gear shifts while a chase rests  →  the resting order is still at the OLD
+                                    price, and the new line cannot arm
+```
+
+Cancelling clears it, and the next poll re-arms at the current line. It is also how a line is pulled before the market reaches it.
+
+It touches **resting (unfilled) orders only** — a trade that has already filled cannot be cancelled, and is not what this button is about. The button names the count and is disabled when nothing rests, so it never invites a click that would do nothing.
+
 The sell line reads first because it sits at the top of the chart; the next buy and **its size** read below it, then where the ladder goes after that. Both charts draw the same rows: the armed buy, the broker average, and the EXIT bold; the projected chases and the vantage soft. An unfundable buy line is drawn grey and relabelled `✕ … (no army)`.
 
-**There are no manual Buy/Sell buttons.** The point of the bot is that the offer goes out when the curve touches the line. WATCH shows the crossed line and says plainly that it did not send; LIVE sends. The one intervention left is **Cancel all**, the escape hatch.
+**There are no manual Buy/Sell buttons.** The point of the bot is that the offer goes out when the curve touches the line. WATCH shows the crossed line and says plainly that it did not send; LIVE sends.
 
 The full campaign-spanning chart of the original §15 (a LOAD marker, every chase marker, the campaign low, the exit marker, with a 10-trading-day view policy) is **not built**. The 5-day panel plus the day-grouped log carries the same information.
 
@@ -619,7 +653,7 @@ Realized campaign profit, fees/taxes, campaign duration statistics, completion-r
 **As built:** the dashboard is the card itself. Each card shows
 
 ```text
-V 18.2% → G2            the volatility gear, tracked live
+V 18.2% → G3            the volatility gear, tracked live
 V 18.2% → G5 ▲heavy     the heavy-unit floor (FLAT only) overrode volatility
 V 18.2% → reload -3%    a same-day reload is armed
 ```
@@ -629,14 +663,22 @@ and the gear badge (a colored circle 1–5) makes the selected gear readable acr
 The recommendation map:
 
 ```text
-5D range ≤ 15%       → Gear 1
-      ≤ 20%          → Gear 2
-      ≤ 25%          → Gear 3
-      ≤ 30%          → Gear 4
-      > 30%          → Gear 5
+V ≤ 10%       → Gear 1
+V ≤ 15%       → Gear 2
+V ≤ 20%       → Gear 3
+V ≤ 25%       → Gear 4
+V >  25%      → Gear 5
 ```
 
-where `5D range = 100 × (High5 − Low5) / High5`.
+### 17.1 V is one number
+
+```text
+V = 100 × (High5 − Low5) / High5
+```
+
+The span of the whole five-day window as a percent of its high — **not** a per-day average, and not a per-day average divided by anything. `core.calc.calc_volatility` computes it, `select_auto_gear` reads the gear off it, and it is the number shown on the card, in the cockpit's gearbox strip, and on the candle panel. One definition, one figure, three places, always agreeing.
+
+The candle panel briefly showed a different one (the mean of the last five completed days' ranges, plus a `/3` hint) — a leftover from the daily v^ grid, where that average sized the grid spacing. It measured something the gearbox never used and is gone.
 
 This is a recommendation, not an automatic order command. Switching the card to MANUAL lets the commander pick a more conservative gear whenever conditions warrant it.
 
@@ -695,7 +737,7 @@ exit_tier: 1..3
 auto_mode: true                 # gear follows volatility while FLAT
 
 # core/calc.py constants
-VOL_THRESHOLDS:      [15, 20, 25, 30]
+VOL_THRESHOLDS:      [10, 15, 20, 25]
 WEIGHT_GEAR_THRESHOLDS: [1.2, 1.6, 2.0, 2.5]
 RELOAD_DROP_PCT:     3
 DEFAULT_GEAR:        3
@@ -747,13 +789,22 @@ Higher Gears can tolerate a lower right-side endpoint because they lower average
 | §13 state machine | **built** |
 | §14 campaign log — trades and decisions, grouped by day | **built** |
 | §15 cockpit: curve, both charts, day-grouped log | **built** |
-| §17 gear dashboard on the card | **built** |
+| §17 / §17.1 one V number, on the card, the cockpit and the panel | **built** |
+| §15.1 gear + tier choosable in the cockpit | **built** |
 | §19 WATCH / LIVE, bot fires by itself | **built** (DRY replaced by the offline simulator) |
 | §8.3 concurrency limits, global buying-power manager | **NOT built** — commander's discipline |
 | §14.4 full completion metrics (fees, duration, ROC) | **NOT built** |
 | §15 campaign-spanning chart | **NOT built** — 5-day panel + day-grouped log instead |
 | §16 accounting views | **NOT built** |
 | Portfolio orchestrator (candidate ranking, army split) | **NOT built** |
+
+### v0.4.0 amendment log
+
+1. **Gear ladder → 10 / 15 / 20 / 25** (§6, §6.1, §17). G5 arms above a 25% range. The previous 15/20/25/30 pass over-corrected: it left almost everything on G1's timid −6%/−4% ladder.
+2. **V is one number everywhere** (§17.1). The candle panel's grid-era read-out (mean completed-day range, plus a `/3` grid hint) is gone; it now shows `V …% → G…` from the same `calc_volatility(High5, Low5)` the gearbox uses. The controller computes it from the five completed daily bars it already fetches for the vantage.
+3. **A FLAT stock publishes chase 1** (§10). The projection helper numbered from 2 in both states, so a flat stock's chart drew chases 2 and 3 and omitted chase 1 — which the flat card had been printing all along.
+4. **Gear and exit tier are choosable in the cockpit** (§15.1), writing through to the card and reaching the engine on the next poll. Picking a gear drops AUTO; the AUTO button hands it back.
+5. **"Cancel all" became "Cancel N resting"** (§15.2) — disabled when nothing rests, listing the orders in its confirmation, and documented: it exists because the bot never re-prices a resting order, so a shifted gear needs the stale one cleared before the new line can arm.
 
 ### v0.3.0 amendment log
 

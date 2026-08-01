@@ -409,12 +409,17 @@ class CampaignEngine:
         if sell:
             self.lines['exit' if sell_armed else 'pexit'] = sell
 
-    def _chase_projection(self, shares, avg, count=PROJECTED_CHASES):
-        """The chases AFTER the armed one, each folded into the running
-        average exactly as the campaign would run them."""
+    def _chase_projection(self, shares, avg, start=2,
+                          count=PROJECTED_CHASES):
+        """`count` projected chase lines, numbered from `start` in the
+        ladder. A DEPLOYED card arms chase 1 separately, so its projections
+        are chases 2 and 3; a FLAT card arms the LOAD, so the whole ladder —
+        chase 1 and chase 2, exactly what its card prints — is projection.
+        Each line is folded into the running average as the campaign would
+        run it."""
         out = []
         cur_shares, cur_avg = shares, avg
-        for i in range(count + 1):
+        for n in range(1, start + count):
             if cur_shares <= 0 or cur_avg <= 0:
                 break
             price = trim_buy_price(self.ticker,
@@ -422,10 +427,10 @@ class CampaignEngine:
             qty = calc_chase_shares(cur_shares, self.gear)
             if price <= 0 or qty <= 0:
                 break
-            if i > 0:
+            if n >= start:
                 out.append({'price': price, 'qty': qty,
-                            'kind': f'chase{i + 1}',
-                            'label': f'chase {i + 1}', 'armed': False})
+                            'kind': f'chase{n}',
+                            'label': f'chase {n}', 'armed': False})
             new_shares = cur_shares + qty
             cur_avg = (cur_avg * cur_shares + price * qty) / new_shares
             cur_shares = new_shares
@@ -583,7 +588,7 @@ class CampaignEngine:
         self._publish_lines(
             {'price': load_p, 'qty': load_q, 'kind': 'load', 'armed': True,
              'label': f'{kind} -{drop}%'},
-            self._chase_projection(load_q, load_p),
+            self._chase_projection(load_q, load_p, start=1),
             {'price': pexit, 'qty': load_q, 'kind': 'pexit', 'armed': False,
              'label': f'exit if loaded T{self.exit_tier} '
                       f'+{exit_pct(self.gear, self.exit_tier)}%'},
