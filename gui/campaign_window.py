@@ -2,10 +2,10 @@
 
 Opened by the card's V-COMMANDOS button. Opening it arms WATCH mode: the
 stock is polled every few seconds and this window follows every tick. The bot
-follows exactly the lines the CARD draws — same gear, same exit tier.
+follows exactly the lines the CARD draws — same gear and armed exit tiers.
 
     WATCH  polling, lines and fill detection only; nothing is placed.
-    LIVE   the bot sends the LOAD / CHASE / full EXIT by ITSELF the moment
+    LIVE   the bot sends the LOAD / CHASE / armed EXIT by ITSELF the moment
            the curve crosses a line; regular market hours only (drops back
            to WATCH at the close).
 
@@ -15,8 +15,7 @@ goes out when the curve touches the line.
 Nothing is placed in advance: the bot sends an order only when the price
 actually crosses a line. A limit order it sent can still rest unfilled, and
 the engine re-prices its own resting orders every poll — so a shifted gear or
-a re-armed tier heals itself. **Cancel resting** is only the manual override
-for that, and it is disabled whenever nothing rests.
+a re-armed tier heals itself.
 
 The gear and the exit tiers are chosen here as well as on the card. Both write
 to the CARD, which is the single source of truth; the change is read straight
@@ -24,7 +23,7 @@ back, so the lines move on the very next poll.
 
 Layout is ONE information banner over TWO charts, plus the campaign log:
 
-    header   name · campaign state · market phase · Cancel resting · LIVE
+    header   name · campaign state · market phase · LIVE
     gearbox  AUTO/MANUAL · G1..G5 · T1/T2/T3 (multi-select) · V · vantage
     banner   gear line (G/tier · load% / chase% ×frac · vantage)
              position · reserve · campaign age / chases / low
@@ -46,7 +45,8 @@ from tkinter import messagebox
 
 from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, exit_pct, fmt_price,
                        gear_button_color, gear_button_fg, gear_params,
-                       select_auto_gear, tier_pcts)
+                       select_auto_gear, sell_pct_color,
+                       sell_pct_foreground)
 from gui.candle_chart import (CandlePanel, bounded_label_layout,
                               required_label_pad)
 
@@ -79,6 +79,8 @@ _PHASE_TXT = {'REGULAR': ('OPEN (regular)', '#007700'),
               'CLOSED':  ('CLOSED', '#888888')}
 _LIVE_BG = '#CC0000'
 _NO_ARMY_CLR = '#999999'
+_STATUS_NEUTRAL = '#6B4A2B'
+_STATUS_ERROR = '#CC0000'
 _STATE_CLR = {
     'FLAT': '#666666', 'ARMED_LOAD': '#0033AA', 'DEPLOYED': '#0033AA',
     'CHASE_PENDING': '#B8860B', 'EXIT_PENDING': '#B8860B',
@@ -89,8 +91,8 @@ _KIND_CLR = {'LOAD': '#0033AA', 'RELOAD': '#E08000', 'CHASE': '#3366CC',
              'EXIT': '#CC3333', 'PARTIAL': '#B8860B',
              'ADOPT': '#7E3FBF', 'GEAR': '#666666', 'TIER': '#666666'}
 
-_VANTAGE_SRC = {'high5': 'Dynamic High5', 'close': 'prev close',
-                'reload': 'sell fill -3%', 'manual': 'pinned by hand'}
+_VANTAGE_SRC = {'high5': 'Automatic Dynamic High5', 'close': 'previous close',
+                'reload': 'sell fill -3%', 'manual': 'Pinned high'}
 
 # Buy lines in the order they would fire, armed first. A DEPLOYED campaign
 # arms 'chase' and projects chase2/chase3; a FLAT one arms 'load' and projects
@@ -100,6 +102,82 @@ _BUY_KEYS = ('load', 'chase', 'chase1', 'chase2', 'chase3')
 # a flat one publishes pexit1..3 (what the tiers would be if the LOAD filled).
 _SELL_KEYS = ('exit1', 'exit2', 'exit3')
 _PSELL_KEYS = ('pexit1', 'pexit2', 'pexit3')
+
+
+def can_pin_vantage(ui):
+    """A vantage choice belongs to a flat campaign, before any LOAD fills."""
+    state = ui.get('campaign_state') or ui.get('state') or ''
+    try:
+        shares = float(ui.get('shares') or 0)
+    except (TypeError, ValueError):
+        shares = 0
+    return shares <= 0 and state == 'FLAT'
+
+
+def vantage_presentation(campaign, currency):
+    """Pure Dynamic/Pinned/Reload/Campaign wording for Vantage."""
+    c = campaign or {}
+    price = c.get('vantage')
+    price_text = fmt_price(price, currency) if price else '--'
+    pinned = bool(c.get('vantage_manual'))
+    if c.get('campaign_id'):
+        label = str(c.get('vantage_manual_label') or '').strip().strip('() ')
+        detail = (f'Campaign Vantage · pinned {label}' if pinned and label
+                  else 'Campaign Vantage · frozen at LOAD')
+        return {
+            'pinned': pinned,
+            'label': label,
+            'text': f'CAMPAIGN — {detail}: {price_text}',
+            'source': detail,
+        }
+    if pinned:
+        label = str(c.get('vantage_manual_label') or 'selected high').strip()
+        label = label.strip('() ') or 'selected high'
+        return {
+            'pinned': True,
+            'label': label,
+            'text': f'PINNED — {label}: {price_text}',
+            'source': f'Pinned {label}',
+        }
+    src = c.get('vantage_src') or 'high5'
+    detail = _VANTAGE_SRC.get(src, src) or 'Automatic Dynamic High5'
+    mode = 'AUTOMATIC'
+    if src == 'reload':
+        mode = 'RELOAD'
+    elif src == 'close':
+        detail = 'previous-close fallback for Dynamic High5'
+    return {
+        'pinned': False,
+        'label': '',
+        'text': f'{mode} — {detail}: {price_text}',
+        'source': detail,
+    }
+
+
+def toggled_tiers(armed, tier):
+    """Toggle one tier, but return the original selection if it was last."""
+    current = [bool(v) for v in list(armed or [])[:3]]
+    current += [False] * (3 - len(current))
+    want = list(current)
+    if tier in EXIT_TIERS:
+        want[tier - 1] = not want[tier - 1]
+    return want if any(want) else current
+
+
+def sell_tier_colors(pct):
+    """Shared percent-dependent color contrast for an armed exit tier."""
+    return sell_pct_color(float(pct)), sell_pct_foreground(float(pct))
+
+
+def status_banner_color(ui):
+    """Reserve exhaustion is ordinary strategy state, not a red alarm."""
+    state = ui.get('campaign_state') or ui.get('state') or ''
+    status = str(ui.get('status') or '').lower()
+    data_error = any(token in status for token in (
+        'unavailable', 'poll error', 'data error', 'no price',
+        'no average cost', 'reconcil', 'order error'))
+    return (_STATUS_ERROR if state == 'PAUSED_RECONCILE' or data_error
+            else _STATUS_NEUTRAL)
 
 
 def campaign_line(ui, currency):
@@ -117,8 +195,9 @@ def campaign_line(ui, currency):
              f"CHASE -{c['chase_pct']}% ×{c['add_frac']}",
              f"EXIT {tiers} ({how})"]
     if c.get('vantage'):
-        src = _VANTAGE_SRC.get(c.get('vantage_src'), c.get('vantage_src') or '')
-        parts.append(f"vantage {fmt_price(c['vantage'], currency)} ({src})")
+        view = vantage_presentation(c, currency)
+        parts.append(f"Vantage {fmt_price(c['vantage'], currency)} "
+                     f"({view['source']})")
     return '  ·  '.join(parts)
 
 
@@ -190,6 +269,10 @@ def fill_log_rows(ui, currency, limit=40):
     events = (ui.get('events') or [])[-limit:]
     rows, day = [], None
     for e in events:
+        # Older saved campaigns may still carry ADOPT/GEAR/TIER/HOLD decisions.
+        # The cockpit is a fill log: only a real position delta belongs here.
+        if not e.get('qty'):
+            continue
         d = e.get('date') or ''
         if d and d != day:
             day = d
@@ -197,19 +280,36 @@ def fill_log_rows(ui, currency, limit=40):
         price = e.get('price')
         p = fmt_price(price, currency) if price else '--'
         kind = e.get('kind', '?')
-        if e.get('qty'):
-            line = (f"{e['ts']}  {kind:<7} {e['qty']:+d} @ {p}"
-                    f"  → {e['shares']} sh")
-            if e.get('avg'):
-                line += f" @ {fmt_price(e['avg'], currency)}"
-            if e.get('source') == 'EXT':
-                line += '  [hand]'
-        else:
-            line = f"{e['ts']}  {kind:<7} {e.get('note', '')}"
-        if e.get('note') and e.get('qty'):
+        line = (f"{e['ts']}  {kind:<7} {e['qty']:+d} @ {p}"
+                f"  → {e['shares']} sh")
+        if e.get('avg'):
+            line += f" @ {fmt_price(e['avg'], currency)}"
+        if e.get('source') == 'EXT':
+            line += '  [hand]'
+        elif e.get('source') == 'MIXED':
+            line += '  [bot + hand]'
+        elif e.get('source') == 'UNKNOWN':
+            line += '  [ownership unverified]'
+        if e.get('note'):
             line += f"  {e['note']}"
         rows.append((line, kind if kind in _KIND_CLR else 'OTHER'))
     return rows
+
+
+def empty_fill_status(ui, currency):
+    """Current broker-backed status shown when there are no trade rows yet."""
+    state = ui.get('campaign_state') or ui.get('state') or 'ARMING'
+    shares = int(ui.get('shares') or 0)
+    if shares > 0:
+        position = f'{shares:,} shares'
+        avg = ui.get('avg_cost') or 0
+        if avg:
+            position += f' @ {fmt_price(avg, currency)} average'
+        return (f'(current DEPLOYED: {position}; no new buy/sell change '
+                'recorded in this log)\n')
+    if state in ('FLAT', 'RELOAD_ARMED'):
+        return '(current FLAT: no shares; waiting for LOAD)\n'
+    return f'(current {state}; watcher is arming)\n'
 
 
 class CampaignWindow:
@@ -241,12 +341,6 @@ class CampaignWindow:
                                    command=self._on_live)
         self._live_btn.pack(side='right', padx=(6, 0))
         self._default_bg = self._live_btn.cget('bg')
-        # Only ever enabled when something is actually resting — the button
-        # naming the count is what explains what it is for.
-        self._cancel_btn = tk.Button(head, text='no resting orders',
-                                     font=_F_INFO, state='disabled',
-                                     command=self._do_cancel)
-        self._cancel_btn.pack(side='right', padx=(6, 0))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
@@ -279,17 +373,17 @@ class CampaignWindow:
         self._vol_lbl.pack(side='left', padx=(16, 0))
 
         # ── Vantage strip: where the LOAD hangs from, and how to move it ──────
-        vbox = tk.Frame(self.win, padx=12, pady=(0))
-        vbox.pack(fill='x')
-        tk.Label(vbox, text='vantage', font=_F_SM, fg='#888').pack(side='left')
+        vbox = tk.Frame(self.win, padx=12)
+        vbox.pack(fill='x', pady=(1, 4))
+        tk.Label(vbox, text='Vantage:', font=_F_SM_B, fg='#555').pack(side='left')
         self._vantage_lbl = tk.Label(vbox, text='', font=_F_SM_B, fg='#E08000')
         self._vantage_lbl.pack(side='left', padx=(4, 10))
         self._vantage_free_btn = tk.Button(
-            vbox, text='use the rolling high', font=_F_SM, bd=1, takefocus=0,
+            vbox, text='Return to Dynamic High5', font=_F_SM, bd=1,
+            takefocus=0,
             command=self._on_free_vantage)
-        self._vantage_free_btn.pack(side='left')
-        tk.Label(vbox, text='  — or click a day on the 5-day chart to pin its '
-                            'high', font=_F_SM, fg='#888').pack(side='left')
+        self._vantage_hint_lbl = tk.Label(vbox, text='', font=_F_SM, fg='#777')
+        self._vantage_hint_lbl.pack(side='left', padx=(2, 0))
 
         # ── Banner ────────────────────────────────────────────────────────────
         self._gear_lbl = tk.Label(self.win, text='', font=_F_BTN,
@@ -305,7 +399,7 @@ class CampaignWindow:
                                   anchor='w')
         self._next_lbl.pack(fill='x', padx=14)
         self._status_lbl = tk.Label(self.win, text='', font=_F_INFO,
-                                    fg='#4B0082', anchor='w')
+                                    fg=_STATUS_NEUTRAL, anchor='w')
         self._status_lbl.pack(fill='x', padx=14, pady=(0, 4))
 
         # ── Campaign log (bottom strip, grows with the campaign) ─────────────
@@ -362,53 +456,40 @@ class CampaignWindow:
             return
         ui = self.ap['ui_state']() or {}
         c = ui.get('campaign') or {}
-        lines = ui.get('lines') or {}
         detail = [f'Go LIVE on {self.ticker}?', '',
                   'The campaign bot sends these by ITSELF the moment the '
                   'price touches the line:']
         for e in buy_lines(ui)[:1]:
             detail.append(f"  BUY   {e['qty']} @ "
                           f"{fmt_price(e['price'], self.ccy)}   ({e['label']})")
-        if lines.get('exit'):
-            detail.append(f"  SELL  {lines['exit']['qty']} (ALL) @ "
-                          f"{fmt_price(lines['exit']['price'], self.ccy)}")
+        for e in sell_lines(ui):
+            when = 'SELL  ' if e.get('armed') else 'SELL* '
+            detail.append(
+                f"  {when} {e['qty']} @ {fmt_price(e['price'], self.ccy)}"
+                f"   ({e['label']})")
+        armed = c.get('exit_tiers') or [False, True, False]
+        exit_mode = ('one armed tier takes the full position'
+                     if sum(bool(v) for v in armed) == 1
+                     else 'the position is split across the armed tiers')
         detail += [
             '',
             f"Gear {c.get('gear', '?')}: LOAD -{c.get('load_pct', '?')}%, "
             f"CHASE -{c.get('chase_pct', '?')}% ×{c.get('add_frac', '?')}, "
-            f"one full EXIT at T{c.get('exit_tier', '?')} "
-            f"+{c.get('exit_pct', '?')}%. One order at a time; every fill "
-            f"recomputes both lines from the broker's real average; the "
+            f"EXIT {c.get('tier_text', '?')} — {exit_mode}. "
+            f"One order at a time; every fill "
+            f"recomputes the ladder from the broker's real average; the "
             f"campaign ends only when the holding is zero. The chase stops "
             f"when the army runs out — there is no other cap. LIVE drops "
             f"back to WATCH when the market closes.",
         ]
+        if any(not e.get('armed') for e in sell_lines(ui)):
+            detail.append('* projected after the LOAD fills')
         if not messagebox.askyesno('Campaign LIVE', '\n'.join(detail),
                                    parent=self.win):
             return
         ok, msg = self.ap['set_mode']('LIVE')
         if not ok:
             messagebox.showwarning('Autopilot', msg, parent=self.win)
-
-    def _do_cancel(self):
-        orders = (self.ui or {}).get('orders') or []
-        if not orders:
-            return
-        lines = [f'Cancel {len(orders)} resting order(s) on {self.ticker}?',
-                 '']
-        for o in orders:
-            lines.append(f"  {o.get('side', '?')} {o.get('qty_open', '?')} @ "
-                         f"{fmt_price(o.get('price'), self.ccy)}")
-        lines += ['',
-                  'Only unfilled orders are cancelled; anything already '
-                  'traded stays. The bot re-arms the current line on its '
-                  'next poll.']
-        if not messagebox.askyesno('Cancel resting orders', '\n'.join(lines),
-                                   parent=self.win):
-            return
-        ok, msg = self.ap['cancel_all']()
-        if not ok:
-            messagebox.showwarning('Cancel', msg, parent=self.win)
 
     # ── Gearbox strip ─────────────────────────────────────────────────────────
 
@@ -423,57 +504,35 @@ class CampaignWindow:
         self.ap['set_gear'](gear)
 
     def _on_tier(self, tier):
-        """Arm or disarm one exit tier. This decides where real money leaves,
-        so it is confirmed; the last armed tier cannot be turned off."""
+        """Apply a tier choice immediately; silently keep the final one."""
         c = (self.ui or {}).get('campaign') or {}
         armed = list(c.get('exit_tiers') or [False, True, False])
-        pcts = c.get('tier_pcts') or (0, 0, 0)
-        want = list(armed)
-        want[tier - 1] = not want[tier - 1]
-        if not any(want):
-            messagebox.showinfo(
-                'Exit tiers',
-                'At least one exit tier stays armed — otherwise the campaign '
-                'has no way out.', parent=self.win)
+        want = toggled_tiers(armed, tier)
+        if want == armed:
             return
-        on = [i + 1 for i, a in enumerate(want) if a]
-        if len(on) == 1:
-            plan = (f'the WHOLE position leaves at T{on[0]} '
-                    f'+{pcts[on[0] - 1]}%.')
-        else:
-            share = {2: 'half', 3: 'a third'}[len(on)]
-            lines = ', '.join(f'T{i} +{pcts[i - 1]}%' for i in on)
-            plan = (f'about {share} of the holding leaves at each of {lines}.'
-                    '\n\nA tier that fills is spent; the rest stay armed, and '
-                    'the campaign is over only when the holding reaches zero. '
-                    'A chase re-arms every tier on the bigger holding.')
-        label = '+'.join(f'T{i}' for i in on)
-        if messagebox.askyesno('Exit tiers', f'Arm {label}?\n\n{plan}',
-                               parent=self.win):
-            self.ap['set_tiers'](want)
+        self.ap['set_tiers'](want)
 
     # ── Vantage ───────────────────────────────────────────────────────────────
 
     def _on_free_vantage(self):
+        if not can_pin_vantage(self.ui or {}):
+            return
         ok, msg = self.ap['set_vantage'](None)
         if not ok:
             messagebox.showwarning('Vantage', msg, parent=self.win)
 
     def _on_pick_day(self, bar):
         """A day was clicked on the 5-day chart: pin its HIGH as the vantage.
-        This is the manual override for the day a campaign really ended — the
-        rolling high cannot know about a trade made outside the bot."""
+        The choice applies immediately. A deployed campaign cannot change its
+        established Vantage here."""
+        if not can_pin_vantage(self.ui or {}):
+            return
         high = bar.get('high')
         if not high:
             return
         day = bar.get('date') or ''
-        text = (f"Pin the vantage to {day}'s high, "
-                f'{fmt_price(high, self.ccy)}?\n\n'
-                'The LOAD hangs under this price until you release it, so it '
-                'stops following the rolling high.')
-        if not messagebox.askyesno('Vantage', text, parent=self.win):
-            return
-        ok, msg = self.ap['set_vantage'](high, f'({day} high)')
+        label = bar.get('_vantage_label') or f'{day} high'
+        ok, msg = self.ap['set_vantage'](high, label)
         if not ok:
             messagebox.showwarning('Vantage', msg, parent=self.win)
 
@@ -491,9 +550,11 @@ class CampaignWindow:
             activebackground=('#2E8B57' if auto else '#E6B800'))
         for g, b in self._gear_btns.items():
             picked = (g == gear)
-            b.config(bg=(gear_button_color(g) if picked else self._default_bg),
-                     fg=(gear_button_fg(g) if picked else '#666'),
-                     relief=('sunken' if picked else 'raised'))
+            bg, fg = gear_button_color(g), gear_button_fg(g)
+            b.config(bg=bg, fg=fg, activebackground=bg,
+                     activeforeground=fg,
+                     relief=('sunken' if picked else 'raised'),
+                     bd=(3 if picked else 1))
         if gear:
             g = gear_params(gear)
             self._gear_txt.config(
@@ -501,12 +562,12 @@ class CampaignWindow:
                      + ('' if auto else '  (manual)'))
             for t, b in self._tier_btns.items():
                 on, spent = armed[t - 1], done[t - 1]
-                label = f'T{t} +{exit_pct(gear, t)}%' + (' ✓' if spent else '')
+                pct = exit_pct(gear, t)
+                label = f'T{t} +{pct}%' + (' ✓' if spent else '')
+                active_bg, active_fg = sell_tier_colors(pct)
                 b.config(text=label,
-                         bg=(self._default_bg if not on else
-                             ('#E4A9A9' if spent else _CLR['exit'])),
-                         fg=('#666' if not on else
-                             ('#552222' if spent else 'white')),
+                         bg=(active_bg if on else self._default_bg),
+                         fg=(active_fg if on else '#666'),
                          relief=('sunken' if on else 'raised'))
 
         v = ui.get('vol5')
@@ -517,16 +578,23 @@ class CampaignWindow:
             tail = '' if (auto or rec == gear) else f' (AUTO would pick G{rec})'
             self._vol_lbl.config(text=f'V {v:.1f}% → G{rec}{tail}')
 
-        src = c.get('vantage_src') or ''
-        pinned = bool(c.get('vantage_manual'))
-        txt = (fmt_price(c['vantage'], self.ccy) if c.get('vantage') else '--')
-        detail = _VANTAGE_SRC.get(src, src)
-        if c.get('last_exit_date'):
-            detail += f" · last exit {c['last_exit_date']}"
-        self._vantage_lbl.config(text=f'{txt}  ({detail})',
-                                 fg=('#CC0000' if pinned else '#E08000'))
-        self._vantage_free_btn.config(
-            state=('normal' if pinned else 'disabled'))
+        vantage = vantage_presentation(c, self.ccy)
+        selectable = can_pin_vantage(ui)
+        suffix = (f"  · last exit {c['last_exit_date']}"
+                  if c.get('last_exit_date') else '')
+        self._vantage_lbl.config(
+            text=vantage['text'] + suffix,
+            fg=('#CC0000' if vantage['pinned'] else '#E08000'))
+        self._vantage_hint_lbl.config(
+            text=('Choose a candle or OHLC row below to pin that day\'s high.'
+                  if selectable else
+                  'Vantage selection is locked while deployed or an order is pending.'))
+        show_return = vantage['pinned'] and selectable
+        if show_return and not self._vantage_free_btn.winfo_manager():
+            self._vantage_free_btn.pack(side='left', padx=(0, 8),
+                                        before=self._vantage_hint_lbl)
+        elif not show_return and self._vantage_free_btn.winfo_manager():
+            self._vantage_free_btn.pack_forget()
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -557,12 +625,6 @@ class CampaignWindow:
         mkt = 'KR' if self.ticker.endswith('.KS') else 'US'
         self._phase_lbl.config(text=f'{mkt} market: {txt}', fg=pclr)
 
-        orders = ui.get('orders') or []
-        self._cancel_btn.config(
-            text=(f'Cancel {len(orders)} resting' if orders
-                  else 'no resting orders'),
-            state=('normal' if orders else 'disabled'))
-
         self._update_gearbox(ui)
         self._gear_lbl.config(text=campaign_line(ui, self.ccy))
         self._age_lbl.config(text=campaign_age_line(ui, self.ccy))
@@ -570,7 +632,7 @@ class CampaignWindow:
         self._next_lbl.config(text=next_line(ui, self.ccy))
         self._status_lbl.config(
             text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}",
-            fg=('#CC0000' if ui.get('buy_state') != 'OK' else '#4B0082'))
+            fg=status_banner_color(ui))
         self._update_log(ui)
         self._draw()
         self._refresh_candles()
@@ -608,12 +670,7 @@ class CampaignWindow:
         txt.delete('1.0', 'end')
         txt.insert('end', 'RECORDED FILLS\n', 'HEADER')
         if not rows:
-            state = ui.get('campaign_state') or ui.get('state') or 'ARMING'
-            txt.insert('end', {
-                'DEPLOYED': '(no buy/sell change recorded since this '
-                            'campaign was adopted)\n',
-                'FLAT': '(no campaign open — waiting for the LOAD)\n',
-            }.get(state, '(watcher is arming)\n'), 'OTHER')
+            txt.insert('end', empty_fill_status(ui, self.ccy), 'OTHER')
         for line, kind in rows:
             txt.insert('end', line + '\n', kind)
         txt.config(state='disabled')
@@ -656,9 +713,9 @@ class CampaignWindow:
 
         if c.get('vantage'):
             v = c['vantage']
-            src = _VANTAGE_SRC.get(c.get('vantage_src'), '')
+            src = vantage_presentation(c, self.ccy)['source']
             rows.append((v, _CLR['vantage'],
-                         f'vantage {fmt_price(v, self.ccy)} ({src})', False))
+                         f'Vantage {fmt_price(v, self.ccy)} ({src})', False))
         return rows
 
     def _refresh_candles(self):
@@ -679,9 +736,13 @@ class CampaignWindow:
                 refs.append({'label': text, 'price': price, 'color': color,
                              'dash': ((2, 4) if bold else (3, 6)),
                              'width': (1.8 if bold else 1.1)})
-        self.candle_panel.update(ohlc=ohlc, ref_lines=refs,
-                                 current=(ui or {}).get('price'),
-                                 vol5=(ui or {}).get('vol5'))
+        campaign = (ui or {}).get('campaign') or {}
+        self.candle_panel.update(
+            ohlc=ohlc, ref_lines=refs,
+            current=(ui or {}).get('price'), vol5=(ui or {}).get('vol5'),
+            selection_enabled=can_pin_vantage(ui or {}),
+            selected_price=campaign.get('vantage_manual'),
+            selected_label=campaign.get('vantage_manual_label'))
 
     # ── Live chart ────────────────────────────────────────────────────────────
 

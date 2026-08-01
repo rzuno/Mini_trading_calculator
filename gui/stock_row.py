@@ -1,14 +1,13 @@
 import tkinter as tk
-from tkinter import messagebox
 
 from core.calc import (
-    DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS, RELOAD_DROP_PCT,
-    calc_chase_cascade, calc_exit_lines, calc_gap_rate, calc_load_ladder,
-    calc_reload_price, chase_drop, clamp_gear, display_name,
-    effective_entry_gear, exit_pct, fmt_price, gap_color, gear_button_color,
-    gear_button_fg, gear_detail, gear_for_chase_pct, gear_label,
-    gear_menu_label, gear_params, load_drop, load_gap_color, select_auto_gear,
-    sell_pct_color, tier_pcts,
+    DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS,
+    calc_chase_cascade, calc_exit_lines, calc_gap_rate, calc_load_gap_rate,
+    calc_load_ladder, calc_reload_price, chase_drop, clamp_gear, display_name,
+    effective_entry_gear, exit_pct, fmt_price, gap_color, gear_detail,
+    gear_for_chase_pct, gear_label, gear_menu_label, gear_params, load_drop,
+    load_gap_color, select_auto_gear, sell_pct_color, sell_pct_foreground,
+    tier_pcts,
 )
 
 # Readable blue for buy-trigger values (matches the chart's chase lines)
@@ -24,9 +23,7 @@ _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
 _F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
-_F_TINY = ('Segoe UI', 9)
 _F_STATUS = ('Segoe UI', 12, 'bold')
-_F_GEAR_BADGE = ('Segoe UI', 18, 'bold')
 
 # Greys for a "muted" (state-inactive but informational) control
 _MUTE_TITLE = '#C0C0C0'
@@ -54,8 +51,8 @@ class StockRow:
     **Exit tiers are a multi-select.** Arm one and the whole position leaves
     there. Arm two or three and it leaves in portions — a tier that fills is
     spent, the rest stay armed, and the campaign ends only when the holding is
-    actually zero. A chase re-arms every tier on the larger holding. Changing
-    the selection asks for confirmation, because it moves real money.
+    actually zero. A chase re-arms every tier on the larger holding. Tier
+    selections apply immediately; the last armed tier cannot be switched off.
 
     The gear can be shifted at any time, deployed or not: only the average
     cost is history, and every line is recomputed from it on the spot. AUTO
@@ -69,7 +66,6 @@ class StockRow:
                  on_autopilot=None):
         self.deployed       = deployed
         self.editable       = editable
-        self._order_locked  = False   # True while live orders rest (gear frozen)
         self.ticker         = pos['ticker']
         self.tier           = pos.get('tier', 'Major')
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
@@ -78,12 +74,13 @@ class StockRow:
         self._on_compute_cb = on_compute
         self.current_price  = None
         self.vantage        = None    # High5 / prev close / same-day sell fill
-        self.vantage_src    = 'high5' # 'high5' | 'close' | 'reload'
+        self.vantage_src    = 'high5' # high5 | close | reload | manual
         self.volatility     = None
         self._army_pct      = None
-        self._gap           = None    # current vs anchor %, for ordering
+        self._gap           = None    # actionable gap %, for global ordering
         self._computing     = False
         self._syncing_gear  = False
+        self._syncing_position = False
         self._order_side    = None
         self._base_gear = None        # pure volatility gear
         self._eff_gear  = None        # after the heavy-unit rule
@@ -233,8 +230,8 @@ class StockRow:
         self.gap_lbl = _out('Gap:', self.gap_var, width=9)
 
         # Ladder: 3 columns. Buys on top (Load/Chase), the gear's three EXIT
-        # tiers beneath — every tier sells the WHOLE position, only the
-        # selected one is armed.
+        # tiers beneath. One armed tier takes all shares; multiple armed tiers
+        # split the position.
         ladder = tk.Frame(left)
         ladder.pack(fill='x', pady=(2, 0))
 
@@ -291,17 +288,7 @@ class StockRow:
                              command=lambda g=gear: self._on_gear_select(g))
         self.gear_menu.config(menu=menu)
         self.gear_menu.pack(side='left')
-        badge_row = tk.Frame(gear_box)
-        badge_row.grid(row=2, column=0, sticky='w', pady=(3, 0))
-        tk.Label(badge_row, text='gear:', font=_F_SM, fg='#888'
-                 ).pack(side='left', padx=(0, 3))
-        self.gear_badge = tk.Canvas(
-            badge_row, width=46, height=46, highlightthickness=0, bd=0)
-        self.gear_badge.pack(side='left')
-        self.mode_lbl = tk.Label(badge_row, text='', font=_F_TINY, fg='#888')
-        self.mode_lbl.pack(side='left', padx=(4, 0))
-
-        # -- Exit tier (ONE tier, full position — no split) --------------------
+        # -- Exit tiers (one full exit, or a two/three-tier split) --------------
         exit_box = tk.Frame(wrap)
         exit_box.pack(side='left', anchor='n')
         self._gear_title['exit'] = tk.Label(exit_box, text='Exit',
@@ -360,34 +347,10 @@ class StockRow:
         return flags
 
     def _on_tier_click(self, tier):
-        """Arming or disarming a tier changes where real money leaves, so it
-        is confirmed. Turning the last one off is refused — a campaign with no
-        way out is not a state worth allowing."""
+        """Apply the click immediately; silently keep the final tier armed."""
         flags = [bool(v.get()) for v in self.tier_vars]
         if not any(flags):
             self.tier_vars[tier - 1].set(True)
-            messagebox.showinfo(
-                'Exit tiers',
-                'At least one exit tier stays armed — otherwise the campaign '
-                'has no way out.', parent=self.frame)
-            return
-        gear = self._get_gear()
-        armed = [i for i in EXIT_TIERS if flags[i - 1]]
-        pcts = tier_pcts(gear)
-        if len(armed) == 1:
-            plan = (f'the WHOLE position leaves at T{armed[0]} '
-                    f'+{pcts[armed[0] - 1]}%')
-        else:
-            share = {2: 'half', 3: 'a third'}[len(armed)]
-            lines = ', '.join(f'T{i} +{pcts[i - 1]}%' for i in armed)
-            plan = (f'about {share} of the holding leaves at each of {lines}.'
-                    '\n\nA tier that fills is spent; the rest stay armed, and '
-                    'the campaign is over only when the holding is zero. A '
-                    'chase re-arms every tier on the bigger holding.')
-        if messagebox.askyesno('Exit tiers', f'Arm {self._tier_text()}?\n\n'
-                                             f'{plan}', parent=self.frame):
-            return
-        self.tier_vars[tier - 1].set(not flags[tier - 1])   # rolled back
 
     def _tier_text(self) -> str:
         on = [f'T{i}' for i in EXIT_TIERS if self._get_tiers()[i - 1]]
@@ -434,11 +397,12 @@ class StockRow:
     def _apply_auto(self):
         """AUTO tracks the 5-day range, deployed or not — the gear is not
         pinned by a live campaign, because only the average cost is history
-        and both lines are recomputed from it. The heavy-unit floor applies
+        and the full ladder is recomputed from it. The heavy-unit floor applies
         to a FLAT card only: it is an ENTRY rule about opening a position with
-        useful resolution, not about one that already exists. Everything
-        freezes while live orders rest."""
-        if self._order_locked or not self.auto_var.get():
+        useful resolution, not about one that already exists. Resting orders
+        do not freeze the strategy: the bot self-heals its own order when a
+        line moves, while a foreign order pauses execution safely."""
+        if not self.auto_var.get():
             return
         if self.volatility is None:
             return
@@ -462,39 +426,23 @@ class StockRow:
 
     # ── Gear styling (enabled + state muting) ─────────────────────────────────
 
-    def set_gear_locked(self, locked: bool):
-        """Freeze (or release) every gear control while live orders rest."""
-        self._order_locked = bool(locked)
-        self._refresh_gear_styles()
-
     def set_order_state(self, side):
-        """Reflect live Toss orders in the title status and lock resting gear."""
+        """Reflect live Toss orders in the title without locking strategy."""
         self._order_side = side
         self._refresh_status()
-        self.set_gear_locked(side is not None)
 
     def _refresh_status(self):
         """Title status shows live resting orders only."""
         if self._order_side == 'BUY':
-            self._status_lbl.config(text='buy ordered', fg=_SELL_FG)
+            self._status_lbl.config(text='buy ordered', fg=_BUY_FG)
         elif self._order_side == 'SELL':
-            self._status_lbl.config(text='sell ordered', fg=_BUY_FG)
+            self._status_lbl.config(text='sell ordered', fg=_SELL_FG)
         else:
             self._status_lbl.config(text='')
 
     def _refresh_gear_styles(self):
         self._refresh_gear_title_text()
-        self._draw_gear_badge(self._get_gear())
         self._style_tier_buttons()
-
-        # While orders are live the projection must not move: lock everything.
-        if self._order_locked:
-            self.auto_btn.config(state='disabled')
-            self.gear_menu.config(state='disabled')
-            for b in self._tier_btns.values():
-                b.config(state='disabled')
-            self.mode_lbl.config(text='locked', fg='#CC0000')
-            return
 
         self.auto_btn.config(state='normal')
         for b in self._tier_btns.values():
@@ -507,8 +455,6 @@ class StockRow:
             activeforeground=self._gear_menu_default_fg,
             activebackground=self._gear_menu_default_bg,
             disabledforeground='#888888', font=_F_SM)
-        self.mode_lbl.config(text='live' if self.deployed else '',
-                             fg='#0033AA')
 
     def _style_tier_buttons(self):
         gear = self._get_gear()
@@ -517,29 +463,18 @@ class StockRow:
             pct = exit_pct(gear, t)
             if armed[t - 1]:
                 bg = sell_pct_color(float(pct))
-                fg = 'white' if pct >= 7 else 'black'
+                fg = sell_pct_foreground(pct)
             else:
                 bg, fg = _MUTE_BG, _MUTE_FG
             btn.config(text=f'T{t} +{pct}%', bg=bg, fg=fg,
                        selectcolor=bg, activebackground=bg,
                        activeforeground=fg)
 
-    def _draw_gear_badge(self, gear):
-        if not hasattr(self, 'gear_badge'):
-            return
-        gear = clamp_gear(gear)
-        bg = gear_button_color(gear)
-        fg = gear_button_fg(gear)
-        self.gear_badge.delete('all')
-        self.gear_badge.create_oval(
-            3, 3, 43, 43, fill=bg, outline='#555555', width=1)
-        self.gear_badge.create_text(
-            23, 23, text=str(gear), fill=fg, font=_F_GEAR_BADGE)
-
     # ── Compute ───────────────────────────────────────────────────────────────
 
     def _on_input_change(self):
-        if not self._computing and not self._syncing_gear:
+        if (not self._computing and not self._syncing_gear
+                and not self._syncing_position):
             self.compute()
             if self._on_compute_cb:
                 self._on_compute_cb()
@@ -603,7 +538,8 @@ class StockRow:
                 anchor_price = load_price if load_price > 0 else None
                 exit_lines = calc_exit_lines(load_shares, load_price, gear,
                                              armed)
-                tag = ' (reload)' if reload_mode else ''
+                tag = (' (reload)' if reload_mode else
+                       (' (pinned)' if self.vantage_src == 'manual' else ''))
                 self.cost_var.set(fmt_price(self.vantage, ccy) + tag)
             else:
                 anchor_price = None
@@ -617,22 +553,20 @@ class StockRow:
         else:
             self.current_var.set('--')
 
-        # Deployed: gap = current vs avg cost (P&L red/blue).
-        # Flat: gap = current vs the VANTAGE — how much of the pullback the
-        # price still owes before the LOAD line is reached.
-        trigger_pct = (RELOAD_DROP_PCT if self.vantage_src == 'reload'
-                       else load_drop(gear))
+        # Deployed: current vs average cost. Flat: LOAD vs current, so the
+        # number rises toward zero as the bait gets closer (historical card
+        # semantics). FLAT keeps one blue lightness scale; deployed remains the
+        # red/grey/blue position P&L scale.
         if self.deployed and self.current_price and anchor_price:
             gap = calc_gap_rate(self.current_price, anchor_price)
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
             self.gap_lbl.config(fg=gap_color(gap))
-        elif (not self.deployed and self.current_price
-                and self.vantage and self.vantage > 0):
-            gap = (self.current_price - self.vantage) / self.vantage * 100.0
+        elif (not self.deployed and self.current_price and anchor_price):
+            gap = calc_load_gap_rate(self.current_price, anchor_price)
             self._gap = gap
             self.gap_var.set(f"{gap:+.2f}%")
-            self.gap_lbl.config(fg=load_gap_color(gap, trigger_pct))
+            self.gap_lbl.config(fg=load_gap_color(gap))
         else:
             self._gap = None
             self.gap_var.set('--')
@@ -732,6 +666,40 @@ class StockRow:
             self.vantage_src = vantage_src
         if volatility is not None:
             self.volatility = volatility
+
+    def update_broker_position(self, qty, avg_price):
+        """Reconcile the card with the broker position used by the cockpit.
+
+        The controller can call this before its normal live-price update so
+        both views calculate from the same shares and average. The main account
+        refresh still rebuilds the card when it crosses between FLAT and
+        DEPLOYED, because that changes the card's structural layout.
+        """
+        try:
+            shares = max(0, int(round(float(qty or 0))))
+        except (TypeError, ValueError):
+            shares = 0
+        try:
+            avg = max(0.0, float(avg_price or 0.0))
+        except (TypeError, ValueError):
+            avg = 0.0
+
+        shares_text = str(shares) if shares else ''
+        avg_text = self._fmt_init(avg) if shares and avg else ''
+        if (self.shares_var.get() == shares_text
+                and self.avg_cost_var.get() == avg_text):
+            return False
+
+        self._syncing_position = True
+        try:
+            self.shares_var.set(shares_text)
+            self.avg_cost_var.set(avg_text)
+        finally:
+            self._syncing_position = False
+        self.compute()
+        if self._on_compute_cb:
+            self._on_compute_cb()
+        return True
 
     def get_state(self) -> dict:
         try:

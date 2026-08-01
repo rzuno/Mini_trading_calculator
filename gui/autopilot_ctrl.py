@@ -7,7 +7,7 @@ buying power. The main panel stays refresh-button-driven; only the autopilot
 windows (and the cards' button colors) follow ticks.
 
 ONE strategy: V_COMMANDOS_GEARBOX (`core/vcommandos.py`). It follows exactly
-the lines the CARD draws — every card pushes {'gear','exit_tier'} on each
+the lines the CARD draws — every card pushes {'gear','exit_tiers','auto'} on each
 compute, so whatever the commander reads off the card IS what the bot watches.
 
 The Daily v^ grid was removed on 2026-08-01 to stabilise this one; it is
@@ -21,8 +21,8 @@ Modes per stock:
             hours; when the session ends, LIVE drops back to WATCH.
 
 Error policy: a failed poll skips the whole cycle and retries; ~6 straight
-failures announce a data problem once. insufficient-buying-power announces
-once and backs off 5 min (the SELL side stays managed — no hard stop);
+failures announce a data problem once. Insufficient buying power is shown on
+the line/banner without a popup and backs BUY off 5 min (SELL stays managed);
 order-hours-closed backs off 5 min; opposite-pending retries next cycle.
 
 Engine state persists in data/autopilot_state.json under 'ticker#VCG', so a
@@ -41,7 +41,8 @@ import tkinter as tk
 from tkinter import messagebox
 
 from core.vcommandos import CampaignEngine, POLL_SECONDS, STRATEGY_ID
-from core.calc import calc_volatility, clamp_gear, fmt_order_price
+from core.calc import (calc_volatility, clamp_gear, effective_entry_gear,
+                       fmt_order_price, select_auto_gear)
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
@@ -53,6 +54,249 @@ _BACKOFF_OTHER = 60
 _TICKS_KEPT = 7200              # ~10h of 5s ticks for the live chart
 _FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one warning
 _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
+
+# Every broker order created by this controller carries this stable prefix.
+# Toss returns clientOrderId with order history/open-order rows, so ownership
+# survives an application restart instead of depending only on the in-memory
+# order ids collected during the current run.
+_BOT_CLIENT_ID_PREFIX = 'vcg-ap-'
+_CLEANUP_RETRY_S = 5
+_FILL_EVIDENCE_RETRIES = 3
+_CARD_REBUILD_RETRY_S = 15
+_FILL_HISTORY_OVERLAP_S = 120
+_IDEMPOTENCY_TTL_S = 600       # Toss documents clientOrderId for ten minutes
+_SUBMISSION_RETRY_S = 5
+
+_TERMINAL_ORDER_STATES = {'FILLED', 'CANCELED', 'REJECTED', 'REPLACED'}
+
+
+def _client_order_id(order):
+    """Read a broker/client order id from raw or normalized order data."""
+    return (order.get('client_order_id') or order.get('clientOrderId')
+            or order.get('client_id'))
+
+
+def _broker_order_id(order):
+    """Read a broker order id from raw or normalized order data."""
+    return order.get('id') or order.get('order_id') or order.get('orderId')
+
+
+def is_bot_owned_order(order, runtime_ids=()):
+    """True only for an order this V-Commandos controller can prove it owns.
+
+    Runtime broker ids cover orders placed since launch; the clientOrderId
+    prefix covers those same orders after a restart. Price/side/quantity are
+    deliberately never used as ownership evidence because an app/web order can
+    legitimately look identical to a bot order.
+    """
+    oid = _broker_order_id(order)
+    coid = str(_client_order_id(order) or '')
+    return bool((oid and oid in (runtime_ids or ()))
+                or coid.startswith(_BOT_CLIENT_ID_PREFIX))
+
+
+def _as_float(value, default=0.0):
+    try:
+        return float(value) if value not in (None, '') else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _compact_qty(value):
+    """Keep fractional broker quantities intact; render whole shares as int."""
+    qty = _as_float(value, 0.0)
+    return int(qty) if qty.is_integer() else qty
+
+
+def _broker_epoch(value):
+    """Parse an ISO/epoch broker timestamp for bounded fill correlation."""
+    if value in (None, ''):
+        return None
+    try:
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000.0
+        return number
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_TZ_KR)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _closed_from_date(ticker, value):
+    """Conservative order-creation date for a bounded CLOSED scan.
+
+    Toss applies ``from`` to ``orderedAt`` in KST.  A US DAY order can be
+    created before KST midnight and finish after it, so using the Eastern
+    session date deliberately widens that query by at most one KST day; the
+    caller still filters every row by its exact ``filledAt`` timestamp.
+    """
+    epoch = _broker_epoch(value)
+    if epoch is None:
+        return None
+    scan_utc = datetime.fromtimestamp(epoch, timezone.utc)
+    if ticker.endswith('.KS'):
+        scan_local = scan_utc.astimezone(_TZ_KR)
+    else:
+        eastern_day = (scan_utc + timedelta(hours=-5)).date()
+        eastern_offset = -4 if _us_dst(eastern_day) else -5
+        scan_local = scan_utc.astimezone(
+            timezone(timedelta(hours=eastern_offset)))
+    return scan_local.strftime('%Y-%m-%d')
+
+
+def fill_evidence_key(fill):
+    """Match ``CampaignEngine.fill_evidence_key`` without importing internals."""
+    if not isinstance(fill, dict):
+        return None
+    oid = fill.get('order_id') or fill.get('id')
+    coid = fill.get('client_order_id')
+    side = str(fill.get('side') or '').upper()
+    qty = _compact_qty(fill.get('qty') or 0)
+    stamp = fill.get('filled_at') or fill.get('fill_time') or ''
+    if not (oid or coid or stamp):
+        return None
+    return '|'.join(str(v or '') for v in (oid, coid, side, qty, stamp))
+
+
+def normalize_open_order(order, runtime_ids=()):
+    """Normalize one Toss working-order row for the campaign engine."""
+    execution = order.get('execution') or {}
+    filled = _as_float(
+        execution.get('filledQuantity', order.get('filled')), 0.0)
+    if order.get('quantity') not in (None, ''):
+        quantity = _as_float(order.get('quantity'), 0.0)
+        qty_open = max(0.0, quantity - filled)
+    else:
+        qty_open = _as_float(order.get('qty_open'), 0.0)
+        if qty_open <= 0 and _as_float(order.get('orderAmount'), 0.0) > 0:
+            # Amount-based MARKET orders do not have a knowable share count
+            # before execution. A positive sentinel keeps the foreign order
+            # visible to the ticker-wide pause without pretending it is a
+            # quantity that the campaign may trade or cancel.
+            qty_open = 1.0
+    oid = _broker_order_id(order)
+    coid = _client_order_id(order)
+    return {
+        'id': oid,
+        'client_order_id': coid,
+        'side': str(order.get('side') or '').upper(),
+        'price': _as_float(order.get('price'), None),
+        'qty_open': _compact_qty(max(0.0, qty_open)),
+        'filled': _compact_qty(filled),
+        'mine': is_bot_owned_order(order, runtime_ids),
+        'status': str(order.get('status') or '').upper(),
+    }
+
+
+def normalize_order_detail(order, runtime_ids=()):
+    """Normalize exact order detail, including terminal lifecycle evidence."""
+    if not isinstance(order, dict) or not order:
+        return None
+    execution = order.get('execution') or {}
+    filled = _as_float(execution.get('filledQuantity', order.get('filled')), 0.0)
+    quantity = _as_float(order.get('quantity'), 0.0)
+    qty_open = max(0.0, quantity - filled) if quantity > 0 else _as_float(
+        order.get('qty_open'), 0.0)
+    status = str(order.get('status') or order.get('orderStatus') or '').upper()
+    terminal = status in _TERMINAL_ORDER_STATES
+    # Some detail implementations omit status but expose a completed quantity
+    # or cancellation timestamp.  Both are positive terminal evidence.
+    if quantity > 0 and filled >= quantity:
+        terminal = True
+        status = status or 'FILLED'
+    if order.get('canceledAt') or order.get('cancelledAt'):
+        terminal = True
+        status = status or 'CANCELED'
+    filled_at = (execution.get('filledAt') or order.get('filledAt')
+                 or order.get('filled_at') or order.get('fill_time'))
+    return {
+        'id': _broker_order_id(order),
+        'order_id': _broker_order_id(order),
+        'client_order_id': _client_order_id(order),
+        'side': str(order.get('side') or '').upper(),
+        'price': _as_float(order.get('price'), None),
+        'qty': _compact_qty(quantity),
+        'qty_open': _compact_qty(qty_open),
+        'filled': _compact_qty(filled),
+        'actual_fill_price': _as_float(
+            execution.get('averageFilledPrice', order.get('actual_fill_price')),
+            None),
+        'filled_at': filled_at,
+        'status': status,
+        'terminal': terminal,
+        'mine': is_bot_owned_order(order, runtime_ids),
+    }
+
+
+def normalize_recent_fills(orders, ticker, runtime_ids=(), side=None,
+                           filled_after=None, filled_before=None,
+                           allow_undated=False):
+    """Normalize completed broker rows that contain an actual fill.
+
+    CLOSED history also contains rejected/cancelled orders with zero executed
+    quantity. Those are not fills and are omitted. ``side`` narrows a holdings
+    delta to BUY or SELL so unrelated history cannot be mistaken for the
+    change that triggered the history read.
+    """
+    wanted_symbol = ticker[:-3] if ticker.endswith('.KS') else ticker
+    wanted_side = str(side or '').upper()
+    fills = []
+    for order in orders or []:
+        symbol = str(order.get('symbol') or '')
+        if symbol and symbol != wanted_symbol and symbol != ticker:
+            continue
+        order_side = str(order.get('side') or '').upper()
+        if wanted_side and order_side != wanted_side:
+            continue
+        execution = order.get('execution') or {}
+        qty = _as_float(
+            execution.get('filledQuantity', order.get('qty')), 0.0)
+        if qty <= 0:
+            continue
+        # A limit price is intent, not execution.  Keep missing actual fill
+        # data missing so reconciliation can decline a reload instead of
+        # inventing one from ``order.price``.
+        price = _as_float(
+            execution.get('averageFilledPrice',
+                          order.get('actual_fill_price')),
+            None)
+        filled_at = (execution.get('filledAt') or order.get('filledAt')
+                     or order.get('filled_at') or order.get('fill_time'))
+        filled_epoch = _broker_epoch(filled_at)
+        if filled_epoch is None and not allow_undated:
+            continue
+        if (filled_epoch is not None and filled_after is not None
+                and filled_epoch <= float(filled_after)):
+            continue
+        if (filled_epoch is not None and filled_before is not None
+                and filled_epoch > float(filled_before)):
+            continue
+        oid = _broker_order_id(order)
+        coid = _client_order_id(order)
+        fills.append({
+            'side': order_side,
+            'qty': _compact_qty(qty),
+            # ``price``/``filled_at`` are the engine-facing canonical keys;
+            # the explicit aliases keep the payload self-describing to UI/log
+            # consumers without losing the actual average execution value.
+            'price': price,
+            'actual_fill_price': price,
+            'filled_at': filled_at,
+            'fill_time': filled_at,
+            'order_id': oid,
+            'id': oid,
+            'client_order_id': coid,
+            'mine': is_bot_owned_order(order, runtime_ids),
+            'status': str(order.get('status') or '').upper(),
+        })
+    fills.sort(key=lambda f: str(f.get('filled_at') or ''), reverse=True)
+    return fills
 
 
 def merge_live_bar(ohlc, price, trading_date):
@@ -155,6 +399,8 @@ class AutopilotController:
             tmp = _STATE_STORE + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self._store, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, _STATE_STORE)
             return True
         except OSError as e:
@@ -184,14 +430,35 @@ class AutopilotController:
             return False, 'Switch to Toss (auto) mode first.'
         with self._lock:
             if ticker in self._slots:
+                slot = self._slots[ticker]
+                if slot.get('stopping'):
+                    # Do not reopen across an in-flight cancel.  Cleanup keeps
+                    # polling until the broker confirms every bot-owned order
+                    # is gone; a later click starts a clean WATCH slot.
+                    self._wake.set()
+                    return False, ('bot-order cleanup is still finishing — '
+                                   'try again in a few seconds')
                 return True, 'already watching'
             self._slots[ticker] = {
                 'engine': None, 'mode': 'WATCH', 'card': None,
-                'backoff_until': 0.0,
+                'engine_lock': threading.RLock(),
+                'vantage_request': None,
+                'backoff_until': {'BUY': 0.0, 'SELL': 0.0},
                 'prev_close': None, 'high5': None, 'vol5': None,
                 'bars': [], 'daily_date': None,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
                 'ticks': [], 'my_ids': set(),
+                'broker_shares': None,
+                'fill_transition': None, 'fill_cleanup': False,
+                'fill_cleanup_order_id': None,
+                'fill_cleanup_client_id': None,
+                'fill_scan_ts': None, 'fill_scan_ready': False,
+                'seen_fill_keys': set(),
+                'submission_retry_after': 0.0,
+                'card_rebuild_after': 0.0,
+                'stopping': False, 'cleanup_after': 0.0,
+                'cleanup_started_at': None, 'cleanup_client_empty_reads': 0,
+                'cleanup_retire_pending_save': False,
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
                        'status': 'arming…', 'mode': 'WATCH', 'lines': {},
@@ -206,18 +473,28 @@ class AutopilotController:
 
     def disable(self, ticker):
         with self._lock:
-            slot = self._slots.pop(ticker, None)
+            slot = self._slots.get(ticker)
+            if slot:
+                # Retain the slot as a cleanup task until the broker confirms
+                # no bot-owned order remains.  This also closes the race where
+                # a placement was already in flight as the window was closed.
+                slot['stopping'] = True
+                slot['mode'] = 'WATCH'
+                slot['cleanup_after'] = 0.0
+                slot['cleanup_started_at'] = time.time()
+                slot['cleanup_client_empty_reads'] = 0
+                slot['cleanup_retire_pending_save'] = False
         if slot:
-            self._log(ticker, 'autopilot off (watch stopped; any resting '
-                              'orders left as-is)')
+            self._log(ticker, 'autopilot off (bot-owned order cleanup queued)')
             self.root.after(0, self._apply_row_badge, ticker, None)
+            self._wake.set()
         self._notify(ticker, None)
 
     # ── Card config: the card IS the campaign strategy (UI thread) ───────────
 
     def set_card_config(self, ticker, cfg):
-        """The card pushes {'gear','exit_tier'} on every compute — the gear
-        the commander is looking at is the gear the bot trades."""
+        """The card pushes {'gear','exit_tiers','auto'} on every compute —
+        the ladder the commander sees is the ladder the bot trades."""
         slot = self._slots.get(ticker)
         if slot is None or not cfg:
             return
@@ -266,18 +543,45 @@ class AutopilotController:
 
     def set_vantage(self, ticker, price=None, label=''):
         """Pin the LOAD's vantage to a price the commander picked off the
-        5-day chart, or (price=None) hand it back to the rolling high."""
-        slot = self._slots.get(ticker)
-        engine = slot and slot.get('engine')
-        if engine is None:
-            return False, 'still arming — try again in a moment'
-        ok = (engine.set_manual_vantage(price, label) if price
-              else engine.clear_manual_vantage())
-        if ok and getattr(engine, 'dirty', False):
-            if self._save_state(ticker, engine):
-                engine.dirty = False
+        5-day chart, or (price=None) hand it back to Dynamic High5.
+
+        Tk never mutates the campaign engine directly. The poll worker applies
+        this queued preference before its next decision, so a candle click
+        cannot race fill reconciliation or state persistence.
+        """
+        with self._lock:
+            slot = self._slots.get(ticker)
+            if slot is None or slot.get('stopping'):
+                return False, 'not watching'
+            if slot.get('engine') is None:
+                return False, 'still arming — try again in a moment'
+            slot['vantage_request'] = {
+                'price': float(price) if price else None,
+                'label': str(label or ''),
+            }
         self._wake.set()
-        return ok, ('vantage pinned' if price else 'vantage released')
+        return True, ('vantage pin queued' if price
+                      else 'Dynamic High5 queued')
+
+    def _apply_vantage_request(self, ticker, slot, engine, snap=None):
+        """Apply one queued Vantage preference on the poll worker."""
+        with self._lock:
+            request = slot.get('vantage_request')
+            slot['vantage_request'] = None
+        if request is None:
+            return
+        price = request.get('price')
+        broker_blocked = (int((snap or {}).get('shares') or 0) > 0
+                          or bool((snap or {}).get('orders')))
+        ok = (False if broker_blocked else
+              (engine.set_manual_vantage(price, request.get('label', ''))
+               if price else engine.clear_manual_vantage()))
+        if not ok:
+            engine.status = ('Vantage unchanged — choose it while FLAT, before '
+                             'a LOAD order is resting')
+        else:
+            engine.status = ('Pinned Vantage applied' if price
+                             else 'Automatic Dynamic High5 restored')
 
     def set_mode(self, ticker, mode):
         """WATCH ↔ LIVE. LIVE only during regular market hours."""
@@ -299,35 +603,15 @@ class AutopilotController:
 
     def mode_of(self, ticker):
         slot = self._slots.get(ticker)
-        return slot['mode'] if slot else None
+        return slot['mode'] if slot and not slot.get('stopping') else None
 
     def is_enabled(self, ticker) -> bool:
-        return ticker in self._slots
+        slot = self._slots.get(ticker)
+        return bool(slot and not slot.get('stopping'))
 
     def ui_state(self, ticker):
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
-
-    # ── Cancel (UI thread, from the campaign window) ─────────────────────────
-
-    def cancel_all(self, ticker):
-        """Cancel every live Toss order for this ticker (ours or not)."""
-        prov = self.app._toss_provider()
-        if prov is None:
-            return False, 'Toss unavailable'
-        try:
-            seq = self.app._account_seq(prov)
-            orders = prov.get_open_orders(seq, ticker) or []
-            n = 0
-            for o in orders:
-                st, _ = prov.cancel_order(o['orderId'], seq)
-                if st == 200:
-                    n += 1
-            self._log(ticker, f'manual cancel: {n}/{len(orders)} orders')
-            self._wake.set()
-            return True, f'cancelled {n}/{len(orders)}'
-        except Exception as e:
-            return False, f'cancel error: {e}'
 
     # ── Panel subscriptions (Autopilot windows) ───────────────────────────────
 
@@ -359,7 +643,6 @@ class AutopilotController:
             'market_phase': lambda: market_phase(ticker),
             'subscribe': lambda fn: self.subscribe(ticker, fn),
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
-            'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
             'set_gear': lambda g: self.set_card_gear(ticker, gear=g),
             'set_tiers': lambda t: self.set_card_gear(ticker, tiers=t),
@@ -390,13 +673,132 @@ class AutopilotController:
         if row is not None:
             row.set_autopilot(badge_key)
 
+    def _sync_card_from_ui(self, ticker, ui):
+        """Push the engine/broker truth into the current card, then read its
+        controls back.
+
+        This runs only on the Tk thread. Broker quantity/average are copied
+        only when the card and broker describe the same deployed/flat state;
+        a state transition belongs to the app's normal account reconciliation
+        and row rebuild, not to an in-place mutation of the wrong card type.
+        """
+        row = self._find_row(ticker)
+        if row is None:
+            return
+        ui = ui or {}
+        campaign = ui.get('campaign') or {}
+        shares = ui.get('shares')
+        avg = ui.get('avg_cost')
+        try:
+            same_state = (shares is not None
+                          and bool(float(shares) > 0)
+                          == bool(getattr(row, 'deployed', float(shares) > 0)))
+        except (TypeError, ValueError):
+            same_state = False
+        slot = self._slots.get(ticker)
+        if same_state and slot is not None:
+            slot['card_rebuild_after'] = 0.0
+        elif shares is not None and slot is not None:
+            # A flat↔deployed transition changes the card's structure. Ask the
+            # normal account refresh path to rebuild it from broker truth, at
+            # most once per retry window while that refresh is in flight.
+            now = time.time()
+            if now >= float(slot.get('card_rebuild_after') or 0.0):
+                fetch = getattr(self.app, '_fetch_bg', None)
+                if callable(fetch):
+                    slot['card_rebuild_after'] = now + _CARD_REBUILD_RETRY_S
+                    threading.Thread(target=fetch, daemon=True).start()
+        update_position = getattr(row, 'update_broker_position', None)
+        if same_state and callable(update_position):
+            try:
+                update_position(shares, avg)
+            except (AttributeError, TypeError, ValueError, tk.TclError):
+                pass
+
+        try:
+            row.update_live(
+                price=ui.get('price'),
+                vantage=campaign.get('vantage'),
+                vantage_src=campaign.get('vantage_src'),
+                volatility=ui.get('vol5'))
+        except (AttributeError, tk.TclError):
+            return
+
+        try:
+            row.compute()
+        except (AttributeError, tk.TclError):
+            pass
+
+        # AUTO may have selected a different gear from the live V just pushed.
+        # Feed that exact card selection back to the engine for the next poll.
+        if hasattr(row, 'line_config'):
+            try:
+                old = dict((self._slots.get(ticker) or {}).get('card') or {})
+                cfg = row.line_config()
+                self.set_card_config(ticker, cfg)
+                if dict(cfg or {}) != old:
+                    self._wake.set()
+            except Exception:
+                pass
+
+        # The engine's vantage can change the empty-card gap without a user
+        # edit. Re-run the normal row callback and card ordering so the card
+        # position and the line configuration remain visually synchronized.
+        callback = getattr(row, '_on_compute_cb', None)
+        callback_ran = False
+        if callable(callback):
+            try:
+                callback()
+                callback_ran = True
+            except Exception:
+                pass
+        reorder = getattr(self.app, '_reorder_cards', None)
+        if not callback_ran and callable(reorder):
+            try:
+                reorder()
+            except Exception:
+                pass
+
     def on_rows_rebuilt(self):
         """Cards are recreated on every refresh — re-apply statuses, units,
-        and re-read the (new) cards' gear configs."""
+        restore live campaign/broker values, and re-read their gear configs."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
+            if slot.get('stopping'):
+                self._apply_row_badge(ticker, None)
+                continue
             self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'))
-            self._pull_card_config(ticker)
+            self._sync_card_from_ui(ticker, slot.get('ui'))
+
+        # A manually selected Vantage is a durable card input, not merely a
+        # property of an open cockpit. Restore that explicit pin even while
+        # the watcher is off so hand trading from the card and later LIVE
+        # watching continue to use the same LOAD line.
+        active = set(self._slots)
+        for row in self.app.deployed_rows + self.app.empty_rows:
+            if row.ticker in active or getattr(row, 'deployed', False):
+                continue
+            saved = self._saved_for(row.ticker) or {}
+            pinned = saved.get('vantage_manual')
+            reload_anchor = (saved.get('vantage')
+                             if saved.get('vantage_src') == 'reload'
+                             and saved.get('last_exit_date')
+                             == self._trading_date(row.ticker) else None)
+            vantage = pinned or reload_anchor
+            source = 'manual' if pinned else ('reload' if reload_anchor else None)
+            if not vantage:
+                continue
+            try:
+                row.update_live(vantage=float(vantage), vantage_src=source)
+                row.compute()
+            except (AttributeError, TypeError, ValueError, tk.TclError):
+                pass
+        reorder = getattr(self.app, '_reorder_cards', None)
+        if callable(reorder):
+            try:
+                reorder()
+            except Exception:
+                pass
 
     # ── Poll thread ───────────────────────────────────────────────────────────
 
@@ -461,8 +863,17 @@ class AutopilotController:
     # ── One poll cycle for one stock ──────────────────────────────────────────
 
     def _trading_date(self, ticker):
-        tz = _TZ_KR if ticker.endswith('.KS') else timezone(timedelta(hours=-5))
-        return datetime.now(tz).strftime('%Y-%m-%d')
+        now = datetime.now(timezone.utc)
+        if ticker.endswith('.KS'):
+            tz = _TZ_KR
+        else:
+            # Match market_phase(): New York is UTC-4 in DST and UTC-5 in
+            # standard time. A fixed -5 date is wrong around the evening
+            # boundary for more than half the trading year.
+            probe_date = (now + timedelta(hours=-5)).date()
+            offset = -4 if _us_dst(probe_date) else -5
+            tz = timezone(timedelta(hours=offset))
+        return now.astimezone(tz).strftime('%Y-%m-%d')
 
     def _daily_vantage(self, prov, ticker, slot):
         """The last five COMPLETED sessions, fetched once per trading day:
@@ -480,10 +891,7 @@ class AutopilotController:
                     slot['prev_close'] = bars[-1]['close']
                     slot['bars'] = [dict(b) for b in bars[-5:]]
                     highs = [b['high'] for b in slot['bars'] if b.get('high')]
-                    lows = [b['low'] for b in slot['bars'] if b.get('low')]
                     slot['high5'] = max(highs) if highs else None
-                    slot['vol5'] = calc_volatility(
-                        slot['high5'], min(lows) if lows else None)
                     slot['daily_date'] = today
             except Exception:
                 pass
@@ -528,13 +936,28 @@ class AutopilotController:
             except Exception:
                 # keep the old bars; retry in a minute, not in five
                 slot['ohlc_ts'] = now - _OHLC_REFRESH_S + 60
-        base = slot['ohlc'] or self.app._ohlc_data.get(ticker) or []
+        base = (slot['ohlc'] or self.app._ohlc_data.get(ticker)
+                or slot.get('bars') or [])
         slot['ohlc_view'] = merge_live_bar(base, snap.get('price'),
                                            snap.get('trading_date'))
+        # V and the candle panel must describe the same five bars. In
+        # particular, today's live-folded high/low participates immediately;
+        # the old completed-only daily cache could leave the card and chart on
+        # different gears until the following session.
+        latest = (slot.get('ohlc_view') or [])[-5:]
+        highs = [b.get('high') for b in latest if b.get('high') is not None]
+        lows = [b.get('low') for b in latest if b.get('low') is not None]
+        slot['vol5'] = calc_volatility(
+            max(highs) if highs else None,
+            min(lows) if lows else None)
 
-    def _real_snapshot(self, prov, seq, ticker, my_ids):
+    def _real_snapshot(self, prov, seq, ticker, my_ids, prev_shares=None,
+                       pending_order_id=None, pending_client_order_id=None,
+                       fill_after=None, fill_before=None,
+                       seen_fill_keys=()):
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         price = prov.get_prices([ticker]).get(ticker)
+        observed_at = float(fill_before or time.time())
 
         shares, avg = 0, 0.0
         for it in (prov.get_holdings(seq, ticker) or {}).get('items', []) or []:
@@ -548,48 +971,466 @@ class AutopilotController:
                     pass
                 break
 
+        raw_open = prov.get_open_orders(seq, ticker) or []
         orders = []
-        for o in prov.get_open_orders(seq, ticker) or []:
+        for o in raw_open:
+            normalized = normalize_open_order(o, my_ids)
+            orders.append(normalized)
+
+        recent_fills = []
+        pending_order = None
+        pending_lookup_error = False
+
+        def matches_pending(raw):
+            oid = _broker_order_id(raw)
+            coid = _client_order_id(raw)
+            return bool((pending_order_id is not None and oid is not None
+                         and str(pending_order_id) == str(oid))
+                        or (pending_client_order_id is not None
+                            and coid is not None
+                            and str(pending_client_order_id) == str(coid)))
+
+        # OPEN already proves acceptance for a client-id-only submission.
+        raw_pending = next((o for o in raw_open if matches_pending(o)), None)
+        if raw_pending is not None:
+            pending_order = normalize_order_detail(raw_pending, my_ids)
+
+        # A persisted broker id is authoritative in every lifecycle state.
+        # Query it on every poll, not only after a holdings delta: cancellation
+        # is confirmed by exact terminal state, never by one missing OPEN row.
+        get_order = getattr(prov, 'get_order', None)
+        if pending_order_id and callable(get_order):
             try:
-                p = float(o.get('price'))
-            except (TypeError, ValueError):
+                raw_pending = get_order(seq, pending_order_id) or {}
+                if isinstance(raw_pending, dict) and raw_pending:
+                    pending_order = normalize_order_detail(raw_pending, my_ids)
+            except Exception as exc:
+                pending_lookup_error = True
+                self._log(ticker, 'order-detail lookup failed: '
+                                  f'{type(exc).__name__}: {exc}')
+
+        if isinstance(raw_pending, dict) and raw_pending:
+            recent_fills.extend(normalize_recent_fills(
+                [raw_pending], ticker, my_ids, allow_undated=True))
+
+        # Scan a short overlapping CLOSED window every poll when supported.
+        # The overlap catches history lag; stable evidence keys prevent old
+        # rows from being replayed.  This is also how genuine net-zero app/web
+        # round trips become visible even though holdings did not change.
+        closed = []
+        closed_complete = False
+        get_closed = getattr(prov, 'get_closed_orders', None)
+        if callable(get_closed):
+            try:
+                from_date = _closed_from_date(ticker, fill_after)
+                try:
+                    closed = get_closed(
+                        seq, ticker, limit=100, from_date=from_date) or []
+                except TypeError:
+                    # Small fake providers and older adapters use the original
+                    # two-argument signature.
+                    closed = get_closed(seq, ticker) or []
+                # Toss may answer ``closed-not-supported`` as a successful
+                # empty compatibility result.  That is no evidence about the
+                # interval and must not enable gross/net-zero replay.
+                closed_complete = (getattr(
+                    prov, '_closed_orders_supported', None) is not False)
+                recent_fills.extend(normalize_recent_fills(
+                    closed, ticker, my_ids, filled_after=fill_after,
+                    filled_before=observed_at))
+            except Exception as exc:
+                closed = []
+                closed_complete = False
+                self._log(ticker, 'closed-order lookup failed: '
+                                  f'{type(exc).__name__}: {exc}')
+
+        if pending_order is None and pending_client_order_id:
+            raw_closed_pending = next(
+                (o for o in closed if matches_pending(o)), None)
+            if raw_closed_pending is not None:
+                pending_order = normalize_order_detail(
+                    raw_closed_pending, my_ids)
+
+        deduped, seen = [], set(seen_fill_keys or ())
+        for fill in recent_fills:
+            key = fill_evidence_key(fill)
+            if key and key in seen:
                 continue
-            try:
-                qty = float(o.get('quantity') or 0)
-            except (TypeError, ValueError):
-                qty = 0.0
-            filled = 0.0
-            try:
-                filled = float((o.get('execution') or {}).get('filledQuantity') or 0)
-            except (TypeError, ValueError):
-                pass
-            oid = o.get('orderId')
-            orders.append({'id': oid, 'side': o.get('side'),
-                           'price': p, 'qty_open': int(max(0, qty - filled)),
-                           'filled': filled, 'mine': oid in my_ids})
+            if key:
+                seen.add(key)
+            deduped.append(fill)
+        recent_fills = deduped
 
         bp = prov.get_buying_power(seq, ccy)
         return {'price': price, 'shares': shares, 'avg_cost': avg,
-                'orders': orders, 'buying_power': bp}
+                'orders': orders, 'recent_fills': recent_fills,
+                'pending_order': pending_order,
+                'pending_lookup_error': pending_lookup_error,
+                'fills_correlated': bool(
+                    fill_after is not None and closed_complete),
+                'closed_fills_complete': closed_complete,
+                'fill_window_after': fill_after,
+                'fill_window_before': observed_at,
+                'buying_power': bp}
+
+    @staticmethod
+    def _evidence_matches_pending(item, pending):
+        if not item or not pending:
+            return False
+        item_id = item.get('order_id') or item.get('id')
+        pending_id = pending.get('order_id')
+        if item_id is not None and pending_id is not None:
+            return str(item_id) == str(pending_id)
+        item_client = item.get('client_order_id')
+        pending_client = pending.get('client_order_id')
+        return (item_client is not None and pending_client is not None
+                and str(item_client) == str(pending_client))
+
+    def _fill_transition_ready(self, ticker, slot, engine, snap,
+                               previous_shares, pending):
+        """Retry an ambiguous holding transition before consuming it.
+
+        Holdings are authoritative, but Toss execution detail can lag the
+        quantity snapshot. Advancing the watermark immediately would make the
+        evidence a one-shot read and could classify a bot fill as manual. Three
+        bounded retries give exact order detail time to catch up. If it still
+        cannot be proven, the engine accepts broker quantity conservatively,
+        retains the unresolved identity, and remains non-trading until exact
+        broker evidence resolves it.
+        """
+        shares = snap.get('shares')
+        if previous_shares is None or shares == previous_shares:
+            slot['fill_transition'] = None
+            return True, None
+        side = 'BUY' if shares > previous_shares else 'SELL'
+        if (not isinstance(pending, dict) or not pending.get('accepted')
+                or str(pending.get('side') or '').upper() != side):
+            slot['fill_transition'] = None
+            return True, None
+
+        old_filled = int(_as_float(pending.get('filled_seen'), 0.0))
+        matching_orders = [o for o in (snap.get('orders') or [])
+                           if self._evidence_matches_pending(o, pending)]
+        open_progress = max(
+            [int(_as_float(o.get('filled'), 0.0)) for o in matching_orders]
+            or [0]) > old_filled
+        matching_fills = [f for f in (snap.get('recent_fills') or [])
+                          if self._evidence_matches_pending(f, pending)]
+        fill_progress = max(
+            [int(_as_float(f.get('qty'), 0.0)) for f in matching_fills]
+            or [0]) > old_filled
+        if open_progress or fill_progress:
+            slot['fill_transition'] = None
+            return True, None
+
+        # A time-correlated app/web execution can fully explain the broker
+        # delta while our same-side order merely rests.  Accept that proof
+        # immediately and leave the durable bot intent for exact repair.
+        if snap.get('fills_correlated'):
+            foreign_net = 0
+            for fill in snap.get('recent_fills') or []:
+                if fill.get('mine') is not False:
+                    continue
+                qty = int(_as_float(fill.get('qty'), 0.0))
+                foreign_net += qty if str(fill.get('side')).upper() == 'BUY' \
+                    else -qty
+            if foreign_net == int(shares) - int(previous_shares):
+                slot['fill_transition'] = None
+                return True, None
+
+        key = (int(previous_shares), int(shares), side,
+               str(pending.get('order_id') or
+                   pending.get('client_order_id') or ''))
+        transition = slot.get('fill_transition')
+        attempts = (int(transition.get('attempts') or 0) + 1
+                    if isinstance(transition, dict)
+                    and transition.get('key') == key else 1)
+        slot['fill_transition'] = {'key': key, 'attempts': attempts}
+        if attempts <= _FILL_EVIDENCE_RETRIES:
+            return False, (f'Holdings changed {previous_shares} → {shares}; '
+                           f'rechecking bot fill evidence '
+                           f'({attempts}/{_FILL_EVIDENCE_RETRIES}) — no order '
+                           'will be sent')
+
+        slot['fill_transition'] = None
+        unresolved = getattr(engine, 'note_order_unresolved', None)
+        if callable(unresolved):
+            unresolved(side=side, price=pending.get('price'),
+                        qty=pending.get('qty'),
+                       reason='execution detail unavailable after retries',
+                       order_id=pending.get('order_id'),
+                       client_order_id=pending.get('client_order_id'))
+        slot['fill_cleanup'] = True
+        slot['fill_cleanup_order_id'] = pending.get('order_id')
+        slot['fill_cleanup_client_id'] = pending.get('client_order_id')
+        # Reconcile the real holdings now, but never trade off the same
+        # ambiguous snapshot. A later clean poll may resume LIVE.
+        snap['can_trade'] = False
+        return True, (f'Broker position accepted at {shares} shares; exact '
+                      'fill ownership was unavailable — bot intent retained '
+                      'and LIVE remains paused pending exact evidence')
+
+    def _finish_cleanup(self, ticker, slot):
+        with self._lock:
+            if self._slots.get(ticker) is slot and slot.get('stopping'):
+                self._slots.pop(ticker, None)
+        self._log(ticker, 'autopilot cleanup complete')
+
+    def _cleanup_cycle(self, ticker, slot, prov, seq):
+        """Retire only provably bot-owned working orders before dropping a
+        disabled slot. Foreign app/web orders are deliberately ignored."""
+        now = time.time()
+        if now < slot.get('cleanup_after', 0.0):
+            return
+        try:
+            raw_orders = prov.get_open_orders(seq, ticker) or []
+        except Exception as exc:
+            slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+            self._log(ticker, f'cleanup read failed: {type(exc).__name__}: {exc}')
+            return
+
+        owned = []
+        pending = getattr(slot.get('engine'), '_pending', None) or {}
+        for order in raw_orders:
+            oid = _broker_order_id(order)
+            stable_pending = (pending.get('accepted')
+                              and pending.get('order_id') is not None
+                              and oid is not None
+                              and str(pending.get('order_id')) == str(oid))
+            if (not stable_pending
+                    and not is_bot_owned_order(order, slot.get('my_ids', ()))):
+                continue
+            normalized = normalize_open_order(order, slot.get('my_ids', ()))
+            if _as_float(normalized.get('qty_open'), 0.0) > 0:
+                owned.append(normalized)
+        if not owned:
+            if slot.get('cleanup_retire_pending_save'):
+                # Retirement already cleared the in-memory pending marker, but
+                # a failed disk write must never let the cleanup slot vanish.
+                if self._save_state(ticker, slot.get('engine')):
+                    slot['cleanup_retire_pending_save'] = False
+                    self._finish_cleanup(ticker, slot)
+                else:
+                    slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                return
+            if pending.get('accepted') and pending.get('order_id') is not None:
+                try:
+                    raw_detail = prov.get_order(seq, pending.get('order_id'))
+                    detail = normalize_order_detail(raw_detail or {},
+                                                    slot.get('my_ids', ()))
+                except Exception as exc:
+                    detail = None
+                    self._log(ticker, 'cleanup detail failed: '
+                                      f'{type(exc).__name__}: {exc}')
+                if detail and detail.get('terminal'):
+                    self._finish_cleanup(ticker, slot)
+                    return
+                if detail and _as_float(detail.get('qty_open'), 0.0) > 0:
+                    owned.append(detail)
+                else:
+                    slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                    return
+            elif pending.get('accepted') and pending.get('client_order_id'):
+                # A lost POST response can leave only the durable idempotency
+                # key.  First exhaust CLOSED history for that exact key.  If
+                # it is absent, repeat the identical request while Toss still
+                # guarantees idempotency; this may create the never-received
+                # original, but it can never create a second identity and is
+                # cancelled below in the same cleanup pass.
+                slot['cleanup_client_empty_reads'] = int(
+                    slot.get('cleanup_client_empty_reads') or 0) + 1
+                coid = pending.get('client_order_id')
+                submitted = (_broker_epoch(pending.get('submitted_at'))
+                             or _broker_epoch(pending.get('ts'))
+                             or float(slot.get('cleanup_started_at') or now))
+                closed_detail = None
+                get_closed = getattr(prov, 'get_closed_orders', None)
+                if callable(get_closed):
+                    try:
+                        try:
+                            closed = get_closed(
+                                seq, ticker, limit=100,
+                                from_date=_closed_from_date(ticker, submitted))
+                        except TypeError:
+                            closed = get_closed(seq, ticker)
+                        raw_closed = next(
+                            (o for o in (closed or [])
+                             if str(_client_order_id(o) or '') == str(coid)),
+                            None)
+                        if raw_closed is not None:
+                            candidate = normalize_order_detail(
+                                raw_closed, slot.get('my_ids', ()))
+                            if candidate and candidate.get('order_id'):
+                                closed_detail = candidate
+                    except Exception as exc:
+                        # The provider is all-pages-or-error, so no prefix from
+                        # an incomplete CLOSED scan is consumed here.
+                        self._log(ticker, 'cleanup CLOSED lookup failed: '
+                                          f'{type(exc).__name__}: {exc}')
+
+                if closed_detail is not None:
+                    oid = closed_detail.get('order_id')
+                    slot['my_ids'].add(oid)
+                    self._note_order_accepted(
+                        slot.get('engine'), pending.get('side'),
+                        pending.get('price'), pending.get('qty'), oid, coid)
+                    if not self._save_state(ticker, slot.get('engine')):
+                        slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                        return
+                    if closed_detail.get('terminal'):
+                        self._finish_cleanup(ticker, slot)
+                        return
+                    if _as_float(closed_detail.get('qty_open'), 0.0) > 0:
+                        owned.append(closed_detail)
+                    else:
+                        slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                        return
+                elif now - submitted < _IDEMPOTENCY_TTL_S:
+                    placed, _message = self._place_real(
+                        ticker, slot, prov, seq, slot.get('engine'),
+                        pending.get('side'), pending.get('price'),
+                        pending.get('qty'), 'cleanup identity recovery',
+                        client_id=coid)
+                    refreshed = (getattr(slot.get('engine'), '_pending', None)
+                                 or {})
+                    if placed and refreshed.get('order_id'):
+                        oid = refreshed.get('order_id')
+                        # Persist the broker id too.  Even if this second write
+                        # fails, the pre-POST client id is durable and the live
+                        # order is still cancelled immediately below.
+                        self._save_state(ticker, slot.get('engine'))
+                        owned.append({
+                            'id': oid, 'side': refreshed.get('side'),
+                            'price': refreshed.get('price'),
+                            'qty_open': refreshed.get('qty') or 1,
+                            'mine': True,
+                        })
+                    elif not refreshed:
+                        # A definite non-ambiguous rejection proves that this
+                        # idempotent request did not leave a working order.
+                        if self._save_state(ticker, slot.get('engine')):
+                            self._finish_cleanup(ticker, slot)
+                        else:
+                            slot['cleanup_retire_pending_save'] = True
+                            slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                        return
+                    else:
+                        slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                        return
+                elif slot.get('cleanup_client_empty_reads', 0) >= 3:
+                    # OPEN is an exhaustive non-paginated read.  After the
+                    # idempotency window and repeated successful empty reads,
+                    # no working order with this lost identity remains. Retire
+                    # the ambiguous marker durably; a later WATCH still adopts
+                    # any broker holdings change as truth.
+                    self._note_order_failed(
+                        slot.get('engine'), pending.get('side'),
+                        pending.get('price'), pending.get('qty'))
+                    retired = not getattr(
+                        slot.get('engine'), '_pending', None)
+                    if (retired
+                            and self._save_state(ticker, slot.get('engine'))):
+                        self._log(ticker, 'client-id-only cleanup retired after '
+                                          'the idempotency window and repeated '
+                                          'empty OPEN reads')
+                        self._finish_cleanup(ticker, slot)
+                    else:
+                        if retired:
+                            slot['cleanup_retire_pending_save'] = True
+                        slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                    return
+                else:
+                    slot['cleanup_after'] = now + _CLEANUP_RETRY_S
+                    return
+            else:
+                self._finish_cleanup(ticker, slot)
+                return
+
+        for order in owned:
+            oid = order.get('id')
+            if not oid:
+                continue
+            self._log(ticker, f'cleanup cancel bot order {oid}')
+            try:
+                st, body = prov.cancel_order(oid, seq)
+                if not (isinstance(st, int) and 200 <= st < 300):
+                    body = body if isinstance(body, dict) else {}
+                    code = (body.get('error') or {}).get('code') or st
+                    self._log(ticker, f'cleanup cancel rejected: {code}')
+            except Exception as exc:
+                self._log(ticker, 'cleanup cancel failed: '
+                                  f'{type(exc).__name__}: {exc}')
+        # Confirm the orders have disappeared on a later broker read. Never
+        # infer success merely from the cancel response.
+        slot['cleanup_after'] = now + _CLEANUP_RETRY_S
 
     def _cycle(self, ticker, slot):
         prov = self.app._toss_provider()
         if prov is None:
-            self._push_ui(ticker, slot, status='Toss unavailable')
+            if not slot.get('stopping'):
+                self._push_ui(ticker, slot, status='Toss unavailable')
             return
         seq = self.app._account_seq(prov)
         if not seq:
-            self._push_ui(ticker, slot, status='no Toss account')
+            if not slot.get('stopping'):
+                self._push_ui(ticker, slot, status='no Toss account')
+            return
+        if slot.get('stopping'):
+            self._cleanup_cycle(ticker, slot, prov, seq)
             return
 
         # LIVE runs only during regular hours; drop to WATCH at the close.
-        if slot['mode'] == 'LIVE' and market_phase(ticker) != 'REGULAR':
-            slot['mode'] = 'WATCH'
+        phase = market_phase(ticker)
+        dropped_to_watch = False
+        with self._lock:
+            if slot['mode'] == 'LIVE' and phase != 'REGULAR':
+                slot['mode'] = 'WATCH'
+                dropped_to_watch = True
+            mode = slot['mode']
+        if dropped_to_watch:
             self._log(ticker, 'market left regular hours — LIVE → WATCH')
 
-        snap = self._real_snapshot(prov, seq, ticker, slot['my_ids'])
-        mode = slot['mode']
-
+        # On the first poll after a restart, compare broker holdings with the
+        # quantity persisted by the engine.  Otherwise a full app/web sell
+        # made while the bot was closed would look like an ordinary FLAT
+        # startup and we would never request the completed fill needed for a
+        # verified same-day reload.
+        engine_lock = slot['engine_lock']
+        with engine_lock:
+            saved = self._saved_for(ticker) if slot['engine'] is None else None
+            pending = (dict(getattr(slot.get('engine'), '_pending', None) or {})
+                       if slot.get('engine') is not None
+                       else dict(((saved or {}).get('pending') or {})))
+        previous_shares = slot.get('broker_shares')
+        if previous_shares is None and isinstance(saved, dict):
+            saved_q = saved.get('q')
+            if saved_q is not None:
+                try:
+                    previous_shares = int(round(float(saved_q)))
+                except (TypeError, ValueError):
+                    previous_shares = None
+        pending_order_id = ((pending or {}).get('order_id')
+                            if isinstance(pending, dict) else None)
+        pending_order_id = (pending_order_id
+                            or slot.get('fill_cleanup_order_id'))
+        pending_client_id = ((pending or {}).get('client_order_id')
+                             if isinstance(pending, dict) else None)
+        pending_client_id = (pending_client_id
+                             or slot.get('fill_cleanup_client_id'))
+        if slot.get('fill_scan_ts') is None:
+            saved_epoch = (_broker_epoch((saved or {}).get('saved_at'))
+                           if isinstance(saved, dict) else None)
+            slot['fill_scan_ts'] = saved_epoch or time.time()
+        scan_after = float(slot.get('fill_scan_ts') or time.time())
+        if slot.get('fill_scan_ready'):
+            scan_after -= _FILL_HISTORY_OVERLAP_S
+        scan_before = time.time()
+        snap = self._real_snapshot(
+            prov, seq, ticker, slot['my_ids'], previous_shares,
+            pending_order_id=pending_order_id,
+            pending_client_order_id=pending_client_id,
+            fill_after=scan_after, fill_before=scan_before,
+            seen_fill_keys=slot.get('seen_fill_keys', ()))
         if snap['price'] is not None:
             slot['ticks'].append((time.time(), snap['price']))
             del slot['ticks'][:-_TICKS_KEPT]
@@ -603,101 +1444,322 @@ class AutopilotController:
         snap['prev_close'], snap['high5'] = self._daily_vantage(
             prov, ticker, slot)
         snap['can_trade'] = (mode == 'LIVE')
-        snap['phase'] = market_phase(ticker)
-        snap['card'] = dict(slot['card']) if slot['card'] else None
+        snap['phase'] = phase
+        cleanup_status = None
+        if slot.get('fill_cleanup'):
+            # OPEN-list absence is not cancellation confirmation.  Exact order
+            # detail below must resolve the durable pending first.
+            snap['can_trade'] = False
+            cleanup_status = ('Ambiguous bot order is being reconciled — no '
+                              'replacement until exact terminal confirmation')
         self._refresh_ohlc(prov, ticker, slot, snap)
         snap['highs'] = self._session_highs(slot, snap)
 
-        if slot['engine'] is None:
-            saved = self._saved_for(ticker)
-            slot['engine'] = CampaignEngine(
-                ticker, trading_date=snap['trading_date'], saved=saved,
-                log=lambda m, t=ticker: self._log(t, m))
-            self._log(ticker, 'campaign engine armed'
-                              + (' (state restored)' if saved else ''))
-        engine = slot['engine']
+        # AUTO must use the volatility calculated from this same live-folded
+        # candle snapshot. Otherwise a volatility threshold and a price line
+        # can cross together while the engine still trades yesterday's Gear.
+        with self._lock:
+            card = dict(slot['card']) if slot.get('card') else None
+        if card and card.get('auto') and slot.get('vol5') is not None:
+            if int(snap.get('shares') or 0) > 0:
+                card['gear'] = select_auto_gear(slot['vol5'])
+            else:
+                card['gear'] = effective_entry_gear(
+                    slot['vol5'], snap.get('price'), snap.get('unit_cash'))
+            with self._lock:
+                if self._slots.get(ticker) is slot:
+                    slot['card'] = dict(card)
+        snap['card'] = card
 
-        acts = engine.poll(snap)
-        self._execute(ticker, slot, prov, seq, engine, acts)
-        if getattr(engine, 'dirty', False):
-            # Keep dirty on a failed write so campaign fills and one-time
-            # migrations (such as legacy HOLD cleanup) retry next poll.
-            if self._save_state(ticker, engine):
-                engine.dirty = False
-        self._push_ui(ticker, slot, snap=snap)
+        with engine_lock:
+            if slot['engine'] is None:
+                slot['engine'] = CampaignEngine(
+                    ticker, trading_date=snap['trading_date'], saved=saved,
+                    log=lambda m, t=ticker: self._log(t, m))
+                self._log(ticker, 'campaign engine armed'
+                                  + (' (state restored)' if saved else ''))
+            engine = slot['engine']
+            detail = snap.get('pending_order')
+            live_pending = getattr(engine, '_pending', None) or pending
+            if (isinstance(detail, dict) and isinstance(live_pending, dict)
+                    and self._evidence_matches_pending(detail, live_pending)):
+                detail_id = detail.get('order_id') or detail.get('id')
+                detail_client = (detail.get('client_order_id')
+                                 or live_pending.get('client_order_id'))
+                if detail_id is not None:
+                    slot['my_ids'].add(detail_id)
+                self._note_order_accepted(
+                    engine, live_pending.get('side'),
+                    live_pending.get('price'), live_pending.get('qty'),
+                    detail_id or live_pending.get('order_id'), detail_client)
+            self._apply_vantage_request(ticker, slot, engine, snap=snap)
+
+            live_pending = getattr(engine, '_pending', None) or pending
+            ready, transition_status = self._fill_transition_ready(
+                ticker, slot, engine, snap, previous_shares, live_pending)
+            if not ready:
+                self._push_ui(ticker, slot, snap=snap,
+                              status=transition_status)
+                return
+
+            acts = engine.poll(snap)
+            # Advance the holdings watermark only after the engine accepted
+            # this snapshot. If reconciliation raises, the next poll asks for
+            # execution evidence again rather than silently losing it.
+            slot['broker_shares'] = snap['shares']
+            self._execute(ticker, slot, prov, seq, engine, acts, snap=snap)
+            self._retry_unresolved_submission(
+                ticker, slot, prov, seq, engine, snap, mode, phase)
+            slot.setdefault('seen_fill_keys', set()).update(
+                getattr(engine, 'consumed_fill_keys', set()) or set())
+            slot['fill_scan_ts'] = snap.get('fill_window_before') or scan_before
+            slot['fill_scan_ready'] = True
+            if slot.get('fill_cleanup') and not getattr(engine, '_pending', None):
+                slot['fill_cleanup'] = False
+                slot['fill_cleanup_order_id'] = None
+                slot['fill_cleanup_client_id'] = None
+            if getattr(engine, 'dirty', False):
+                # Keep dirty on a failed write so campaign fills and one-time
+                # migrations retry next poll.
+                if self._save_state(ticker, engine):
+                    engine.dirty = False
+            self._push_ui(ticker, slot, snap=snap,
+                          status=transition_status or cleanup_status)
 
     # ── Action executor ───────────────────────────────────────────────────────
 
-    def _place_real(self, ticker, slot, prov, seq, side, price, qty, label):
+    @staticmethod
+    def _note_order_failed(engine, side, price, qty):
+        note = getattr(engine, 'note_order_failed', None)
+        if callable(note):
+            note(side, price, qty)
+
+    @staticmethod
+    def _note_order_accepted(engine, side, price, qty, order_id, client_id):
+        note = getattr(engine, 'note_order_accepted', None)
+        if callable(note):
+            note(side, price, qty, order_id=order_id,
+                 client_order_id=client_id)
+
+    @staticmethod
+    def _note_order_submitted(engine, side, price, qty, client_id):
+        note = getattr(engine, 'note_order_submitted', None)
+        return bool(note and note(side, price, qty, client_id))
+
+    @staticmethod
+    def _side_backoff(slot, side):
+        value = slot.get('backoff_until', 0.0)
+        if isinstance(value, dict):
+            value = value.get(str(side or '').upper(), 0.0)
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _set_side_backoff(slot, side, seconds):
+        value = slot.get('backoff_until')
+        if not isinstance(value, dict):
+            value = {'BUY': 0.0, 'SELL': 0.0}
+            slot['backoff_until'] = value
+        value[str(side or '').upper()] = time.time() + float(seconds)
+
+    def _place_real(self, ticker, slot, prov, seq, engine,
+                    side, price, qty, label, client_id=None):
         """Send one real LIMIT/DAY order; shared by LIVE and manual fire."""
         wire = fmt_order_price(ticker, price)
         self._log(ticker, f'place [{label}] {side} {qty} @ {wire}')
-        coid = re.sub(r'[^A-Za-z0-9_-]', '',
-                      f"ap{ticker}{side}")[:26] \
-            + datetime.now().strftime('%H%M%S')
+        symbol = re.sub(r'[^A-Za-z0-9_-]', '', ticker)[:10]
+        # time_ns keeps same-side retries unique while the 36-char truncation
+        # keeps the Toss idempotency key within its documented boundary.
+        coid = client_id or (f'{_BOT_CLIENT_ID_PREFIX}{symbol}-{side[:1]}-'
+                             f'{time.time_ns()}')[:36]
+        if not self._note_order_submitted(
+                engine, side, price, qty, coid):
+            return False, 'intent changed before submission'
+        # The clientOrderId is the no-duplicate boundary.  Commit it before the
+        # network call so a process loss after Toss accepts the order restarts
+        # with the same idempotent identity.  A failed write means no POST.
+        if not self._save_state(ticker, engine):
+            return False, 'state persistence failed; order not transmitted'
         try:
             st, body = prov.place_limit_order(
                 ticker, side, wire, qty, seq, client_order_id=coid)
         except Exception as e:
             self._log(ticker, f'place error: {e}')
-            slot['backoff_until'] = time.time() + _BACKOFF_OTHER
-            return False, f'order error: {e}'
-        order_id = (body.get('result') or {}).get('orderId')
-        if st == 200 and order_id:
+            self._set_side_backoff(slot, side, _SUBMISSION_RETRY_S)
+            unresolved = getattr(engine, 'note_order_unresolved', None)
+            if callable(unresolved):
+                unresolved(side, price, qty, reason=f'transport: {e}',
+                           client_order_id=coid)
+            return False, f'order outcome unresolved: {e}'
+        body = body if isinstance(body, dict) else {}
+        result = body.get('result') or body
+        order_id = result.get('orderId')
+        accepted_coid = result.get('clientOrderId') or coid
+        if isinstance(st, int) and 200 <= st < 300 and order_id:
             slot['my_ids'].add(order_id)
             slot['insuff_warned'] = False
+            self._note_order_accepted(
+                engine, side, price, qty, order_id, accepted_coid)
             return True, f'{side} {qty} @ {wire} placed'
         code = str((body.get('error') or {}).get('code') or st)
         self._log(ticker, f'place rejected: {code}')
+        code_lower = code.lower()
+        duplicate_client_id = (
+            st == 409 and (
+                'duplicate' in code_lower or 'idempot' in code_lower
+                or ('client' in code_lower and 'order' in code_lower)))
+        ambiguous = ((isinstance(st, int) and st >= 500)
+                     or st in (None, 0)
+                     or (isinstance(st, int) and 200 <= st < 300)
+                     or duplicate_client_id)
+        if ambiguous:
+            self._set_side_backoff(slot, side, _SUBMISSION_RETRY_S)
+            unresolved = getattr(engine, 'note_order_unresolved', None)
+            if callable(unresolved):
+                unresolved(side, price, qty,
+                           reason=f'broker response {code}',
+                           client_order_id=coid)
+            return False, f'order outcome unresolved: {code}'
+        self._note_order_failed(engine, side, price, qty)
         if 'insufficient' in code and 'buying' in code:
-            # Army is really out: announce once, back off, keep watching —
-            # Toss is the wall.
-            slot['backoff_until'] = time.time() + _BACKOFF_INSUFFICIENT
-            if not slot.get('insuff_warned'):
-                slot['insuff_warned'] = True
-                self._popup(ticker,
-                            f'Toss rejected the buy ({code}).\n\n'
-                            'The army cannot fund it. The watcher keeps '
-                            'managing the SELL and retries buying every '
-                            '5 minutes.')
+            # Army is really out: back off the BUY side and keep SELL active.
+            # This is ordinary campaign state, not a popup alarm; the muted
+            # graph line and neutral condition banner carry the information.
+            self._set_side_backoff(slot, 'BUY', _BACKOFF_INSUFFICIENT)
+            slot['insuff_warned'] = True
         elif 'hours' in code or 'closed' in code:
-            slot['backoff_until'] = time.time() + _BACKOFF_HOURS_CLOSED
+            self._set_side_backoff(slot, side, _BACKOFF_HOURS_CLOSED)
         elif 'opposite' in code:
             pass           # a foreign order blocks the side; retry next poll
         else:
-            slot['backoff_until'] = time.time() + _BACKOFF_OTHER
+            self._set_side_backoff(slot, side, _BACKOFF_OTHER)
         return False, f'rejected: {code}'
 
-    def _execute(self, ticker, slot, prov, seq, engine, acts):
-        mode = slot['mode']
+    def _retry_unresolved_submission(self, ticker, slot, prov, seq, engine,
+                                     snap, mode, phase):
+        """Recover an ambiguous POST with the same ten-minute idempotency key."""
+        p = getattr(engine, '_pending', None)
+        if (not isinstance(p, dict) or not p.get('unresolved')
+                or p.get('order_id') is not None
+                or not p.get('client_order_id')
+                or snap.get('pending_order') is not None
+                or mode != 'LIVE' or phase != 'REGULAR'):
+            return
+        with self._lock:
+            if (self._slots.get(ticker) is not slot
+                    or slot.get('mode') != 'LIVE' or slot.get('stopping')):
+                return
         now = time.time()
+        submitted = float(p.get('submitted_at') or p.get('ts') or now)
+        if now - submitted >= _IDEMPOTENCY_TTL_S:
+            engine.status = ('submission remains unresolved after the Toss '
+                             'idempotency window — manual broker review needed')
+            return
+        if (now < float(slot.get('submission_retry_after') or 0.0)
+                or now < self._side_backoff(slot, p.get('side'))):
+            return
+        if any(_as_float(o.get('qty_open'), 0.0) > 0
+               for o in (snap.get('orders') or [])):
+            return
+        live = snap.get('price')
+        crossed = (live is not None and
+                   (live <= p.get('price') if p.get('side') == 'BUY'
+                    else live >= p.get('price')))
+        if not crossed:
+            return
+        slot['submission_retry_after'] = now + _SUBMISSION_RETRY_S
+        self._log(ticker, 'retry unresolved submission with the same '
+                          f'clientOrderId {p.get("client_order_id")}')
+        self._place_real(
+            ticker, slot, prov, seq, engine, p.get('side'), p.get('price'),
+            p.get('qty'), f'{p.get("kind") or p.get("side")} reconcile',
+            client_id=p.get('client_order_id'))
+
+    def _execute(self, ticker, slot, prov, seq, engine, acts, snap=None):
+        now = time.time()
+        has_cancel = any(act and act[0] == 'cancel' for act in acts)
+        open_by_id = {
+            order.get('id'): order
+            for order in ((snap or {}).get('orders') or [])
+            if order.get('id')
+        }
         for act in acts:
             kind = act[0]
             if kind == 'notify':
                 # Reserved for explicit one-time engine warnings. Reserve
                 # exhaustion itself is visual-only in the campaign window.
                 self._popup(ticker, act[1])
-            elif mode != 'LIVE':
-                continue           # engine emits none in WATCH; safety net
             elif kind == 'cancel':
                 _, oid, label = act
+                order = open_by_id.get(oid)
+                pending = getattr(engine, '_pending', None) or {}
+                stable_pending = (pending.get('accepted')
+                                  and pending.get('order_id') is not None
+                                  and str(pending.get('order_id')) == str(oid))
+                detail = (snap or {}).get('pending_order') or {}
+                stable_detail = (detail.get('order_id') is not None
+                                 and str(detail.get('order_id')) == str(oid)
+                                 and (detail.get('mine') or stable_pending))
+                visible_owned = bool(order and order.get('mine'))
+                if not (visible_owned or stable_pending or stable_detail):
+                    self._log(ticker, f'skip unsafe cancel [{label}] {oid}')
+                    continue
+                if order and _as_float(order.get('qty_open'), 0.0) <= 0:
+                    continue
                 self._log(ticker, f'cancel [{label}] {oid}')
                 try:
                     st, body = prov.cancel_order(oid, seq)
-                    if st != 200:
+                    if not (isinstance(st, int) and 200 <= st < 300):
+                        body = body if isinstance(body, dict) else {}
                         code = (body.get('error') or {}).get('code') or st
                         self._log(ticker, f'cancel rejected: {code}')
                 except Exception as e:
                     self._log(ticker, f'cancel error: {e}')
-                time.sleep(0.3)   # give the cancel a beat before a re-place
             elif kind == 'place':
                 _, side, price, qty, label = act
-                if now < slot['backoff_until']:
-                    self._log(ticker, f'skip place [{label}] (backing off '
-                                      f'{slot["backoff_until"] - now:.0f}s)')
+                # Even if an engine regression emits cancel+place together,
+                # never race a replacement/opposite order against a cancel
+                # whose result is not yet visible in this broker snapshot.
+                if has_cancel:
+                    self._log(ticker, f'skip place [{label}] — waiting for '
+                                      'cancel confirmation')
+                    self._note_order_failed(engine, side, price, qty)
+                    engine.status = (f'{side} not sent — waiting for the bot '
+                                     'order cancellation to be confirmed')
                     continue
-                self._place_real(ticker, slot, prov, seq,
-                                 side, price, qty, label)
+                # Re-read immediately before the broker call. A mode captured
+                # when the poll began must not let LIVE → WATCH slip through
+                # while fill reconciliation and cancellation were running.
+                with self._lock:
+                    live_now = (self._slots.get(ticker) is slot
+                                and slot.get('mode') == 'LIVE'
+                                and not slot.get('stopping')
+                                and market_phase(ticker) == 'REGULAR')
+                if not live_now or not (snap or {}).get('can_trade', True):
+                    self._note_order_failed(engine, side, price, qty)
+                    continue
+                backoff_until = self._side_backoff(slot, side)
+                if now < backoff_until:
+                    self._log(ticker, f'skip place [{label}] (backing off '
+                                      f'{backoff_until - now:.0f}s)')
+                    self._note_order_failed(engine, side, price, qty)
+                    engine.status = (f'{side} not sent — broker retry in '
+                                     f'{backoff_until - now:.0f}s')
+                    continue
+                with self._lock:
+                    live_now = (self._slots.get(ticker) is slot
+                                and slot.get('mode') == 'LIVE'
+                                and not slot.get('stopping')
+                                and market_phase(ticker) == 'REGULAR')
+                if not live_now or not (snap or {}).get('can_trade', True):
+                    self._note_order_failed(engine, side, price, qty)
+                    continue
+                ok, msg = self._place_real(ticker, slot, prov, seq, engine,
+                                           side, price, qty, label)
+                if not ok:
+                    engine.status = f'{side} not sent — {msg}'
 
     def _popup(self, ticker, msg):
         self._log(ticker, f'ANNOUNCE: {msg}')
@@ -744,27 +1806,18 @@ class AutopilotController:
             'buying_power': (snap or {}).get('buying_power'),
             'unit_cash': self._units.get(ccy) or 0.0,
             'orders': list((snap or {}).get('orders') or []),
+            'recent_fills': list((snap or {}).get('recent_fills') or []),
             'ticks': list(slot.get('ticks') or []),
             'ts': datetime.now().strftime('%H:%M:%S'),
         }
         slot['ui'] = ui
 
         def apply():
-            if ticker not in self._slots:
+            current = self._slots.get(ticker)
+            if current is not slot or slot.get('stopping'):
                 return
             self._apply_row_badge(ticker, badge_key)
-            row = self._find_row(ticker)
-            if row is not None:
-                if ui['price']:
-                    row.update_live(price=ui['price'])
-                    row.compute()
-                # The card is the campaign's source of truth: read back the
-                # gear/tier it now shows so the next poll uses it.
-                if hasattr(row, 'line_config'):
-                    try:
-                        self.set_card_config(ticker, row.line_config())
-                    except Exception:
-                        pass
+            self._sync_card_from_ui(ticker, ui)
             self._notify(ticker, ui)
         try:
             self.root.after(0, apply)

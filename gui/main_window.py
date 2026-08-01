@@ -25,6 +25,24 @@ _FX_GREEN = '#2E8B57'
 _FX_RED   = '#CC3333'
 _FX_BLUE  = '#3366CC'
 
+_STRATEGY_PREF_KEYS = (
+    'tier', 'gear', 'exit_tier', 'load_gear', 'buy_pct',
+    't1_pct', 't2_pct', 't3_pct',
+    't1_active', 't2_active', 't3_active', 'auto_mode',
+)
+
+
+def card_gap_order_key(row):
+    """Global card order: greatest actionable gap first, unknowns last."""
+    gap = getattr(row, '_gap', None)
+    return (-gap if gap is not None else float('inf'),
+            stock_sort_key(row.ticker))
+
+
+def strategy_preferences(state):
+    """Only the durable strategy choices from a card state snapshot."""
+    return {k: state[k] for k in _STRATEGY_PREF_KEYS if k in state}
+
 
 class App:
     def __init__(self, root: tk.Tk):
@@ -54,13 +72,11 @@ class App:
         # shares/avg onto these).
         self._catalogue = [p['ticker'] for p in self.positions]
         self._gear_prefs = {
-            p['ticker']: {k: p.get(k) for k in (
-                'tier', 'gear', 'exit_tier', 'load_gear', 'buy_pct',
-                't1_pct', 't2_pct', 't3_pct',
-                't1_active', 't2_active', 't3_active', 'auto_mode')}
+            p['ticker']: {k: p.get(k) for k in _STRATEGY_PREF_KEYS}
             for p in self.positions}
         self._last_account = None
         self._last_open_orders = []
+        self._fetch_lock = threading.Lock()  # coalesce card-triggered refreshes
 
         # Sort positions in fixed order on load
         self.positions.sort(key=lambda p: stock_sort_key(p['ticker']))
@@ -461,9 +477,9 @@ class App:
         empty.sort(key=lambda p: self._vol_order_key(
             p['ticker'], self._volatility.get(p['ticker'])))
 
-        # One continuous 2-column grid — no section headers or boundary. Deployed
-        # cards (bold + "DEPLOYED" tag) first, then empty. Live refresh sorts
-        # both groups by gap.
+        # One continuous 2-column grid — no section headers or boundary. The
+        # pre-live fallback starts with deployed then flat; a live refresh puts
+        # every card into one global actionable-gap order.
         box = tk.Frame(self.content_frame)
         box.pack(fill='both', expand=True, padx=2, pady=2)
         box.grid_columnconfigure(0, weight=1, uniform='col')
@@ -485,9 +501,11 @@ class App:
             editable=not self._auto,
             on_autopilot=self._open_autopilot)
 
-    def _grid_all_cards(self):
-        """Deployed cards first, then empty, in one 2-column grid; renumber."""
-        for i, row in enumerate(self.deployed_rows + self.empty_rows):
+    def _grid_all_cards(self, rows=None):
+        """Place and renumber the supplied global card sequence."""
+        rows = list(rows) if rows is not None else (
+            self.deployed_rows + self.empty_rows)
+        for i, row in enumerate(rows):
             r, c = divmod(i, 2)
             row.frame.grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             row.set_row_num(i + 1)
@@ -498,22 +516,15 @@ class App:
         return (-vol if vol is not None else float('inf'),
                 stock_sort_key(ticker))
 
-    def _gap_order_key(self, row):
-        """Highest gap first: +1% above -1%, then -2%, and so on."""
-        return (-row._gap if row._gap is not None else float('inf'),
-                stock_sort_key(row.ticker))
-
     def _reorder_cards(self):
-        """Re-sort + re-grid all cards on fresh data — **everything by gap**,
-        deployed and flat alike, highest first.
+        """Re-grid every card in one global descending actionable-gap order.
 
         For a deployed card the gap is price vs the average cost, so the ones
-        closest to their exit rise. For a flat card it is price vs the vantage,
-        so the ones closest to their LOAD rise. Either way the top of the
-        screen is what is about to happen."""
-        self.deployed_rows.sort(key=self._gap_order_key)
-        self.empty_rows.sort(key=self._gap_order_key)
-        self._grid_all_cards()
+        closest to an exit rise. For a flat card it is LOAD vs current, so the
+        bait closest to being caught rises. State does not create subgroups."""
+        rows = sorted(self.deployed_rows + self.empty_rows,
+                      key=card_gap_order_key)
+        self._grid_all_cards(rows)
 
     # ── Autopilot window (big card button) ────────────────────────────────────
 
@@ -611,14 +622,35 @@ class App:
 
     def _on_row_compute(self):
         """Called when any row recomputes (gear change, tier switch, typed
-        input) — update army% across the cards and push every card's gear
-        config to the autopilot. The card IS the campaign strategy, so a gear
-        the commander changes here reaches the bot on its next poll."""
+        input) — refresh card order/army, persist changed strategy preferences,
+        and push the config to the autopilot. The card IS the campaign
+        strategy, so the next poll sees the same choice."""
+        self._reorder_cards()
         if self._fx_rate:
             self._update_army(self._fx_rate)
+        self._persist_strategy_preferences()
         for row in self.deployed_rows + self.empty_rows:
             if self.autopilot.is_enabled(row.ticker):
                 self.autopilot.set_card_config(row.ticker, row.line_config())
+
+    def _persist_strategy_preferences(self):
+        """Save gear/tier/AUTO choices promptly, without writing for price or
+        broker-position-only recomputes."""
+        by_ticker = {p['ticker']: p for p in self.positions}
+        changed = False
+        for row in self.deployed_rows + self.empty_rows:
+            prefs = strategy_preferences(row.get_state())
+            cached = self._gear_prefs.setdefault(row.ticker, {})
+            if all(cached.get(k) == value for k, value in prefs.items()):
+                continue
+            pos = by_ticker.get(row.ticker)
+            if pos is not None:
+                pos.update(prefs)
+            cached.update(prefs)
+            changed = True
+        if changed:
+            save_positions(self.positions)
+        return changed
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 
@@ -675,9 +707,11 @@ class App:
                              quiet=True)
 
     def _apply_order_states(self):
-        """Tag each card with its live Toss order side (BUY/SELL/None) so the
-        title shows 'buy/sell ordered' and the gear locks — even for orders
-        placed in the web. A stock can't have both sides pending."""
+        """Tag each card with its live Toss order side (BUY/SELL/None).
+
+        This is status only: gear and tier choices stay editable because the
+        bot self-heals its orders, while foreign orders pause execution.
+        """
         by_ticker = {}
         for o in (self._last_open_orders or []):
             sym = o.get('symbol') or ''
@@ -689,28 +723,37 @@ class App:
     # ── Live data ────────────────────────────────────────────────────────────
 
     def _fetch_bg(self):
+        if not self._fetch_lock.acquire(blocking=False):
+            return
         tickers = [p['ticker'] for p in self.positions]
         try:
-            data, fx, fx_avg = self._provider.fetch_all(
-                tickers, self.config.get('fx_ticker', 'USDKRW=X'))
-        except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(f'Error: {e}'))
-            return
-        # In Toss(auto) mode also read the account (holdings + cash) and the
-        # live open orders so the cards/army size and the order-state tags come
-        # straight from the broker.
-        account, open_orders = None, []
-        if self._auto:
             try:
-                prov = self._toss_provider()
-                if prov:
-                    account = prov.account_snapshot()
-                    seq = self._account_seq(prov)
-                    open_orders = prov.get_open_orders(seq) if seq else []
-            except Exception:
-                account, open_orders = None, []
-        self.root.after(0, self._apply_live, data, fx, fx_avg, account,
-                        open_orders)
+                data, fx, fx_avg = self._provider.fetch_all(
+                    tickers, self.config.get('fx_ticker', 'USDKRW=X'))
+            except Exception as e:
+                self.root.after(
+                    0, lambda err=e: self.status_var.set(f'Error: {err}'))
+                return
+            # Treat the holdings + OPEN reads as one fresh account snapshot.
+            # A failed account read passes None for both fields: `_apply_live`
+            # must not rebuild from cached holdings or erase order badges with
+            # a synthetic empty list.
+            account, open_orders = None, None
+            if self._auto:
+                try:
+                    prov = self._toss_provider()
+                    if prov:
+                        account = prov.account_snapshot()
+                        seq = self._account_seq(prov)
+                        if not seq:
+                            raise RuntimeError('no Toss account')
+                        open_orders = prov.get_open_orders(seq)
+                except Exception:
+                    account, open_orders = None, None
+            self.root.after(0, self._apply_live, data, fx, fx_avg, account,
+                            open_orders)
+        finally:
+            self._fetch_lock.release()
 
     def _reconcile_from_toss(self, account):
         """Overlay Toss holdings onto the catalogue: held tickers become
@@ -753,8 +796,8 @@ class App:
             if vol is not None:     self._volatility[t]     = vol
 
         # Toss mode: derive deployment/shares/avg from the account, then rebuild.
-        if self._auto and self._last_account is not None:
-            self._reconcile_from_toss(self._last_account)
+        if self._auto and account is not None:
+            self._reconcile_from_toss(account)
             self._rebuild_sections()
 
         self._update_fx_header()
@@ -781,7 +824,7 @@ class App:
         # Re-order all cards now that fresh data is known.
         self._reorder_cards()
 
-        # Tag each card with its live order side (and lock the gear) from Toss.
+        # Tag each card with its live order side; strategy controls stay live.
         self._apply_order_states()
 
         self._update_banner()      # sets auto N before army% uses it

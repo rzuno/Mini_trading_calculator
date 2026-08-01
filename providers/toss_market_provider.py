@@ -101,6 +101,7 @@ class TossMarketProvider(MarketDataProvider):
         self._client_secret = client_secret
         self.base = (base or DEFAULT_BASE).rstrip('/')
         self._fx_avg_provider = fx_average_provider
+        self._closed_orders_supported = None
 
     # -- Construction from environment ----------------------------------------
 
@@ -358,7 +359,94 @@ class TossMarketProvider(MarketDataProvider):
         if symbol:
             params['symbol'] = to_toss_symbol(symbol)
         res = self._get('/api/v1/orders', params, account=account_seq) or {}
-        return res.get('orders', []) if isinstance(res, dict) else []
+        return (res.get('orders', []) if isinstance(res, dict)
+                else (res if isinstance(res, list) else []))
+
+    def get_closed_orders(self, account_seq, symbol: str = None,
+                          limit: int = 20, cursor: str = None,
+                          from_date: str = None, to_date: str = None) -> list:
+        """All terminal orders in the requested range, newest page first.
+
+        A terminal order may be FILLED or may have been cancelled/replaced
+        after a partial fill; callers must inspect execution.filledQuantity.
+        This helper intentionally returns the raw order rows so ownership via
+        clientOrderId and the broker's actual average execution price remain
+        available to reconciliation code.  CLOSED is cursor-paginated.  Never
+        return a prefix as if it were the complete interval: a malformed cursor
+        chain or a later-page failure raises and the controller discards the
+        whole scan rather than replaying incomplete gross fills.
+        """
+        if self._closed_orders_supported is False:
+            return []
+        try:
+            size = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            size = 20
+        base_params = {'status': 'CLOSED', 'limit': size}
+        if symbol:
+            base_params['symbol'] = to_toss_symbol(symbol)
+        if from_date:
+            base_params['from'] = from_date
+        if to_date:
+            base_params['to'] = to_date
+        next_cursor = cursor
+        seen_cursors = set()
+        orders = []
+        try:
+            while True:
+                params = dict(base_params)
+                if next_cursor:
+                    params['cursor'] = next_cursor
+                res = self._get(
+                    '/api/v1/orders', params, account=account_seq) or {}
+                if isinstance(res, list):
+                    # Compatibility with an older/non-paginated adapter shape.
+                    orders.extend(res)
+                    break
+                if not isinstance(res, dict):
+                    raise RuntimeError('invalid CLOSED order-history response')
+                page = res.get('orders', [])
+                if not isinstance(page, list):
+                    raise RuntimeError('invalid CLOSED orders page')
+                orders.extend(page)
+                if not res.get('hasNext'):
+                    break
+                candidate = res.get('nextCursor')
+                if not candidate or candidate in seen_cursors:
+                    raise RuntimeError(
+                        'incomplete CLOSED order history: invalid next cursor')
+                seen_cursors.add(candidate)
+                next_cursor = candidate
+        except requests.HTTPError as exc:
+            # The bundled Toss schema advertises the CLOSED filter but also
+            # documents that the current server may answer
+            # ``400 closed-not-supported``.  Treat that capability gap as no
+            # evidence; callers must fall back safely rather than guessing.
+            response = getattr(exc, 'response', None)
+            if response is not None and response.status_code == 400:
+                try:
+                    code = ((response.json().get('error') or {}).get('code'))
+                except (TypeError, ValueError):
+                    code = None
+                if code == 'closed-not-supported':
+                    self._closed_orders_supported = False
+                    return []
+            raise
+        self._closed_orders_supported = True
+        return orders
+
+    def get_order(self, account_seq, order_id) -> dict:
+        """One order in any lifecycle state, including a completed fill.
+
+        Unlike the currently optional CLOSED list, Toss documents this detail
+        endpoint for FILLED, CANCELED, REJECTED, and working orders.  It is the
+        authoritative way to recover the actual execution of a persisted bot
+        order after its holding changes or the application restarts.
+        """
+        if not order_id:
+            return {}
+        return self._get(f'/api/v1/orders/{order_id}', {},
+                         account=account_seq) or {}
 
     # -- Order placement (LIVE — use deliberately) ----------------------------
 

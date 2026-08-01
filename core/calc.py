@@ -1,16 +1,17 @@
 """Gearbox V-Commandos — catalogue, the five-speed gearbox, and every line
 the cards and the campaign bot draw.
 
-ONE gearbox drives the card AND the autopilot (`core/vcommandos.py`). A Gear
-is picked before the campaign starts and stays fixed for its whole life:
+ONE gearbox drives the card AND the autopilot (`core/vcommandos.py`). AUTO may
+track the five-day range or the commander may pick a gear; changing it moves
+the watched lines immediately without rewriting already-filled trades:
 
     LOAD   vantage (High5) × (1 - gear.load%)      ~1 unit of cash
     CHASE  actual avg cost × (1 - gear.chase%)     actual shares × gear.ratio
-    EXIT   actual avg cost × (1 + tier%)           the WHOLE position
+    EXIT   actual avg cost × (1 + tier%)           armed share of position
 
-The exit is one clean full-position sell at ONE selected tier — no 33/33/34
-split (see the manual, §4.2 / §7.2). The daily v^ grid is a separate,
-selectable bot; it does not share these tables.
+One exit tier can take the whole position, or two/three armed tiers can split
+it. The legacy daily v^ grid is retained only in Git history; the running app
+has one card and one V-Commandos Gearbox engine per ticker.
 """
 
 import math
@@ -69,24 +70,24 @@ def display_name(ticker: str) -> str:
 GEARS = {
     1: {'name': 'Smooth',   'load':  6, 'chase': 4, 'ratio': 1 / 2,
         'frac': '1/2', 'tiers': (1, 3, 5), 'vol_max': 10.0, 'max_chase': 8,
-        'color': '#D8ECFF', 'fg': 'black'},
+        'color': '#C62828', 'fg': 'white'},
     2: {'name': 'Moderate', 'load':  7, 'chase': 5, 'ratio': 2 / 3,
         'frac': '2/3', 'tiers': (2, 4, 6), 'vol_max': 15.0, 'max_chase': 7,
-        'color': '#9ED0FF', 'fg': 'black'},
+        'color': '#E08000', 'fg': 'black'},
     3: {'name': 'Balanced', 'load':  8, 'chase': 6, 'ratio': 3 / 4,
         'frac': '3/4', 'tiers': (3, 5, 7), 'vol_max': 20.0, 'max_chase': 6,
-        'color': '#5FA7EF', 'fg': 'black'},
+        'color': '#E6B800', 'fg': 'black'},
     4: {'name': 'Deep',     'load':  9, 'chase': 7, 'ratio': 4 / 5,
         'frac': '4/5', 'tiers': (4, 6, 8), 'vol_max': 25.0, 'max_chase': 6,
-        'color': '#2478D4', 'fg': 'white'},
+        'color': '#2E8B57', 'fg': 'white'},
     5: {'name': 'Extreme',  'load': 10, 'chase': 8, 'ratio': 1.0,
         'frac': '1.0', 'tiers': (5, 7, 9), 'vol_max': None, 'max_chase': 5,
-        'color': '#123E8A', 'fg': 'white'},
+        'color': '#1565C0', 'fg': 'white'},
 }
 
 # 5-day range (%) cut points, upper bound INCLUSIVE: G1 ≤10, G2 ≤15, G3 ≤20,
-# G4 ≤25, G5 above 25. Tuned from the original 8/12/16/20 so that gear 5 —
-# which doubles the share count on every chase — only arms above a 25% range.
+# G4 ≤25, G5 above 25. Tuned from the original 8/12/16/20 so that Gear 5's
+# ×1.0 add size only arms above a 25% range.
 VOL_THRESHOLDS = tuple(GEARS[g]['vol_max'] for g in (1, 2, 3, 4))
 
 DEFAULT_GEAR = 3
@@ -235,6 +236,11 @@ def sell_pct_color(pct: float) -> str:
     return '#880000'
 
 
+def sell_pct_foreground(pct: float) -> str:
+    """Readable text over :func:`sell_pct_color` at every tier depth."""
+    return 'white' if float(pct) >= 7 else 'black'
+
+
 def gap_color(gap_pct: float) -> str:
     """Red for positive (profit), blue for negative (loss)."""
     if gap_pct > 5:    return '#CC0000'
@@ -244,17 +250,18 @@ def gap_color(gap_pct: float) -> str:
     return '#003399'
 
 
-def load_gap_color(gap_pct: float, trigger_pct: float = 6.0) -> str:
-    """Color for a FLAT stock's gap = current vs the VANTAGE point (kept
-    distinct from the deployed red/blue P&L colors so a watch-list of flats
-    doesn't read as losses). The LOAD sits at gap = -trigger_pct: orange once
-    the price is at/below it, purple above — deeper purple = farther away."""
-    rem = gap_pct + abs(trigger_pct)      # distance still to fall to the LOAD
-    if rem <= 0:   return '#E08000'   # orange — already at/below the LOAD
-    if rem < 2:    return '#B084E0'   # light purple — close to a buy
-    if rem < 4:    return '#9A5FD0'
-    if rem < 6:    return '#7E3FBF'
-    return '#5E2CA0'                   # deep purple — far above the LOAD
+def load_gap_color(gap_pct: float) -> str:
+    """Single-hue blue contrast for a FLAT card's actionable LOAD gap.
+
+    Far-away bait is deep blue and becomes lighter as it approaches or crosses
+    the line. Crossing is already shown by the card's green Current value, so
+    the gap text does not need the later purple/orange or red alarm palette.
+    """
+    if gap_pct >= 0: return '#B7D3F0'
+    if gap_pct > -1: return '#99BBE0'
+    if gap_pct > -4: return '#6699CC'
+    if gap_pct > -6: return '#3366CC'
+    return '#003399'
 
 
 def fx_dev_color(pct: float) -> str:
@@ -283,8 +290,8 @@ def calc_volatility(high_5d, low_5d):
 
 def select_auto_gear(volatility) -> int:
     """5-day range percent -> recommended gear 1..5. Unknown volatility is
-    treated as calm (gear 1) — the system never guesses its way into the
-    share-doubling gear."""
+    treated as calm (gear 1) — the system never guesses its way into G5's
+    ×1.0 add size."""
     if volatility is None:
         return 1
     for gear in (1, 2, 3, 4):
@@ -513,3 +520,16 @@ def calc_gap_rate(current_price: float, avg_cost: float) -> float:
     if avg_cost <= 0:
         return 0.0
     return (current_price - avg_cost) / avg_cost * 100.0
+
+
+def calc_load_gap_rate(current_price: float, load_price: float) -> float:
+    """Actionable FLAT-card gap: LOAD measured from the current price.
+
+    A negative number means the bait still sits below the market; the value
+    rises toward zero as price approaches LOAD and turns positive after the
+    line is crossed.  This is the historical card definition and makes a
+    descending sort put the closest bait first.
+    """
+    if current_price <= 0 or load_price <= 0:
+        return 0.0
+    return (load_price - current_price) / current_price * 100.0

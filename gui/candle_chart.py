@@ -8,8 +8,8 @@ current price).
 
 No order buttons live here, but a day CAN be clicked: `on_pick_day` receives
 that session's bar, which the cockpit uses to pin the vantage to its high.
-The bot's rolling high cannot know about a sale made outside it, so the
-commander needs a way to say "the campaign ended on this day".
+This is the visible alternative to Automatic Dynamic High5 and is available
+only while the stock is flat.
 """
 
 import tkinter as tk
@@ -37,6 +37,8 @@ _F_REF  = ('Segoe UI', 10, 'bold')
 _CUR_CLR = '#222222'
 _UP_CLR = '#CC3333'
 _DOWN_CLR = '#3366CC'
+_PIN_CLR = '#E08000'
+_PIN_BG = '#FFF3D6'
 
 
 def candle_color(day):
@@ -64,6 +66,33 @@ def bar_day_labels(bars):
         seen[lab] = seen.get(lab, 0) + 1
         final.append(lab if seen[lab] == 1 else f'{lab}#{seen[lab]}')
     return final
+
+
+def bar_pick_label(bar, display_label=None):
+    """Stable human label persisted with a manually selected high."""
+    label = display_label or bar.get('date') or str(bar.get('ts') or '')[:10]
+    return f'{label or "selected day"} high'
+
+
+def bar_is_selected(bar, selected_price=None, selected_label='',
+                    display_label=None):
+    """Whether a candle is the manually pinned Vantage day."""
+    try:
+        price = float(selected_price)
+        high = float(bar.get('high'))
+    except (TypeError, ValueError):
+        return False
+    if abs(high - price) > max(1e-8, abs(price) * 1e-8):
+        return False
+    label = str(selected_label or '').strip().strip('() ').lower()
+    if not label or label == 'selected high':
+        return True
+    candidates = {
+        str(display_label or '').lower(),
+        str(bar.get('date') or '').lower(),
+        str(bar.get('ts') or '')[:10].lower(),
+    }
+    return any(token and token in label for token in candidates)
 
 
 def required_label_pad(labels, measure, minimum, padding=12):
@@ -103,13 +132,19 @@ class CandlePanel(tk.Frame):
         self.current = None
         self.vol5 = None        # 5-day range V from the watcher
         self.on_pick_day = on_pick_day
-        self._day_bands = []    # [(x0, x1, bar)] for the click test
+        self._day_bands = []    # [(x0, x1, bar, display_label)]
+        self.selection_enabled = False
+        self.selected_price = None
+        self.selected_label = ''
         self._ref_font = tkfont.Font(root=self, font=_F_REF)
         self._row_wrap = max(100, width - 10)
 
         self._stat = tk.Label(self, text='5-day chart — waiting for data',
                               font=_F_STAT, anchor='w')
         self._stat.pack(fill='x')
+        self._pick_hint = tk.Label(self, text='', font=_F_DAY, fg='#777',
+                                   anchor='w')
+        self._pick_hint.pack(fill='x')
         self._days = tk.Frame(self)
         self._days.pack(fill='x')
         self.canvas = tk.Canvas(self, bg='white', highlightthickness=0,
@@ -121,12 +156,19 @@ class CandlePanel(tk.Frame):
 
     def _on_click(self, event):
         """Clicking a candle hands its bar to the cockpit."""
-        if not self.on_pick_day:
+        if not self.on_pick_day or not self.selection_enabled:
             return
-        for x0, x1, bar in self._day_bands:
+        for x0, x1, bar, label in self._day_bands:
             if x0 <= event.x <= x1:
-                self.on_pick_day(dict(bar))
+                self._pick_bar(bar, label)
                 return
+
+    def _pick_bar(self, bar, display_label):
+        if not self.on_pick_day or not self.selection_enabled:
+            return
+        picked = dict(bar)
+        picked['_vantage_label'] = bar_pick_label(bar, display_label)
+        self.on_pick_day(picked)
 
     def _resize_day_rows(self, event):
         """Keep every colored OHLC row inside the panel as it is resized."""
@@ -136,19 +178,25 @@ class CandlePanel(tk.Frame):
 
     # ── Data in ───────────────────────────────────────────────────────────────
 
-    def update(self, ohlc=None, ref_lines=None, current=None, vol5=None):
+    def update(self, ohlc=None, ref_lines=None, current=None, vol5=None,
+               selection_enabled=False, selected_price=None,
+               selected_label=''):
         if ohlc is not None:
             self.ohlc = list(ohlc)
         if ref_lines is not None:
             self.ref_lines = [r for r in ref_lines if r.get('price')]
         self.current = current
         self.vol5 = vol5
+        self.selection_enabled = bool(selection_enabled)
+        self.selected_price = selected_price
+        self.selected_label = selected_label or ''
         self._update_stats()
         self._draw()
 
     def _update_stats(self):
         if not self.ohlc:
             self._stat.config(text='5-day chart — no data')
+            self._pick_hint.config(text='')
             for child in self._days.winfo_children():
                 child.destroy()
             return
@@ -165,19 +213,40 @@ class CandlePanel(tk.Frame):
         self._stat.config(
             text=f'5D  High {fmt_price(hi, self.ccy)}   '
                  f'Low {fmt_price(lo, self.ccy)}   {v_txt}')
+        selected = self.selected_price is not None
+        if not self.selection_enabled:
+            hint = 'Vantage selection is locked while deployed or an order is pending.'
+        elif selected:
+            hint = ('Pinned day is highlighted. Pick another day to move it, '
+                    'or return to Dynamic High5 above.')
+        else:
+            hint = 'Pick Vantage: click a candle or an OHLC row to pin its high.'
+        self._pick_hint.config(text=hint)
         for child in self._days.winfo_children():
             child.destroy()
         for d, lab in zip(self.ohlc, bar_day_labels(self.ohlc)):
             rng = (d['high'] - d['low']) / d['low'] * 100 if d['low'] else 0
-            row = (f"{lab}  O {fmt_price(d['open'], self.ccy)}"
+            picked = bar_is_selected(d, self.selected_price,
+                                     self.selected_label, lab)
+            marker = ('✓ PINNED  ' if picked else
+                      ('▲ PIN HIGH  ' if self.selection_enabled else ''))
+            row = (f"{marker}{lab}  O {fmt_price(d['open'], self.ccy)}"
                    f"  H {fmt_price(d['high'], self.ccy)}"
                    f"  L {fmt_price(d['low'], self.ccy)}"
                    f"  C {fmt_price(d['close'], self.ccy)}"
                    f"  ({rng:.1f}%)")
-            tk.Label(self._days, text=row, font=_F_DAY,
-                     fg=candle_color(d), anchor='w', justify='left',
-                     wraplength=self._row_wrap
-                     ).pack(fill='x', anchor='w')
+            button = tk.Button(
+                self._days, text=row, font=_F_DAY,
+                fg=candle_color(d), disabledforeground=candle_color(d),
+                bg=(_PIN_BG if picked else 'white'),
+                activebackground=_PIN_BG, anchor='w', justify='left',
+                wraplength=self._row_wrap, bd=(2 if picked else 1),
+                relief=('sunken' if picked else 'raised'), takefocus=0,
+                command=lambda bar=d, label=lab: self._pick_bar(bar, label))
+            button.config(state=('normal' if self.selection_enabled
+                                 else 'disabled'),
+                          cursor=('hand2' if self.selection_enabled else ''))
+            button.pack(fill='x', anchor='w', pady=1)
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
@@ -278,7 +347,15 @@ class CandlePanel(tk.Frame):
         self._day_bands = []
         for i, d in enumerate(ohlc):
             x = left_pad + candle_w * (i + 0.5)
-            self._day_bands.append((x - candle_w / 2, x + candle_w / 2, d))
+            selected = bar_is_selected(d, self.selected_price,
+                                       self.selected_label, labels[i])
+            self._day_bands.append(
+                (x - candle_w / 2, x + candle_w / 2, d, labels[i]))
+            if selected:
+                c.create_rectangle(
+                    x - candle_w / 2 + 2, top_pad,
+                    x + candle_w / 2 - 2, top_pad + chart_h,
+                    outline=_PIN_CLR, width=2)
             c.create_line(x, y_of(d['high']), x, y_of(d['low']),
                           fill='#555', width=1)
             color = candle_color(d)
@@ -287,9 +364,11 @@ class CandlePanel(tk.Frame):
             if y_bot - y_top < 2:
                 y_bot = y_top + 2
             c.create_rectangle(x - body_w / 2, y_top, x + body_w / 2, y_bot,
-                               fill=color, outline='#444')
+                               fill=color,
+                               outline=(_PIN_CLR if selected else '#444'),
+                               width=(3 if selected else 1))
             if i % step == 0 or i == len(ohlc) - 1:
                 c.create_text(x, h - 6, text=labels[i],
                               font=_F_AXIS, fill='#555', anchor='s')
-        if self.on_pick_day:
-            c.config(cursor='hand2')
+        c.config(cursor=('hand2' if self.on_pick_day
+                         and self.selection_enabled else ''))

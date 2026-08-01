@@ -1,5 +1,5 @@
 # AI Seesaw Mini-Calculator
-## Project Manual v0.7
+## Project Manual v0.8
 
 **Sister project of:** AI Seesaw Trading (main program)
 **Goal:** Single-window, reactive calculator, bookkeeper, and autopilot cockpit for an AI-sector portfolio.
@@ -15,10 +15,10 @@ The Mini-Calculator is a **field tool**, not a command center. It reads the posi
 
 1. Where is a flat stock's entry (LOAD) trigger, and how many shares?
 2. Where is my next CHASE, and how many shares does it add?
-3. Where does the whole position come out (the single EXIT)?
+3. Where does the position come out (one-shot EXIT by default, or optional tiers)?
 4. Is the FX rate far enough from its 3-month average to switch some won/dollar?
 
-**The card and the bot are one system.** Whatever a card shows is exactly what the autopilot watches: the card pushes `{gear, exit_tier}` to the engine on every recompute. The same numbers can be typed into the broker app by hand — hand trades and bot trades land in the same campaign log.
+**The card and the bot are one system.** Whatever a card shows is exactly what the autopilot watches: the card pushes `{gear, exit_tiers, auto}` to the engine on every recompute. The same numbers can be entered in the broker app by hand — hand trades and bot trades reconcile into the same campaign.
 
 It deliberately omits the main program's perk engine, anchor tracking, regime detection, and idle flags.
 
@@ -79,13 +79,14 @@ is_deployed   : bool   — derived/maintained; True when a position is open
 shares        : int    — shares held (0 = flat)
 avg_cost      : float  — average cost per share
 cost_basis    : float  — shares × avg_cost
-gear          : int    — 1..5, the campaign's fixed gear
-exit_tier     : int    — 1..3, the ONE armed exit tier
-auto_mode     : bool   — AUTO (gear from volatility while flat) vs MANUAL
+gear          : int    — 1..5, the selected gear (AUTO may refresh it from V)
+exit_tier     : int    — 1..3, compatibility value (lowest armed tier)
+t1_active..t3_active  — actual one-, two-, or three-tier exit selection
+auto_mode     : bool   — AUTO (gear follows volatility) vs MANUAL
 last_updated  : date   — timestamp of last CSV write
 ```
 
-The pre-gearbox columns (`load_gear`, `buy_pct`, `t1_pct`…`t3_active`) are still written, derived from the gear, so older builds and scripts keep reading the file. On load a legacy file migrates automatically: a bait drop percent becomes its gear (4%→G1 … 8%→G5) and the lowest active sell tier becomes the single exit tier.
+The pre-gearbox columns (`load_gear`, `buy_pct`, `t1_pct`…`t3_active`) are still written, derived from the gear, so older builds and scripts keep reading the file. On load a legacy file migrates automatically: a bait drop percent becomes its gear (4%→G1 … 8%→G5), all valid active tier flags are preserved, and `exit_tier` supplies the one-shot selection only when those flags are absent.
 
 ### 2.3 Stock States
 
@@ -100,7 +101,7 @@ On **Save & Refresh** the program auto-promotes an empty stock to deployed when 
 
 ## 3. The Gearbox (AUTO / MANUAL)
 
-Each card has an **AUTO / MANUAL** toggle and a **gear picker**. One gear fixes the whole campaign:
+Each card has an **AUTO / MANUAL** toggle and a **gear picker**. The selected gear defines the complete LOAD/CHASE/EXIT ladder at that moment:
 
 | Gear | Name | 5-day range | LOAD | CHASE | Add size | Exit tiers |
 |---|---|---|---|---|---|---|
@@ -118,10 +119,10 @@ V = 100 × (High5 − Low5) / High5
 
 - **AUTO** tracks V continuously, deployed or not — a stock that turns violent mid-campaign gets a deeper ladder without being touched. On a FLAT card the heavy-unit rule (§3.1) floors it.
 - **MANUAL** holds whatever the commander picked.
-- Either way a gear or tier change on a live campaign is written into the campaign log. Nothing has to be unwound: only the average cost is history, and both lines are recomputed from it on the spot.
-- The gear badge (a colored circle 1–5) makes the whole grid of cards readable at a glance.
+- Either way a gear or tier change is saved as configuration and may enter the diagnostic application log, never `RECORDED FILLS`. Nothing has to be unwound: only the average cost is history, and the watched lines are recomputed from it on the spot.
+- Gear identity uses the same red/orange/yellow/green/blue G1–G5 colors on the card and in the cockpit.
 
-Bounds are inclusive: exactly 15.0% is gear 2, 15.1% is gear 3. G5 — which buys the entire position again on every chase — arms only above a 25% range.
+Bounds are inclusive: exactly 15.0% is gear 2, 15.1% is gear 3. G5's ×1.0 add size arms only above a 25% range.
 
 ### 3.1 Heavy-unit entry floor
 
@@ -150,7 +151,7 @@ A flat card shows `Vantage:`, then a projected ladder `Load / Chase 1 / Chase 2`
 
 ### 4.1 Same-day reload
 
-After a full EXIT the same session, one fast reload arms at the **actual final sell fill −3%** (not the gear's load drop). The card marks the vantage `(reload)`. If it does not fill by the close it expires — the next trading day returns to the rolling High5.
+After a full EXIT the same session, one fast reload arms at the **actual final sell fill −3%** (not the gear's load drop). The card marks the Vantage `(reload)`. If it does not fill by the close it expires — the next trading day returns to Automatic Dynamic High5.
 
 ---
 
@@ -169,7 +170,7 @@ The card shows three chase lines. They **cascade**: each level's shares are fold
 
 ## 6. EXIT (one tier, or a ladder)
 
-The three tiers are a **multi-select**. Click them on the card or in the cockpit; the change is confirmed before it takes effect.
+The three tiers are a **multi-select**. Click them on the card or in the cockpit and the selection applies directly; the final armed tier silently stays on so the campaign always has an exit.
 
 ```
 one armed     exit_price = avg × (1 + tier%)      qty = ALL shares
@@ -204,9 +205,13 @@ Every card carries one button:
 
 There are no manual Buy/Sell buttons: the reason to run a bot is that the offer goes out when the curve touches the line. Trading by hand in the broker app stays fully supported — the bot detects it and folds it into the campaign.
 
-The cockpit also carries a **gearbox strip** — AUTO, G1–G5, T1/T2/T3 — so the gear and the exit tier can be changed where the campaign is being watched. It writes to the card, which stays the source of truth, and the engine picks it up on the next poll.
+The cockpit also carries a **gearbox strip** — AUTO, G1–G5, T1/T2/T3 — so the Gear and exit tiers can be changed where the campaign is being watched. It writes to the card, which stays the source of truth, and the engine picks it up on the next poll. G1–G5 use red, orange, yellow, green, and blue; exit buttons vary by their actual percentage.
 
-Nothing rests in advance — an order goes out only when a line is actually crossed. An order that then rests unfilled is **re-priced by the bot itself** every poll, so a gear shift never strands one. **Cancel N resting** is the manual override for that: unfilled orders only, count named, disabled when nothing rests.
+Nothing rests in advance — an order goes out only when a line is actually crossed. An order that then rests unfilled is **re-priced by the bot itself** every poll, so a Gear shift never strands one. There is no broad Cancel control: WATCH and self-healing clean up only durably identified bot orders; visible app/web orders pause the ticker and are never cancelled by the bot.
+
+If Toss gives an ambiguous placement response, the bot writes the client id to durable state **before** transmitting and pauses instead of sending a fresh identity. A failed state write sends no order. A missing OPEN row is not treated as cancellation; a known broker order requires exact terminal detail before replacement. During shutdown, a client-id-only ambiguity is recovered with the same idempotency key, never a new one. The shutdown-only fallback retires an identity with no broker order id only after its 10-minute idempotency window and three successful exhaustive OPEN reads show that no working order remains; the retirement must itself save successfully. Recent fill evidence is time-bounded and deduplicated, so an old SELL cannot become a new reload anchor and opposing app/bot fills can remain separately attributable when the broker exposes the full evidence. Every CLOSED cursor page must complete first; a failed/malformed later page or `closed-not-supported` disables gross/net-zero replay instead of treating a partial history as complete.
+
+Dormant Toss app-side conditional/reserved orders are not visible in OPEN before they trigger. Do not combine one with LIVE on the same ticker; the bot can yield only to a manual order the broker exposes.
 
 The daily v^ grid was removed on 2026-08-01 so this bot could be stabilised alone; its specification and a restore recipe are in [`Daily v^ Grid Autopilot Manual.md`](Daily%20v^%20Grid%20Autopilot%20Manual.md).
 
@@ -265,7 +270,7 @@ This is a manual tracker: you can always trade off-schedule when a position dema
 
 ## 8. Ordering of Cards
 
-**Everything by gap, highest first** — deployed and flat alike. For a deployed card the gap is price vs the average cost, so campaigns closest to their exit rise; for a flat card it is price vs the vantage, so candidates closest to their LOAD rise. Either way the top of the screen is what is about to happen.
+**Everything by displayed gap, highest first** — deployed and flat alike. A deployed card uses current price versus broker average. A flat card uses LOAD versus current price, so candidates closest to or through their bait rise. Either way the top of the screen is the largest displayed gap.
 
 Both orderings re-grid live after each price fetch (no full rebuild), so cards re-sort without disturbing fields you are editing.
 
@@ -282,7 +287,7 @@ Both orderings re-grid live after each price fetch (no full rebuild), so cards r
 - **Save & Refresh** (single main button): collect inputs → reconcile from Toss (or auto-promote/demote in manual mode) → rebuild → save CSV + config → fetch prices and FX in a background thread → recompute and re-sort.
 - Auto-refresh once on launch. No timed refresh loop on the main panel.
 - The **autopilot** polls independently every 5 s, but only for stocks being watched, and only that ticker's data. A failed poll skips the whole cycle and retries — nothing is placed or cancelled on missing data.
-- The **gap** is `(current − avg)/avg × 100` on a deployed card (red above cost, blue below) and `(current − vantage)/vantage × 100` on a flat card (purple far from the LOAD, orange once it is reached).
+- The **gap** is `(current − avg)/avg × 100` on a deployed card and `(LOAD − current)/current × 100` on a flat card. FLAT gaps use one blue family with lightness contrast; the Current value turns green when LOAD is crossed.
 
 ---
 
@@ -290,11 +295,11 @@ Both orderings re-grid live after each price fetch (no full rebuild), so cards r
 
 `gui/campaign_window.py` carries the charts and the log:
 
-- **Live tick curve** with the campaign's own lines — the armed LOAD/CHASE and the broker average and the full EXIT drawn bold, the next two projected chases and the vantage drawn soft. An unfundable buy line goes grey, relabelled `✕ … (no army)`.
-- **5-day candle panel** beside it, carrying the same lines.
+- **Live tick curve** with the campaign's own lines — the armed LOAD/CHASE, broker average, and selected EXIT line(s) drawn bold; the next two projected chases and Vantage drawn soft. Its right-hand label area keeps long BUY/SELL WATCH/pseudo text visible. An unfundable buy line goes grey, relabelled `✕ … (no army)`.
+- **Always-visible 5-day candle panel** beside it, carrying the same lines. Rising/unchanged OHLC rows are red and falling rows blue. While FLAT, candle and OHLC rows visibly select and highlight a pinned Vantage; only a pin shows `Return to Dynamic High5`.
 - **Banner** naming the gear, the campaign, the position, and then `▲ EXIT …` (every armed tier with its own price and portion) over `▼ next buy … then …`. A DEPLOYED campaign projects chases 2 and 3 beyond its armed chase; a FLAT one projects chases 1 and 2 beyond its armed LOAD — the same ladder its card prints.
-- **Gearbox strip** — AUTO/MANUAL, G1–G5, the three tiers, V, and the vantage with its source. Clicking a day on the candle panel pins the vantage to that session's high.
-- **RECORDED FILLS** at the bottom: one row per trade with the resulting position and average, plus `ADOPT` / `GEAR` / `TIER` decision rows, grouped under a header per trading day.
+- **Gearbox strip** — AUTO/MANUAL, G1–G5, the three tiers, `V`, and **Vantage** with its Dynamic/Pinned/Reload/Campaign source. Gear, tier, and Vantage choices are direct; only LIVE asks for trade-mode confirmation.
+- **RECORDED FILLS** at the bottom: one row per definite broker quantity change with resulting position and average, grouped by trading day. Opening the window, adopting status, and changing Gear/tier/Vantage never add rows; a separate current FLAT/DEPLOYED message remains visible when the list is empty.
 
 ---
 
@@ -308,7 +313,7 @@ load_gear,buy_pct,t1_pct,t2_pct,t3_pct,t1_active,t2_active,t3_active,
 auto_mode,last_updated
 ```
 
-`gear` and `exit_tier` are the live fields; the rest of the gear columns are derived and written for back-compat. Created automatically (all tickers, shares = 0) on first run if missing. Legacy files (`A/B/C`, `L1`–`L7`, bait drop percents, three active sell tiers) are migrated on read.
+`gear`, `auto_mode`, and `t1_active`/`t2_active`/`t3_active` are the live strategy fields; `exit_tier` is the lowest-armed compatibility value and the remaining gear columns are derived for back-compat. Created automatically (all tickers, shares = 0) on first run if missing. Legacy files (`A/B/C`, `L1`–`L7`, bait drop percents, and active sell tiers) are migrated on read without collapsing a valid multi-tier selection.
 
 ### 11.2 `config.json`
 
@@ -326,7 +331,7 @@ auto_mode,last_updated
 
 ### 11.3 `data/autopilot_state.json`
 
-Campaign state per `ticker#VCG`: campaign id, gear, exit tier, vantage, chase count, campaign low, peak deployment and the campaign log. A restart re-arms exactly where it left off. Any v^ grid record left at a bare ticker key is untouched and is never restored as a campaign.
+Campaign state per `ticker#VCG`: campaign id, gear, armed/spent exit tiers, Vantage, chase count, campaign low, peak deployment, order-reconciliation state, and the fill log. A restart re-arms from broker truth and durable bot ownership. Any v^ grid record left at a bare ticker key is untouched and is never restored as a campaign.
 
 ---
 
@@ -376,6 +381,8 @@ Mini_trading_calculator/
 | 0.6 | 2026-08-01 | Gear ladder **10/15/20/25** (G5 above 25%). **V unified**: one figure — 100×(High5−Low5)/High5 — on the card, in the cockpit and on the candle panel; the panel's grid-era per-day average and `/3` hint removed. A FLAT stock now publishes **chase 1** as well as chase 2 (it was silently dropped from the chart). Gear and exit tier **choosable in the cockpit**, writing through to the card. `Cancel all` → `Cancel N resting`: disabled when nothing rests, and documented — the bot never re-prices a resting order, so a shifted gear needs the old one cleared. |
 
 | 0.7 | 2026-08-01 | **Exit tiers are a multi-select again** — one for a clean full exit, two or three to leave in portions by the old distribution law; a filled tier is spent, a chase re-arms them all, and the campaign ends only at zero shares. The bot **re-prices its own resting orders** (the 443 `stale LOAD`/`stale SELL` rule), so a gear shift never strands one. The **vantage** is the Dynamic High5 window (four completed highs + today's live high, per the strategy manual's Appendix A), and can be pinned by clicking a day on the 5-day chart. The campaign log holds **trades only**. Cockpit: AUTO/MANUAL without forcing a gear pick, a vantage strip, taller charts, distinct day labels. **All cards ordered by gap.** |
+
+| 0.8 | 2026-08-01 | Mixed manual/LIVE reconciliation made broker-authoritative: durable bot ownership, foreign-order pause, exact-fill retries, MIXED attribution, actual-fill-only reload, and no guessed offline sell. Removed broad Cancel and routine strategy confirmations. Made the 5-day Vantage picker permanent and explicit, restored blue FLAT-gap contrast, added Gear/exit color contrast, current empty/deployed log status, unclipped chart labels, and trade-only fill rows. |
 
 ---
 
