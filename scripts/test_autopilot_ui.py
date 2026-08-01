@@ -28,16 +28,17 @@ import tkinter as tk
 import gui.autopilot_ctrl as autopilot_ctrl_module
 
 from core.calc import (calc_load_gap_rate, calc_volatility, fmt_price,
-                       gear_button_color, load_gap_color, select_auto_gear,
-                       sell_pct_color)
+                       gap_color, gear_button_color, load_gap_color,
+                       select_auto_gear, sell_pct_color)
 from gui.campaign_window import (CampaignWindow, buy_lines, campaign_age_line,
                                  campaign_line, can_pin_vantage,
+                                 cockpit_gear_style,
                                  empty_fill_status, fill_log_rows, next_line,
                                  sell_lines, sell_tier_colors,
                                  status_banner_color, toggled_tiers,
-                                 vantage_presentation)
-from gui.autopilot_ctrl import (AutopilotController, fill_evidence_key,
-                                merge_live_bar, normalize_open_order,
+                                 user_facing_state, vantage_presentation)
+from gui.autopilot_ctrl import (AutopilotController, merge_live_bar,
+                                normalize_open_order,
                                 normalize_recent_fills)
 from gui.candle_chart import (bar_day_labels, bar_is_selected, bar_pick_label,
                               bar_range_v,
@@ -45,7 +46,7 @@ from gui.candle_chart import (bar_day_labels, bar_is_selected, bar_pick_label,
                               required_label_pad)
 from gui.main_window import (App as MainWindow, card_gap_order_key,
                              strategy_preferences)
-from gui.stock_row import _AP_BUTTON_TOP_GAP
+from gui.stock_row import StockRow, _AP_BUTTON_TOP_GAP
 from providers.toss_market_provider import TossMarketProvider
 
 passed = 0
@@ -160,6 +161,10 @@ ok(campaign_line({}, 'USD') == 'arming…', 'an empty ui reads as arming')
 age = campaign_age_line(deployed_ui(), 'USD')
 ok('NVDA-20260801-090000' in age and 'chases 1' in age and 'low 86.00' in age,
    'the campaign line carries id, chases and the campaign low', age)
+manual_ui = deployed_ui()
+manual_ui['campaign'] = dict(manual_ui['campaign'], manually_modified=True)
+ok('MANUALLY_MODIFIED' not in campaign_age_line(manual_ui, 'USD'),
+   'manual/external fill history does not become a persistent position warning')
 ok(campaign_age_line(flat_ui(), 'USD') == '',
    'no campaign line before the first LOAD fills')
 
@@ -216,9 +221,12 @@ ok('current DEPLOYED: 12 shares @ 91.50 average' in empty_fill_status({
        'events': [], 'campaign_state': 'CHASE_PENDING', 'shares': 12,
        'avg_cost': 91.5}, 'USD'),
    'an empty fill log still reports the current deployed position')
-ok('current FLAT: no shares' in empty_fill_status({
+ok('current EMPTY: no shares' in empty_fill_status({
        'events': [], 'campaign_state': 'FLAT', 'shares': 0}, 'USD'),
-   'an empty fill log distinguishes a genuinely flat position')
+   'an empty fill log uses the user-facing EMPTY position name')
+ok(user_facing_state('flat — waiting for the vantage') ==
+   'EMPTY — waiting for the vantage',
+   'internal FLAT wording is translated at the cockpit presentation edge')
 
 note = fill_log_rows({'events': [
     {'date': '2026-08-01', 'ts': '08/01 12:00', 'kind': 'GEAR', 'qty': 0,
@@ -348,6 +356,10 @@ ok(bar_day_labels([]) == [], 'no bars, no labels')
 
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
+ok(StockRow._AP_STYLES[None][0] == 'AUTOPILOT'
+   and StockRow._AP_STYLES['WATCH'][0] == 'AUTOPILOT\nWATCH'
+   and StockRow._AP_STYLES['LIVE'][0] == 'AUTOPILOT\nLIVE',
+   'the card action is consistently named AUTOPILOT')
 
 print('— Vantage selection presentation —')
 dynamic = vantage_presentation(flat_ui()['campaign'], 'USD')
@@ -378,18 +390,46 @@ ok(bar_is_selected(pick_bar, 103.5, '07/30 high', '07/30'),
 ok(not bar_is_selected(pick_bar, 104.0, '07/30 high', '07/30'),
    'a different high is not highlighted accidentally')
 
-print('— actionable card gap and global order —')
+print('— modeless LIVE confirmation —')
+_mode_calls = []
+_confirmation = []
+_confirm_probe = CampaignWindow.__new__(CampaignWindow)
+_confirm_probe.ticker = 'NVDA'
+_confirm_probe.ccy = 'USD'
+_confirm_probe.ap = {
+    'mode_of': lambda: 'WATCH',
+    'ui_state': lambda: flat_ui(),
+    'set_mode': lambda mode: (_mode_calls.append(mode) or (True, mode)),
+}
+_confirm_probe._show_live_confirmation = (
+    lambda detail: _confirmation.append(list(detail)))
+_confirm_probe._hide_live_confirmation = lambda: None
+_confirm_probe._show_notice = lambda message: None
+_confirm_probe._on_live()
+ok(bool(_confirmation) and _mode_calls == [],
+   'first LIVE click presents inline details without entering LIVE or blocking cards')
+_confirm_probe._confirm_live()
+ok(_mode_calls == ['LIVE'],
+   'the separate inline confirmation action is what enters LIVE')
+
+print('— state-specific card gaps and grouped order —')
 close_gap = calc_load_gap_rate(95.0, 92.0)
 far_gap = calc_load_gap_rate(100.0, 92.0)
 crossed_gap = calc_load_gap_rate(90.0, 92.0)
-ok(near(close_gap, (92.0 - 95.0) / 95.0 * 100.0),
-   'FLAT gap is (LOAD-current)/current', str(close_gap))
-ok(crossed_gap > close_gap > far_gap,
-   'the gap rises as price approaches and crosses the bait')
-ok(load_gap_color(close_gap) == '#6699CC'
-   and load_gap_color(far_gap) == '#003399'
-   and load_gap_color(crossed_gap) == '#B7D3F0',
-   'FLAT gaps use historical light/dark blue contrast, not purple/orange')
+ok(near(close_gap, (95.0 - 92.0) / 92.0 * 100.0),
+   'EMPTY gap is (current-LOAD)/LOAD', str(close_gap))
+ok(crossed_gap < 0 < close_gap < far_gap,
+   'a price below LOAD is negative and a price above LOAD is positive')
+ok(load_gap_color(close_gap) == '#D46F00'
+   and load_gap_color(far_gap) == '#A64B00'
+   and load_gap_color(crossed_gap) == '#9A5FD0'
+   and load_gap_color(calc_load_gap_rate(84.0, 92.0)) == '#5E2CA0',
+   'EMPTY gaps use magnitude-shaded orange above and purple below LOAD')
+ok(gap_color(3.0) == '#FF6666' and gap_color(-3.0) == '#6699CC',
+   'DEPLOYED gaps retain reddish profit and bluish loss colors')
+ok(gap_color(0.1) == '#F3A0A0' and gap_color(-0.1) == '#A8C7E8'
+   and gap_color(0.0) == '#888888',
+   'even small DEPLOYED gains/losses keep their sign color; only zero is grey')
 
 
 class _GapRow:
@@ -399,10 +439,11 @@ class _GapRow:
 
 mixed = [_GapRow('NVDA', far_gap, False),
          _GapRow('AAPL', 1.5, True),
-         _GapRow('GOOGL', close_gap, False)]
+         _GapRow('MSFT', -2.0, True),
+         _GapRow('GOOGL', crossed_gap, False)]
 ordered = sorted(mixed, key=card_gap_order_key)
-ok([r.ticker for r in ordered] == ['AAPL', 'GOOGL', 'NVDA'],
-   'deployed and flat cards share one descending actionable-gap order',
+ok([r.ticker for r in ordered] == ['AAPL', 'MSFT', 'GOOGL', 'NVDA'],
+   'DEPLOYED cards come first descending; EMPTY cards follow ascending',
    str([r.ticker for r in ordered]))
 
 prefs = strategy_preferences({'ticker': 'NVDA', 'shares': 10, 'avg_cost': 90,
@@ -415,6 +456,9 @@ print('— cockpit color contrast —')
 ok([gear_button_color(g) for g in range(1, 6)] ==
    ['#C62828', '#E08000', '#E6B800', '#2E8B57', '#1565C0'],
    'G1..G5 are red, orange, yellow, green, blue')
+ok(cockpit_gear_style(3, 3, '#D9D9D9') == ('#E6B800', 'black')
+   and cockpit_gear_style(2, 3, '#D9D9D9') == ('#D9D9D9', '#666666'),
+   'only the selected cockpit Gear retains its identity color')
 low_bg, low_fg = sell_tier_colors(3)
 high_bg, high_fg = sell_tier_colors(9)
 ok(low_bg == sell_pct_color(3) and high_bg == sell_pct_color(9)
@@ -450,31 +494,7 @@ ok(len(unpriced_fill) == 1 and unpriced_fill[0]['price'] is None,
    'a limit price is never substituted for missing actual execution price')
 
 
-class _PendingEngine:
-    def __init__(self):
-        self.unresolved = []
-
-    def note_order_unresolved(self, **kw):
-        self.unresolved.append(kw)
-        return True
-
-
 _helper = AutopilotController.__new__(AutopilotController)
-_slot = {'fill_transition': None}
-_pending = {'accepted': True, 'side': 'BUY', 'price': 90.0, 'qty': 2,
-            'order_id': 'bot-1', 'filled_seen': 0}
-_ambiguous = {'shares': 2, 'orders': [], 'recent_fills': [],
-              'can_trade': True}
-for _attempt in range(3):
-    _ready, _status = _helper._fill_transition_ready(
-        'NVDA', _slot, _PendingEngine(), _ambiguous, 0, _pending)
-    ok(not _ready and 'no order will be sent' in _status,
-       f'ambiguous bot fill pauses on evidence retry {_attempt + 1}')
-_engine = _PendingEngine()
-_ready, _status = _helper._fill_transition_ready(
-    'NVDA', _slot, _engine, _ambiguous, 0, _pending)
-ok(_ready and _ambiguous['can_trade'] is False and _engine.unresolved,
-   'bounded evidence failure retains the unresolved intent in a non-trading poll')
 
 bounded_fills = normalize_recent_fills([
     {'orderId': 'old', 'symbol': 'NVDA', 'side': 'BUY',
@@ -488,7 +508,7 @@ bounded_fills = normalize_recent_fills([
                    'filledAt': '300'}},
 ], 'NVDA', filled_after=150, filled_before=250)
 ok([f['order_id'] for f in bounded_fills] == ['inside'],
-   'CLOSED evidence is limited to the requested correlation window')
+   'the standalone fill normalizer still applies an explicit time window')
 
 
 class _SnapshotProvider:
@@ -533,97 +553,24 @@ _snapshot = _helper._real_snapshot(
     pending_order_id='bot-fill', fill_after=0, fill_before=4_000_000_000)
 ok(len(_snapshot['orders']) == 1 and _snapshot['orders'][0]['price'] is None,
    'the real snapshot keeps a price-less foreign OPEN order')
-ok(len(_snapshot['recent_fills']) == 2
-   and {f['mine'] for f in _snapshot['recent_fills']} == {True, False},
-   'exact bot detail and manual fill history are combined in one bounded scan')
+ok(len(_snapshot['recent_fills']) == 1
+   and _snapshot['recent_fills'][0]['mine']
+   and _snapshot['recent_fills'][0]['order_id'] == 'bot-fill',
+   'the normal snapshot carries only immediate evidence for the pending bot order')
 ok(_snapshot_provider.detail_calls == ['bot-fill']
    and _snapshot['pending_order']['terminal'],
-   'exact pending-order detail is queried even when holdings are unchanged')
-ok(_snapshot['closed_fills_complete'] and _snapshot['fills_correlated'],
-   'a successful complete CLOSED scan enables gross/net-zero replay')
-_seen = {fill_evidence_key(f) for f in _snapshot['recent_fills']}
+   'a pending order missing from OPEN receives one exact-detail lookup')
+ok(_snapshot_provider.closed_requests == []
+   and not _snapshot['closed_fills_complete']
+   and not _snapshot['fills_correlated'],
+   'a normal snapshot never scans CLOSED history or enables history replay')
 _repeat = _helper._real_snapshot(
     _snapshot_provider, 1, 'NVDA', set(), prev_shares=2,
     pending_order_id='bot-fill', fill_after=0, fill_before=4_000_000_000,
-    seen_fill_keys=_seen)
-ok(_repeat['recent_fills'] == [],
-   'overlapping CLOSED scans discard already-consumed evidence keys')
-_us_date_provider = _SnapshotProvider()
-_helper._real_snapshot(
-    _us_date_provider, 1, 'NVDA', set(), prev_shares=2,
-    fill_after=1_785_600_000, fill_before=1_785_600_060)
-ok(_us_date_provider.closed_requests[-1]['from_date'] == '2026-08-01',
-   'a KST-next-day scan requests US CLOSED history from the prior Eastern date')
-
-
-class _IncompleteClosedSnapshotProvider(_SnapshotProvider):
-    def __init__(self):
-        super().__init__()
-        self.history = TossMarketProvider.__new__(TossMarketProvider)
-        self.history._closed_orders_supported = None
-        self.page_calls = 0
-
-        def incomplete_get(path, params, account=None):
-            self.page_calls += 1
-            if self.page_calls == 1:
-                return {'orders': [{
-                    'orderId': 'partial-page-fill', 'symbol': 'NVDA',
-                    'side': 'SELL', 'quantity': '1', 'status': 'FILLED',
-                    'execution': {'filledQuantity': '1',
-                                  'averageFilledPrice': '92',
-                                  'filledAt': '2026-08-01T10:00:02-04:00'},
-                }], 'hasNext': True, 'nextCursor': 'next-page'}
-            raise RuntimeError('second CLOSED page failed')
-
-        self.history._get = incomplete_get
-
-    def get_closed_orders(self, seq, ticker, **kwargs):
-        return self.history.get_closed_orders(seq, ticker, **kwargs)
-
-
-_incomplete_snapshot_provider = _IncompleteClosedSnapshotProvider()
-_incomplete_snapshot = _helper._real_snapshot(
-    _incomplete_snapshot_provider, 1, 'NVDA', set(), prev_shares=2,
-    pending_order_id='bot-fill', fill_after=0,
-    fill_before=4_000_000_000)
-ok(_incomplete_snapshot_provider.page_calls == 2
-   and not _incomplete_snapshot['closed_fills_complete']
-   and not _incomplete_snapshot['fills_correlated']
-   and [f['order_id'] for f in _incomplete_snapshot['recent_fills']]
-       == ['bot-fill'],
-   'an incomplete later CLOSED page contributes no partial rows or gross replay proof')
-
-
-class _UnsupportedClosedSnapshotProvider(_SnapshotProvider):
-    _closed_orders_supported = False
-
-    def get_closed_orders(self, seq, ticker, **kwargs):
-        return []
-
-
-_unsupported_snapshot = _helper._real_snapshot(
-    _UnsupportedClosedSnapshotProvider(), 1, 'NVDA', set(), prev_shares=2,
-    pending_order_id='bot-fill', fill_after=0,
-    fill_before=4_000_000_000)
-ok(not _unsupported_snapshot['closed_fills_complete']
-   and not _unsupported_snapshot['fills_correlated']
-   and [f['order_id'] for f in _unsupported_snapshot['recent_fills']]
-       == ['bot-fill'],
-   'closed-not-supported keeps exact pending evidence but disables gross replay')
-
-_foreign_slot = {'fill_transition': None}
-_foreign_snap = {
-    'shares': 2, 'orders': [], 'fills_correlated': True,
-    'recent_fills': [{'side': 'BUY', 'qty': 2, 'mine': False,
-                      'order_id': 'manual-buy', 'filled_at': '200'}],
-    'can_trade': True,
-}
-_foreign_engine = _PendingEngine()
-_ready, _status = _helper._fill_transition_ready(
-    'NVDA', _foreign_slot, _foreign_engine, _foreign_snap, 0, _pending)
-ok(_ready and _status is None and not _foreign_engine.unresolved,
-   'time-correlated manual evidence explains a delta without claiming a bot fill')
-
+    seen_fill_keys={'legacy-consumed-key'})
+ok(_snapshot_provider.closed_requests == []
+   and [f['order_id'] for f in _repeat['recent_fills']] == ['bot-fill'],
+   'legacy fill-window arguments cannot reactivate CLOSED scanning or replay')
 
 class _AmbiguousEngine:
     def __init__(self):
@@ -702,8 +649,11 @@ class _DiskBoundaryProvider:
 _disk_helper = AutopilotController.__new__(AutopilotController)
 _disk_helper._log = lambda *args: None
 _disk_helper._store = {}
+_disk_helper._lock = threading.Lock()
 _disk_slot = {'my_ids': set(),
-              'backoff_until': {'BUY': 0.0, 'SELL': 0.0}}
+              'backoff_until': {'BUY': 0.0, 'SELL': 0.0},
+              'mode': 'LIVE', 'stopping': False}
+_disk_helper._slots = {'NVDA': _disk_slot}
 _disk_engine = _AmbiguousEngine()
 with tempfile.TemporaryDirectory() as _state_dir:
     _state_path = os.path.join(_state_dir, 'autopilot-state.json')
@@ -736,13 +686,18 @@ class _NeverTransmitProvider:
 _failed_save_helper = AutopilotController.__new__(AutopilotController)
 _failed_save_helper._log = lambda *args: None
 _failed_save_helper._save_state = lambda *args: False
+_failed_save_helper._lock = threading.Lock()
 _failed_save_provider = _NeverTransmitProvider()
+_failed_save_slot = {'my_ids': set(), 'mode': 'LIVE', 'stopping': False}
+_failed_save_helper._slots = {'NVDA': _failed_save_slot}
+_failed_save_engine = _AmbiguousEngine()
 _placed, _message = _failed_save_helper._place_real(
-    'NVDA', {'my_ids': set()}, _failed_save_provider, 1,
-    _AmbiguousEngine(), 'BUY', 90.0, 2, 'LOAD')
+    'NVDA', _failed_save_slot, _failed_save_provider, 1,
+    _failed_save_engine, 'BUY', 90.0, 2, 'LOAD')
 ok(not _placed and _failed_save_provider.transmissions == 0
+   and _failed_save_engine._pending is None
    and 'not transmitted' in _message,
-   'a failed pre-POST state save transmits no broker order')
+   'a failed pre-POST save transmits nothing and retires its local intent')
 
 
 _post_helper = AutopilotController.__new__(AutopilotController)
@@ -1217,6 +1172,18 @@ _smoke_window.win.withdraw()
 _root.update_idletasks()
 ok(_smoke_window.candle_panel.winfo_manager() == 'pack',
    'the real cockpit always constructs and shows its 5-day candle panel')
+ok(_smoke_window._state_lbl.cget('text') == 'EMPTY',
+   'the real cockpit translates its internal FLAT state to EMPTY')
+ok(_smoke_window._gear_btns[3].cget('bg') == gear_button_color(3)
+   and _smoke_window._gear_btns[2].cget('bg') ==
+       _smoke_window._default_bg,
+   'the real cockpit colors only its selected Gear')
+_smoke_window._on_live()
+_root.update_idletasks()
+ok(_smoke_window._live_confirm_frame.winfo_manager() == 'pack'
+   and _smoke_window.win.grab_current() is None,
+   'the real LIVE confirmation is inline and takes no application grab')
+_smoke_window._hide_live_confirmation()
 ok(not hasattr(_smoke_window, '_cancel_btn'),
    'the real cockpit has no broad Cancel widget')
 ok(not _smoke_window._vantage_free_btn.winfo_manager(),

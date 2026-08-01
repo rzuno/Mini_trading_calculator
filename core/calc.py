@@ -242,26 +242,32 @@ def sell_pct_foreground(pct: float) -> str:
 
 
 def gap_color(gap_pct: float) -> str:
-    """Red for positive (profit), blue for negative (loss)."""
+    """Red for positive (profit), blue for negative (loss), grey at zero."""
     if gap_pct > 5:    return '#CC0000'
     if gap_pct > 1:    return '#FF6666'
-    if gap_pct > -1:   return '#888888'
+    if gap_pct > 0:    return '#F3A0A0'
+    if gap_pct == 0:   return '#888888'
+    if gap_pct >= -1:  return '#A8C7E8'
     if gap_pct > -5:   return '#6699CC'
     return '#003399'
 
 
 def load_gap_color(gap_pct: float) -> str:
-    """Single-hue blue contrast for a FLAT card's actionable LOAD gap.
+    """Orange above LOAD, purple below it, with magnitude contrast.
 
-    Far-away bait is deep blue and becomes lighter as it approaches or crosses
-    the line. Crossing is already shown by the card's green Current value, so
-    the gap text does not need the later purple/orange or red alarm palette.
+    EMPTY-card gaps use ``(current - LOAD) / LOAD``.  A positive value means
+    price still sits above the bait and uses the orange family; a negative
+    value means price has crossed below LOAD and uses purple.  Each family gets
+    darker as the distance from the line grows.
     """
-    if gap_pct >= 0: return '#B7D3F0'
-    if gap_pct > -1: return '#99BBE0'
-    if gap_pct > -4: return '#6699CC'
-    if gap_pct > -6: return '#3366CC'
-    return '#003399'
+    if gap_pct >= 6: return '#A64B00'
+    if gap_pct >= 4: return '#BF6200'
+    if gap_pct >= 2: return '#D46F00'
+    if gap_pct >= 0: return '#E08000'
+    if gap_pct > -2: return '#B084E0'
+    if gap_pct > -4: return '#9A5FD0'
+    if gap_pct > -6: return '#7E3FBF'
+    return '#5E2CA0'
 
 
 def fx_dev_color(pct: float) -> str:
@@ -523,13 +529,11 @@ def calc_gap_rate(current_price: float, avg_cost: float) -> float:
 
 
 def calc_load_gap_rate(current_price: float, load_price: float) -> float:
-    """Actionable FLAT-card gap: LOAD measured from the current price.
+    """EMPTY-card gap: current price measured from the LOAD line.
 
-    A negative number means the bait still sits below the market; the value
-    rises toward zero as price approaches LOAD and turns positive after the
-    line is crossed.  This is the historical card definition and makes a
-    descending sort put the closest bait first.
+    Below LOAD is negative and above LOAD is positive.  Sorting these gaps
+    ascending therefore puts the deepest crossed bait first.
     """
     if current_price <= 0 or load_price <= 0:
         return 0.0
-    return (load_price - current_price) / current_price * 100.0
+    return (current_price - load_price) / load_price * 100.0

@@ -449,6 +449,40 @@ ok(near(line(e, 'load')[0], 120.0 * 0.92, 0.02),
    'and the LOAD line is recalculated live under it',
    str(line(e, 'load')[0]))
 
+print('— the vantage window is FIVE sessions, with or without a live one —')
+# 2026-07-27 holds the peak; 07/28..07/31 are lower. On a day with no bar of
+# its own (a weekend, or before the open) the window must still reach back to
+# 07/27 — taking only four completed sessions silently drops it and the
+# vantage collapses onto 07/31's high. That was a live bug: SNDK and NVDA
+# showed 7/31 where 7/27 was correct.
+FIVE = [('2026-07-27', 120.0), ('2026-07-28', 104.0), ('2026-07-29', 103.0),
+        ('2026-07-30', 102.0), ('2026-07-31', 101.0)]
+
+e, b, card = fresh(gear=3)
+settle(e, b, 115.0, date='2026-08-01', card=card, highs=FIVE)  # above the LOAD
+ok(near(e.vantage, 120.0),
+   "with no bar for today the window is the last FIVE completed sessions, "
+   "so 07/27's peak still counts", str(e.vantage))
+ok(near(line(e, 'load')[0], 120.0 * 0.92, 0.02),
+   'and the LOAD hangs under 07/27, not under 07/31',
+   str(line(e, 'load')[0]))
+
+# Once today has a bar, it takes the fifth slot: four completed + the live one.
+e2, b2, card2 = fresh(gear=3)
+settle(e2, b2, 99.0, date='2026-08-03', card=card2,
+       highs=FIVE + [('2026-08-03', 106.0)])
+ok(near(e2.vantage, 106.0),
+   'with a live bar the window is four completed + today, so 07/27 ages out '
+   'and the live 106 leads', str(e2.vantage))
+
+# And a live bar that is NOT the highest still leaves five sessions in play.
+e3, b3, card3 = fresh(gear=3)
+settle(e3, b3, 99.0, date='2026-08-03', card=card3,
+       highs=FIVE + [('2026-08-03', 100.0)])
+ok(near(e3.vantage, 104.0),
+   'four completed sessions plus today — 07/28 leads once 07/27 has aged out',
+   str(e3.vantage))
+
 print('— the vantage can be pinned by hand —')
 e2, b2, card2 = fresh(gear=3)
 settle(e2, b2, 99.0, card=card2, highs=[(D1, 100.0)])
@@ -519,13 +553,22 @@ b.external_sell(89.0, 5)                     # a hand partial sell
 settle(e, b, 89.0, card=card)                # still between the two lines
 ok(e.manually_modified,
    'an external PARTIAL sell flags the campaign MANUALLY_MODIFIED')
+ok('MANUALLY_MODIFIED' not in e.status,
+   'the internal manual-change flag is not shown in the cockpit status')
 ok(exits(e)[0][1] == b.shares,
    'the EXIT still covers the whole REMAINING position')
 
+clean_chase = line(e, 'chase')[0]
+settle(e, b, clean_chase, card=card)
+ok(e.events[-1]['source'] == 'BOT' and not e.manually_modified,
+   'the next clean BOT position delta clears MANUALLY_MODIFIED')
+
 b.external_sell(95.0, b.shares)              # closed by hand
 settle(e, b, 95.0, card=card)                # above the reload line
-ok(e.campaign_id is None and not e.manually_modified,
-   'a hand full-sell completes the campaign and clears the flag')
+ok(e.campaign_id is None and not e.manually_modified
+   and e.campaign_state == 'FLAT' and e.vantage_src == 'high5'
+   and e.last_exit_price is None,
+   'a hand full-sell resets to EMPTY/Dynamic High5 and clears the flag')
 
 print('— the gear shifts freely, and is logged —')
 e, b, card = fresh(gear=3)
@@ -734,10 +777,11 @@ offline_full_fill = [{'side': 'SELL', 'qty': saved['q'], 'price': 98.5,
 offline_exit = CampaignEngine(T, trading_date=D1, saved=saved)
 offline_exit.poll(snap(flat_b, 105.0, card=card,
                        recent_fills=offline_full_fill))
-ok(offline_exit.vantage_src == 'reload'
-   and near(offline_exit.vantage, 98.5)
-   and offline_exit.events[-1]['source'] == 'EXT',
-   'a complete same-day offline SELL is recovered from actual broker evidence')
+ok(offline_exit.campaign_state == 'FLAT'
+   and offline_exit.vantage_src == 'high5'
+   and offline_exit.last_exit_price is None
+   and offline_exit.events == [],
+   'offline external SELL history does not manufacture a reload or event')
 
 reload_e, reload_b, reload_card = fresh(gear=3)
 settle(reload_e, reload_b, 92.0, card=reload_card)
@@ -871,8 +915,10 @@ e, b, card = fresh(gear=3)
 settle(e, b, 92.0, card=card)
 b.external_sell(97.25, b.shares)
 e.poll(snap(b, 150.0, card=card))
-ok(e.vantage_src == 'reload' and near(e.vantage, 97.25),
-   'an external full sell uses its actual fill, never the live quote')
+ok(e.vantage_src == 'high5' and e.last_exit_price is None
+   and e.events[-1]['source'] == 'EXT'
+   and near(e.events[-1]['price'], 97.25),
+   'an external full sell may record its price but never arms a reload')
 
 e, b, card = fresh(gear=3)
 settle(e, b, 92.0, card=card)
@@ -952,9 +998,9 @@ ok(own_id in cancelled and 'manual-sell' not in cancelled
 ok(e.campaign_id == cid and e.campaign_state == 'PAUSED_MANUAL_ORDER',
    'yielding to manual control does not reset the deployed campaign')
 
-print('— durable reconciliation and gross broker evidence —')
-# A timed-out fill stays UNKNOWN until exact detail arrives, then repairs the
-# existing row instead of creating a duplicate campaign event.
+print('— durable order safety with one-pass position reconciliation —')
+# A timed-out fill stays UNKNOWN. Later exact detail preserves the identity and
+# history, but the ambiguous net movement cannot count as bot convergence.
 e, b, card = fresh(gear=3)
 intent = next(a for a in e.poll(snap(b, 92.0, card=card)) if a[0] == 'place')
 oid = b.place(intent[1], intent[2], intent[3])
@@ -967,12 +1013,18 @@ ok(e.events[-1]['source'] == 'UNKNOWN' and e._pending is not None,
 event_count = len(e.events)
 resolved = snap(b, 92.0, card=card,
                 recent_fills=[b.fills[-1]])
-resolved['fills_correlated'] = True
 resolved['pending_order'] = b.order_detail(oid)
 e.poll(resolved)
-ok(len(e.events) == event_count and e.events[-1]['source'] == 'BOT'
-   and e._pending is None,
-   'delayed exact detail repairs UNKNOWN in place and resolves the pending')
+ok(len(e.events) == event_count and e.events[-1]['source'] == 'UNKNOWN'
+   and e._pending is not None and e._pending['filled_seen'] == 0,
+   'delayed exact detail keeps ambiguous BUY safety without rewriting UNKNOWN')
+b.shares += intent[3]
+safe_resolution = snap(b, 92.0, card=card, recent_fills=[])
+safe_resolution['pending_order'] = b.order_detail(oid)
+e.poll(safe_resolution)
+ok(e._pending is None and e.events[0]['source'] == 'UNKNOWN'
+   and len(e.events) == event_count + 1,
+   'a later exact-backed BUY delta reaches the conservative safe endpoint')
 
 # A transport-ambiguous submission survives persistence and blocks a fresh
 # client id/order after restart.
@@ -987,74 +1039,179 @@ ok(e2._pending and e2._pending['client_order_id'] == 'vcg-ap-timeout'
    and not any(a[0] == 'place' for a in acts),
    'a restored ambiguous submission cannot emit a duplicate placement')
 
-# Exact detail can stay ahead of the OPEN list. A partial remainder proven
-# WORKING by detail must survive that temporary OPEN omission.
+def accepted_deployed_pending(side):
+    """A deployed campaign with one accepted BUY or SELL identity."""
+    e, b, card = fresh(shares=12, avg=90.0, gear=3)
+    e.poll(snap(b, 90.0, card=card))
+    crossed = line(e, 'chase')[0] if side == 'BUY' else line(e, 'exit2')[0]
+    intent = next(a for a in e.poll(snap(b, crossed, card=card))
+                  if a[0] == 'place')
+    oid = b.place(intent[1], intent[2], intent[3])
+    ok(e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid),
+       f'{side} fixture binds its accepted identity')
+    return e, b, card, intent, oid
+
+
+def pending_detail(intent, oid, status='PENDING', filled=0, price=None):
+    terminal = status in ('FILLED', 'CANCELED', 'REJECTED')
+    detail = {
+        'id': oid, 'order_id': oid, 'side': intent[1], 'qty': intent[3],
+        'price': intent[2],
+        'qty_open': 0 if terminal else intent[3] - filled,
+        'filled': filled, 'status': status, 'terminal': terminal, 'mine': True,
+    }
+    if price is not None:
+        detail['actual_fill_price'] = price
+        detail['filled_at'] = D1 + 'T12:05:00'
+    return detail
+
+
+# Exact nonterminal detail is a working order even when OPEN temporarily omits
+# it. The central placement gate also blocks an opposite-side order.
+for pending_side in ('BUY', 'SELL'):
+    e, b, card, intent, oid = accepted_deployed_pending(pending_side)
+    e._pending['ts'] = 0
+    temptation = (line(e, 'exit2')[0] if pending_side == 'BUY'
+                  else line(e, 'chase')[0])
+    working = snap(b, temptation, card=card, recent_fills=[])
+    working['orders'] = []
+    working['pending_order'] = pending_detail(intent, oid)
+    acts = e.poll(working)
+    cancels = [a for a in acts if a[0] == 'cancel']
+    ok(e._pending is not None and not e._pending['unresolved']
+       and e._pending['side'] == pending_side
+       and e._pending['cancelling']
+       and len(cancels) == 1 and cancels[0][1] == oid
+       and not any(a[0] == 'place' for a in acts)
+       and 'fired' not in e.status.lower(),
+       f'exact WORKING {pending_side} omitted from OPEN cancels before the opposite line')
+
+# A persisted UNKNOWN movement cannot become bot progress merely because more
+# same-direction movement happened while a still-WORKING order was offline.
+# Only exact terminal cumulative execution unlocks the restart convergence
+# path tested below.
+for pending_side in ('BUY', 'SELL'):
+    e, b, card, intent, oid = accepted_deployed_pending(pending_side)
+    first = 14 if pending_side == 'BUY' else 10
+    second = 16 if pending_side == 'BUY' else 8
+    b.shares = first
+    working = snap(b, intent[2], card=card, recent_fills=[])
+    working['orders'] = []
+    working['pending_order'] = pending_detail(intent, oid)
+    e.poll(working)
+    ok(e._pending is not None and e._pending['filled_seen'] == 0
+       and e._pending['unproven_seen'] == 2,
+       f'working {pending_side} keeps its first external movement unproven')
+    working_saved = e.to_dict()
+    b.shares = second
+    e = CampaignEngine(T, trading_date=D1, saved=working_saved)
+    working_restart = snap(b, intent[2], card=card, recent_fills=[])
+    working_restart['orders'] = []
+    working_restart['pending_order'] = pending_detail(intent, oid)
+    acts = e.poll(working_restart)
+    ok(e._pending is not None and e._pending['filled_seen'] == 0
+       and e._pending['holdings_seen'] == 0
+       and e._pending['unproven_seen'] == 2
+       and not e._pending.get('terminal_status')
+       and not any(a[0] == 'place' for a in acts),
+       f'restart does not credit offline movement to WORKING {pending_side}')
+
+# If both OPEN and exact lookup are empty/failed, ambiguity is immediate. The
+# old 90-second grace interval was an unsafe replacement window.
+for pending_side in ('BUY', 'SELL'):
+    e, b, card, intent, oid = accepted_deployed_pending(pending_side)
+    placed_at = e._pending['ts']
+    temptation = (line(e, 'exit2')[0] if pending_side == 'BUY'
+                  else line(e, 'chase')[0])
+    unknown = snap(b, temptation, card=card, recent_fills=[])
+    unknown['orders'] = []
+    unknown['pending_order'] = None
+    unknown['pending_lookup_error'] = True
+    acts = e.poll(unknown)
+    ok(e._pending is not None and e._pending['unresolved']
+       and e._pending['ts'] == placed_at
+       and not any(a[0] == 'place' for a in acts)
+       and 'fired' not in e.status.lower(),
+       f'unknown {pending_side} lookup pauses immediately without replacing it')
+
+# Terminal cumulative execution can lead holdings by more than one poll. Keep
+# the identity through zero and partial catch-up, blocking both a duplicate and
+# an opposite-side order, then resolve at the broker position endpoint.
+for pending_side in ('BUY', 'SELL'):
+    e, b, card, intent, oid = accepted_deployed_pending(pending_side)
+    base_shares, base_avg = b.shares, b.avg
+    total = intent[3]
+    partial = min(4, total - 1)
+    actual = intent[2]
+    terminal = pending_detail(intent, oid, 'FILLED', total, actual)
+
+    temptation = (line(e, 'exit2')[0] if pending_side == 'BUY'
+                  else line(e, 'chase')[0])
+    zero_progress = snap(b, temptation, card=card, recent_fills=[])
+    zero_progress['orders'] = []
+    zero_progress['pending_order'] = terminal
+    acts = e.poll(zero_progress)
+    ok(e._pending is not None and e._pending['terminal_filled'] == total
+       and e._pending['holdings_seen'] == 0
+       and not any(a[0] == 'place' for a in acts),
+       f'terminal {pending_side} stays guarded at zero holdings catch-up')
+
+    if pending_side == 'BUY':
+        b.shares = base_shares + partial
+        b.avg = (base_avg * base_shares + actual * partial) / b.shares
+        temptation = 10_000.0             # tempt an opposite EXIT
+    else:
+        b.shares = base_shares - partial
+        temptation = 1.0                  # tempt an opposite CHASE
+    partial_progress = snap(b, temptation, card=card, recent_fills=[])
+    partial_progress['orders'] = []
+    partial_progress['pending_order'] = terminal
+    acts = e.poll(partial_progress)
+    ok(e._pending is not None and e._pending['filled_seen'] == partial
+       and e._pending['holdings_seen'] == partial
+       and not any(a[0] == 'place' for a in acts),
+       f'terminal {pending_side} stays guarded through partial holdings catch-up')
+
+    if pending_side == 'BUY':
+        b.shares = base_shares + total
+        b.avg = (base_avg * base_shares + actual * total) / b.shares
+        final_price = b.avg
+    else:
+        b.shares, b.avg = base_shares - total, 0.0
+        final_price = 10_000.0
+    caught_up = snap(b, final_price, card=card, recent_fills=[])
+    caught_up['orders'] = []
+    caught_up['pending_order'] = terminal
+    e.poll(caught_up)
+    ok(e._pending is None,
+       f'terminal {pending_side} resolves only after holdings fully catch up')
+
+# Replaying the same broker acknowledgement must be side-effect free. This is
+# important because exact detail can be observed on every pending poll.
+for pending_side in ('BUY', 'SELL'):
+    e, b, card, intent, oid = accepted_deployed_pending(pending_side)
+    e._pending['cancelling'] = True
+    e._pending['ts'] = 123.0
+    e.dirty = False
+    before = dict(e._pending)
+    ok(e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+       and e._pending == before and not e.dirty,
+       f'repeated identical {pending_side} acknowledgement is a no-op')
+
+# A pre-bound idempotency key survives the first definite acknowledgement.
 e, b, card = fresh(gear=3)
 intent = next(a for a in e.poll(snap(b, 92.0, card=card)) if a[0] == 'place')
-oid = b.place(intent[1], intent[2], intent[3])
-e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
-b.partial_fill(oid, 3, price=91.9)
-lagged_open = snap(b, 92.0, card=card, recent_fills=[b.fills[-1]])
-lagged_open['orders'] = []
-lagged_open['pending_order'] = b.order_detail(oid)
-e.poll(lagged_open)
-followup = snap(b, 92.0, card=card, recent_fills=[])
-followup['orders'] = []
-followup['pending_order'] = b.order_detail(oid)
-acts = e.poll(followup)
-ok(e._pending is not None and e._pending['filled_seen'] == 3
-   and not any(a[0] == 'place' for a in acts),
-   'exact WORKING detail preserves a partial remainder omitted from OPEN')
+ok(e.note_order_submitted(intent[1], intent[2], intent[3], 'client-bind')
+   and e.note_order_accepted(intent[1], intent[2], intent[3],
+                             order_id='broker-bind')
+   and e._pending['client_order_id'] == 'client-bind'
+   and e._pending['order_id'] == 'broker-bind'
+   and e._pending['acknowledged'] and not e._pending['unresolved'],
+   'first acceptance adds broker identity without losing the pre-bound client id')
 
-# Exact cumulative detail can lead the holdings endpoint. Attribute only the
-# position movement visible in each snapshot and retain the remainder.
-e, b, card = fresh(gear=3)
-intent = next(a for a in e.poll(snap(b, 92.0, card=card)) if a[0] == 'place')
-oid = b.place(intent[1], intent[2], intent[3])
-e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
-b.orders.pop(oid)
-full_qty = intent[3]
-first_qty = min(4, full_qty - 1)
-actual_buy = 91.75
-buy_pending_saved = e.to_dict()
-e = CampaignEngine(T, trading_date=D1, saved=buy_pending_saved)
-buy_detail = {
-    'id': oid, 'order_id': oid, 'side': 'BUY', 'qty': full_qty,
-    'qty_open': 0, 'filled': full_qty, 'status': 'FILLED',
-    'terminal': True, 'mine': True, 'actual_fill_price': actual_buy,
-    'filled_at': D1 + 'T12:05:00',
-}
-buy_fill = {
-    'side': 'BUY', 'qty': full_qty, 'price': actual_buy,
-    'actual_fill_price': actual_buy, 'order_id': oid, 'mine': True,
-    'filled_at': D1 + 'T12:05:00',
-}
-b.shares, b.avg = first_qty, actual_buy
-buy_lag = snap(b, 92.0, card=card, recent_fills=[buy_fill])
-buy_lag['pending_order'] = buy_detail
-e.poll(buy_lag)
-ok(e.events[-1]['source'] == 'BOT'
-   and e.events[-1]['qty'] == first_qty
-   and e._pending is not None
-   and e._pending['filled_seen'] == first_qty
-   and 'external/net -' not in str(e.events[-1].get('note') or ''),
-   'ahead-of-holdings BUY detail is capped at the observed delta')
-buy_lag_saved = e.to_dict()
-e = CampaignEngine(T, trading_date=D1, saved=buy_lag_saved)
-b.shares, b.avg = full_qty, actual_buy
-buy_caught_up = snap(b, 92.0, card=card, recent_fills=[])
-buy_caught_up['pending_order'] = buy_detail
-e.poll(buy_caught_up)
-ok(e._pending is None
-   and sum(x['qty'] for x in e.events) == full_qty
-   and all(x['source'] == 'BOT' for x in e.events),
-   'the retained BUY identity attributes catch-up shares even across restart',
-   str({'pending': e._pending, 'events': e.events,
-        'state': e.campaign_state, 'shares': e._prev_shares}))
-
-# The delayed-UNKNOWN path obeys the same monotonic cap. In particular, an
-# ahead cumulative SELL must survive until zero holdings and preserve the
-# actual final fill as the reload anchor.
+# A holdings delta accepted without evidence remains UNKNOWN permanently.
+# Later detail resolves the order identity only; a subsequent full sell is a
+# new external delta and resets to EMPTY without a reload.
 e, b, card = fresh(shares=2, avg=90.0, gear=3)
 e.poll(snap(b, 90.0, card=card))
 exit_p, _exit_q = line(e, 'exit2')
@@ -1065,9 +1222,10 @@ e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
 e.note_order_unresolved(intent[1], intent[2], intent[3], 'detail lag')
 b.shares = 1
 e.poll(snap(b, exit_p, card=card, can_trade=False, recent_fills=[]))
-ok(e.events[-1]['source'] == 'UNKNOWN'
-   and e._pending.get('unresolved_event_index') is not None,
-   'lagging SELL detail first leaves one observed share change UNKNOWN')
+ok(e.events[-1]['source'] == 'UNKNOWN' and e._pending is not None,
+   'a SELL delta without immediate evidence is accepted once as UNKNOWN')
+unknown_event = dict(e.events[-1])
+event_count = len(e.events)
 actual_sell = exit_p + 0.25
 sell_detail = {
     'id': oid, 'order_id': oid, 'side': 'SELL', 'qty': 2,
@@ -1084,26 +1242,234 @@ sell_proof = snap(b, exit_p, card=card, can_trade=False,
                   recent_fills=[sell_fill])
 sell_proof['pending_order'] = sell_detail
 e.poll(sell_proof)
-ok(e.events[-1]['source'] == 'BOT'
-   and e.events[-1]['qty'] == -1
-   and e._pending is not None and e._pending['filled_seen'] == 1
-   and 'external/net -' not in str(e.events[-1].get('note') or ''),
-   'delayed cumulative SELL proof repairs only the observed UNKNOWN quantity')
+ok(len(e.events) == event_count and e.events[-1] == unknown_event
+   and e._pending is not None and e._pending['terminal_filled'] == 2
+   and e._pending['holdings_seen'] == 0
+   and e._pending['unproven_seen'] == 1,
+   'later positive SELL detail preserves UNKNOWN history and waits for holdings')
 b.shares, b.avg = 0, 0.0
 sell_caught_up = snap(b, exit_p, card=card, can_trade=False,
                       recent_fills=[])
 sell_caught_up['pending_order'] = sell_detail
 e.poll(sell_caught_up)
 ok(e._pending is None
-   and [x['qty'] for x in e.events[-2:]] == [-1, -1]
-   and all(x['source'] == 'BOT' for x in e.events[-2:])
-   and near(e.last_exit_price, actual_sell)
-   and near(e.vantage, actual_sell)
-   and e.campaign_state == 'RELOAD_ARMED',
-   'SELL ownership and the actual reload anchor survive until holdings reach zero')
+   and e.events[-1]['source'] == 'BOT' and e.events[-1]['qty'] == -1
+   and e.last_exit_price is None and e.vantage_src == 'high5'
+   and e.campaign_state == 'FLAT',
+   'later catch-up closes EMPTY without a clean reload after UNKNOWN history')
 
-# Terminal zero-fill detail is exclusion proof: the bot did not cause the
-# earlier same-side UNKNOWN movement, so repair it to EXT before clearing.
+# P1 regression: an evidence-less external/UNKNOWN trim cannot be retroactively
+# swallowed by a larger terminal bot fill. Positive terminal execution retains
+# its identity until all six shares are reflected; the ambiguous campaign can
+# never arm a clean bot reload, even if its eventual final exit is proven BOT.
+e, b, card = fresh(shares=12, avg=90.0, gear=3, tiers=(1, 0, 1))
+e.poll(snap(b, 90.0, card=card))
+exit_p, exit_q = line(e, 'exit1')
+ok(exit_q == 6, 'the ambiguity regression starts with an accepted EXIT 6')
+intent = next(a for a in e.poll(snap(b, exit_p, card=card))
+              if a[0] == 'place')
+oid = 'ambiguous-exit-6'
+e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+
+b.shares = 10
+unknown_delta = snap(b, 90.0, card=card, recent_fills=[])
+unknown_delta['orders'] = []
+acts = e.poll(unknown_delta)
+ok(e.events[-1]['source'] == 'UNKNOWN' and e.events[-1]['qty'] == -2
+   and e._pending is not None and e._pending['holdings_seen'] == 0
+   and e._pending['unproven_seen'] == 2
+   and e.campaign_ambiguous and not any(a[0] == 'place' for a in acts),
+   'evidence-less SELL 2 stays immutable UNKNOWN and taints the campaign')
+unknown_event = dict(e.events[-1])
+event_count = len(e.events)
+
+terminal_six = pending_detail(intent, oid, 'FILLED', 6, exit_p + 0.25)
+terminal_lag = snap(b, 1.0, card=card, recent_fills=[])
+terminal_lag['orders'] = []
+terminal_lag['pending_order'] = terminal_six
+acts = e.poll(terminal_lag)
+ok(len(e.events) == event_count and e.events[-1] == unknown_event
+   and e._pending is not None and e._pending['terminal_filled'] == 6
+   and e._pending['filled_seen'] == 0
+   and e._pending['unproven_seen'] == 2
+   and not any(a[0] in ('place', 'cancel') for a in acts),
+   'FILLED 6 with holdings still at 10 retains identity and blocks temptation')
+
+b.shares = 6
+caught_up = snap(b, 90.0, card=card, recent_fills=[])
+caught_up['orders'] = []
+caught_up['pending_order'] = terminal_six
+acts = e.poll(caught_up)
+ok(e._pending is not None and e._pending['filled_seen'] == 4
+   and e._pending['unproven_seen'] == 2
+   and not any(a[0] in ('place', 'cancel') for a in acts)
+   and e.campaign_ambiguous
+   and any(row == unknown_event for row in e.events),
+   'shares 6 proves only BOT 4; UNKNOWN 2 cannot complete terminal convergence')
+
+guarded_saved = e.to_dict()
+e = CampaignEngine(T, trading_date=D1, saved=guarded_saved)
+restart_guard = snap(b, 1.0, card=card, recent_fills=[])
+restart_guard['orders'] = []
+restart_guard['pending_order'] = terminal_six
+acts = e.poll(restart_guard)
+ok(e._pending is not None and e._pending['filled_seen'] == 4
+   and e._pending['holdings_seen'] == 4
+   and e._pending['unproven_seen'] == 2
+   and not any(a[0] in ('place', 'cancel') for a in acts),
+   'restart cannot convert persisted UNKNOWN net movement into bot convergence')
+
+b.shares = 4
+safe_endpoint = snap(b, 90.0, card=card, recent_fills=[])
+safe_endpoint['orders'] = []
+safe_endpoint['pending_order'] = terminal_six
+e.poll(safe_endpoint)
+ok(e._pending is None and e.campaign_ambiguous
+   and any(row == unknown_event for row in e.events),
+   'shares 4 safely reflects external 2 plus the complete BOT EXIT 6')
+
+# If that same terminal SELL catches up while the process is down, the saved
+# broker quantity is a clean boundary after the earlier UNKNOWN movement.  A
+# restart may adopt the later nonzero endpoint without inventing/relabeling a
+# fill, and must not remain PAUSED_RECONCILE forever.
+e, b, card = fresh(shares=12, avg=90.0, gear=3, tiers=(1, 0, 1))
+e.poll(snap(b, 90.0, card=card))
+exit_p, _exit_q = line(e, 'exit1')
+intent = next(a for a in e.poll(snap(b, exit_p, card=card))
+              if a[0] == 'place')
+oid = 'offline-catchup-sell-6'
+e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+b.shares = 10
+unknown_delta = snap(b, 90.0, card=card, recent_fills=[])
+unknown_delta['orders'] = []
+e.poll(unknown_delta)
+terminal_six = pending_detail(intent, oid, 'FILLED', 6, exit_p + 0.25)
+terminal_lag = snap(b, 90.0, card=card, recent_fills=[])
+terminal_lag['orders'] = []
+terminal_lag['pending_order'] = terminal_six
+e.poll(terminal_lag)
+# Four of the six proven bot shares reach holdings before shutdown; the final
+# two catch up only while the process is down.
+b.shares = 6
+partial_sell = snap(b, 90.0, card=card, recent_fills=[])
+partial_sell['orders'] = []
+partial_sell['pending_order'] = terminal_six
+e.poll(partial_sell)
+offline_sell_saved = e.to_dict()
+offline_sell_events = list(e.events)
+b.shares = 4
+e = CampaignEngine(T, trading_date=D1, saved=offline_sell_saved)
+offline_sell_restart = snap(b, 90.0, card=card, recent_fills=[])
+offline_sell_restart['orders'] = []
+offline_sell_restart['pending_order'] = terminal_six
+acts = e.poll(offline_sell_restart)
+ok(e._pending is None and e._prev_shares == 4
+   and e.events == offline_sell_events and e.campaign_ambiguous
+   and e.last_exit_price is None and e.vantage_src != 'reload'
+   and not any(a[0] in ('place', 'cancel') for a in acts),
+   'restart adopts completed offline SELL catch-up at a nonzero endpoint')
+
+saved_ambiguous = e.to_dict()
+e = CampaignEngine(T, trading_date=D1, saved=saved_ambiguous)
+e.poll(snap(b, 90.0, card=card, recent_fills=[]))
+ok(e.campaign_ambiguous,
+   'the no-reload ambiguity guard survives a restart with the campaign')
+settle(e, b, 10_000.0, card=card)
+ok(b.shares == 0 and e.campaign_state == 'FLAT'
+   and e.vantage_src == 'high5' and e.last_exit_price is None,
+   'a later clean BOT close cannot reload a campaign tainted by ambiguity')
+
+# Symmetric BUY case: an UNKNOWN external BUY 2 cannot stand in for any part
+# of the accepted CHASE 6. Four proven bot shares still leave the identity
+# guarded; the final two exact-detail-backed shares resolve it safely.
+e, b, card = fresh(shares=12, avg=90.0, gear=1)
+e.poll(snap(b, 90.0, card=card))
+chase_p, chase_q = line(e, 'chase')
+ok(chase_q == 6, 'the symmetric ambiguity regression starts with CHASE 6')
+intent = next(a for a in e.poll(snap(b, chase_p, card=card))
+              if a[0] == 'place')
+oid = 'ambiguous-buy-6'
+e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+
+b.shares, b.avg = 14, 90.0
+unknown_delta = snap(b, 90.0, card=card, recent_fills=[])
+unknown_delta['orders'] = []
+e.poll(unknown_delta)
+ok(e.events[-1]['source'] == 'UNKNOWN' and e.events[-1]['qty'] == 2
+   and e._pending is not None and e._pending['filled_seen'] == 0
+   and e._pending['unproven_seen'] == 2 and e.campaign_ambiguous,
+   'evidence-less BUY 2 is unproven and cannot count toward CHASE 6')
+
+terminal_buy_six = pending_detail(intent, oid, 'FILLED', 6, chase_p)
+terminal_lag = snap(b, 10_000.0, card=card, recent_fills=[])
+terminal_lag['orders'] = []
+terminal_lag['pending_order'] = terminal_buy_six
+acts = e.poll(terminal_lag)
+ok(e._pending is not None and not any(a[0] in ('place', 'cancel') for a in acts),
+   'terminal BUY remains guarded before any bot-proven holdings catch-up')
+
+b.shares = 18
+b.avg = (90.0 * 14 + chase_p * 4) / 18
+partial_buy = snap(b, 10_000.0, card=card, recent_fills=[])
+partial_buy['orders'] = []
+partial_buy['pending_order'] = terminal_buy_six
+acts = e.poll(partial_buy)
+ok(e._pending is not None and e._pending['filled_seen'] == 4
+   and e._pending['unproven_seen'] == 2
+   and not any(a[0] in ('place', 'cancel') for a in acts),
+   'BUY shares 18 proves only BOT 4 and still blocks the opposite EXIT')
+
+b.shares = 20
+b.avg = (b.avg * 18 + chase_p * 2) / 20
+safe_buy_endpoint = snap(b, 90.0, card=card, recent_fills=[])
+safe_buy_endpoint['orders'] = []
+safe_buy_endpoint['pending_order'] = terminal_buy_six
+e.poll(safe_buy_endpoint)
+ok(e._pending is None and e.campaign_ambiguous
+   and any(row['source'] == 'UNKNOWN' and row['qty'] == 2
+           for row in e.events),
+   'BUY shares 20 safely reflects external 2 plus complete BOT CHASE 6')
+
+# Symmetric restart boundary: the earlier UNKNOWN BUY is already inside saved
+# shares=14.  When terminal CHASE 6 reaches shares=20 while offline, the first
+# broker snapshot can release lifecycle safety without rewriting campaign log.
+e, b, card = fresh(shares=12, avg=90.0, gear=1)
+e.poll(snap(b, 90.0, card=card))
+chase_p, _chase_q = line(e, 'chase')
+intent = next(a for a in e.poll(snap(b, chase_p, card=card))
+              if a[0] == 'place')
+oid = 'offline-catchup-buy-6'
+e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+b.shares, b.avg = 14, 90.0
+unknown_delta = snap(b, 90.0, card=card, recent_fills=[])
+unknown_delta['orders'] = []
+e.poll(unknown_delta)
+terminal_buy_six = pending_detail(intent, oid, 'FILLED', 6, chase_p)
+terminal_lag = snap(b, 90.0, card=card, recent_fills=[])
+terminal_lag['orders'] = []
+terminal_lag['pending_order'] = terminal_buy_six
+e.poll(terminal_lag)
+# Persist after four proven bot shares have caught up; the last two arrive
+# before the next process starts.
+b.shares, b.avg = 18, 89.0
+partial_buy = snap(b, 90.0, card=card, recent_fills=[])
+partial_buy['orders'] = []
+partial_buy['pending_order'] = terminal_buy_six
+e.poll(partial_buy)
+offline_buy_saved = e.to_dict()
+offline_buy_events = list(e.events)
+b.shares, b.avg = 20, 89.0
+e = CampaignEngine(T, trading_date=D1, saved=offline_buy_saved)
+offline_buy_restart = snap(b, 90.0, card=card, recent_fills=[])
+offline_buy_restart['orders'] = []
+offline_buy_restart['pending_order'] = terminal_buy_six
+acts = e.poll(offline_buy_restart)
+ok(e._pending is None and e._prev_shares == 20
+   and e.events == offline_buy_events and e.campaign_ambiguous
+   and not any(a[0] in ('place', 'cancel') for a in acts),
+   'restart adopts completed offline BUY catch-up without rewriting UNKNOWN')
+
+# Delayed zero-fill terminal detail likewise never rewrites UNKNOWN.
 for terminal_status in ('CANCELED', 'REJECTED'):
     e, b, card = fresh(shares=2, avg=90.0, gear=3)
     e.poll(snap(b, 90.0, card=card))
@@ -1125,12 +1491,34 @@ for terminal_status in ('CANCELED', 'REJECTED'):
                          recent_fills=[])
     terminal_snap['pending_order'] = zero_detail
     e.poll(terminal_snap)
-    ok(len(e.events) == event_count and e.events[-1]['source'] == 'EXT'
-       and terminal_status.lower() in e.events[-1].get('note', '')
+    ok(len(e.events) == event_count and e.events[-1]['source'] == 'UNKNOWN'
        and e._pending is None,
-       f'exact {terminal_status} zero-fill detail repairs UNKNOWN to EXT')
+       f'delayed {terminal_status} zero-fill resolves safety without rewrite')
 
-# Exact matching detail turns an across-restart LOAD into a proven BOT event.
+# The same zero-fill exclusion present with the holdings delta is immediate
+# evidence, so that one-pass reconciliation can label it EXT straight away.
+for terminal_status in ('CANCELED', 'REJECTED'):
+    e, b, card = fresh(shares=2, avg=90.0, gear=3)
+    e.poll(snap(b, 90.0, card=card))
+    exit_p, _exit_q = line(e, 'exit2')
+    intent = next(a for a in e.poll(snap(b, exit_p, card=card))
+                  if a[0] == 'place')
+    oid = f'immediate-{terminal_status.lower()}'
+    e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
+    b.shares = 1
+    zero_detail = {
+        'id': oid, 'order_id': oid, 'side': 'SELL', 'qty': 2,
+        'qty_open': 0, 'filled': 0, 'status': terminal_status,
+        'terminal': True, 'mine': True,
+    }
+    immediate = snap(b, exit_p, card=card, can_trade=False,
+                     recent_fills=[])
+    immediate['pending_order'] = zero_detail
+    e.poll(immediate)
+    ok(e.events[-1]['source'] == 'EXT' and e._pending is None,
+       f'immediate {terminal_status} zero-fill classifies the delta EXT')
+
+# Startup adopts broker truth instead of reconstructing a completed LOAD.
 e, b, card = fresh(gear=3)
 intent = next(a for a in e.poll(snap(b, 92.0, card=card)) if a[0] == 'place')
 oid = b.place(intent[1], intent[2], intent[3])
@@ -1139,48 +1527,29 @@ pending_saved = e.to_dict()
 b.partial_fill(oid, intent[3], price=91.75)
 e2 = CampaignEngine(T, trading_date=D1, saved=pending_saved)
 restart_snap = snap(b, 92.0, card=card, recent_fills=[b.fills[-1]])
-restart_snap['fills_correlated'] = True
 restart_snap['pending_order'] = b.order_detail(oid)
 e2.poll(restart_snap)
-ok(len(e2.events) == 1 and e2.events[0]['source'] == 'BOT'
-   and e2.events[0]['kind'] == 'LOAD' and e2._pending is None,
-   'exact pending evidence attributes a LOAD completed across restart')
+ok(e2.events == [] and e2._pending is None
+   and e2._prev_shares == b.shares and near(e2._prev_avg, b.avg)
+   and e2.campaign_id is not None and e2.manually_modified,
+   'first snapshot adopts completed broker holdings without fill reconstruction')
 
-# Both gross executions are logged even when the final share count is unchanged.
-e, b, card = fresh(gear=3)
-settle(e, b, 92.0, card=card)
-before_events, before_fills = len(e.events), len(b.fills)
-b.external_buy(80.0, 2)
-b.external_sell(100.0, 2)
-roundtrip = snap(b, 90.0, card=card,
-                 recent_fills=b.fills[before_fills:])
-roundtrip['fills_correlated'] = True
-e.poll(roundtrip)
-ok(len(e.events) == before_events + 2
-   and [x['qty'] for x in e.events[-2:]] == [2, -2]
-   and all(x['source'] == 'EXT' for x in e.events[-2:]),
-   'time-correlated BUY+SELL evidence records a net-zero manual round trip')
-
-# Opposing bot/app executions are replayed gross instead of collapsing into an
-# incorrectly sourced net delta.
-e, b, card = fresh(gear=3)
-settle(e, b, 92.0, card=card)
-chase_p, chase_q = line(e, 'chase')
-intent = next(a for a in e.poll(snap(b, chase_p, card=card))
+e, b, card = fresh(shares=6, avg=90.0, gear=3)
+e.poll(snap(b, 90.0, card=card))
+exit_p, _exit_q = line(e, 'exit2')
+intent = next(a for a in e.poll(snap(b, exit_p, card=card))
               if a[0] == 'place')
 oid = b.place(intent[1], intent[2], intent[3])
 e.note_order_accepted(intent[1], intent[2], intent[3], order_id=oid)
-before_fills = len(b.fills)
-b.partial_fill(oid, chase_q)
-b.external_sell(95.0, 2)
-opposed = snap(b, chase_p, card=card,
-               recent_fills=b.fills[before_fills:])
-opposed['fills_correlated'] = True
-opposed['pending_order'] = b.order_detail(oid)
-e.poll(opposed)
-ok([x['source'] for x in e.events[-2:]] == ['BOT', 'EXT']
-   and [x['qty'] for x in e.events[-2:]] == [chase_q, -2],
-   'opposing bot BUY and app SELL keep their separate quantities and sources')
+pending_saved = e.to_dict()
+b.partial_fill(oid, intent[3], price=exit_p + 0.25)
+e2 = CampaignEngine(T, trading_date=D1, saved=pending_saved)
+restart_snap = snap(b, 200.0, card=card, recent_fills=[b.fills[-1]])
+restart_snap['pending_order'] = b.order_detail(oid)
+e2.poll(restart_snap)
+ok(e2.events == [] and e2._pending is None and e2._prev_shares == 0
+   and e2.campaign_state == 'FLAT' and e2.last_exit_price is None,
+   'first snapshot adopts a completed SELL as EMPTY without an invented event or reload')
 
 # OPEN absence alone never confirms a cancel; exact CANCELED does.
 e, b, card = fresh(gear=3)
@@ -1200,6 +1569,11 @@ ok(e._pending is None,
    'exact CANCELED detail is required before the pending is released')
 
 print('— missing reserve data is not permission to BUY —')
+wording_e, wording_b, wording_card = fresh(gear=3)
+wording_e.poll(snap(wording_b, 95.0, card=wording_card, high5=None,
+                    prev_close=None, highs=[]))
+ok(wording_e.status.startswith('empty —') and 'flat' not in wording_e.status,
+   'cockpit-facing no-position wording says empty, not flat')
 e, b, card = fresh(gear=3, cash=None)
 acts = e.poll(snap(b, 92.0, card=card))
 ok(not any(a[0] == 'place' for a in acts)

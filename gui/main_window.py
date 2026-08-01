@@ -33,10 +33,15 @@ _STRATEGY_PREF_KEYS = (
 
 
 def card_gap_order_key(row):
-    """Global card order: greatest actionable gap first, unknowns last."""
+    """DEPLOYED first by descending P&L gap, then EMPTY by ascending gap."""
     gap = getattr(row, '_gap', None)
-    return (-gap if gap is not None else float('inf'),
-            stock_sort_key(row.ticker))
+    deployed = bool(getattr(row, 'deployed', False))
+    group = 0 if deployed else 1
+    if gap is None:
+        order_gap = float('inf')
+    else:
+        order_gap = -gap if deployed else gap
+    return group, order_gap, stock_sort_key(row.ticker)
 
 
 def strategy_preferences(state):
@@ -477,9 +482,8 @@ class App:
         empty.sort(key=lambda p: self._vol_order_key(
             p['ticker'], self._volatility.get(p['ticker'])))
 
-        # One continuous 2-column grid — no section headers or boundary. The
-        # pre-live fallback starts with deployed then flat; a live refresh puts
-        # every card into one global actionable-gap order.
+        # One continuous 2-column grid — no section headers or boundary. Cards
+        # stay grouped by position state: DEPLOYED first, EMPTY second.
         box = tk.Frame(self.content_frame)
         box.pack(fill='both', expand=True, padx=2, pady=2)
         box.grid_columnconfigure(0, weight=1, uniform='col')
@@ -517,11 +521,12 @@ class App:
                 stock_sort_key(ticker))
 
     def _reorder_cards(self):
-        """Re-grid every card in one global descending actionable-gap order.
+        """Group and re-grid cards using each state-specific gap direction.
 
-        For a deployed card the gap is price vs the average cost, so the ones
-        closest to an exit rise. For a flat card it is LOAD vs current, so the
-        bait closest to being caught rises. State does not create subgroups."""
+        DEPLOYED cards use current-vs-average P&L, descending. EMPTY cards use
+        current-vs-LOAD distance, ascending, so a price already below LOAD
+        (negative) appears before one that is still above it.
+        """
         rows = sorted(self.deployed_rows + self.empty_rows,
                       key=card_gap_order_key)
         self._grid_all_cards(rows)
@@ -529,7 +534,7 @@ class App:
     # ── Autopilot window (big card button) ────────────────────────────────────
 
     def _open_autopilot(self, ticker):
-        """The card's V-COMMANDOS button: start watching the stock (bare WATCH
+        """The card's AUTOPILOT button: start watching the stock (bare WATCH
         mode — polling only, no orders) and pop its campaign cockpit.
         Reuses an already-open window instead of stacking duplicates."""
         if not self._auto:
@@ -776,6 +781,68 @@ class App:
                 pos['shares'] = 0
                 pos['avg_cost'] = 0.0
                 pos['cost_basis'] = 0.0
+
+    def _apply_autopilot_position(self, ticker, shares, avg_cost):
+        """Apply one watcher position transition without a network refresh.
+
+        The autopilot poll already read this ticker's holdings. When that
+        changes the structural card type, update only its portfolio record and
+        cached account item, rebuild the local card widgets, and paint them
+        from the market data already in memory. Passing ``account=None`` is
+        intentional: an older full-account snapshot must not undo this fresher
+        per-ticker observation.
+        """
+        try:
+            qty = max(0, int(round(float(shares or 0))))
+        except (TypeError, ValueError):
+            return False
+        try:
+            avg = max(0.0, float(avg_cost or 0.0))
+        except (TypeError, ValueError):
+            avg = 0.0
+
+        pos = next((p for p in self.positions
+                    if p.get('ticker') == ticker), None)
+        if pos is None:
+            return False
+        deployed = qty > 0
+        was_deployed = bool(pos.get('is_deployed'))
+        if deployed == was_deployed:
+            return False
+
+        pos['is_deployed'] = deployed
+        pos['shares'] = qty if deployed else 0
+        pos['avg_cost'] = avg if deployed else 0.0
+        pos['cost_basis'] = qty * avg if deployed else 0.0
+        if deployed:
+            pos['exit_tier'] = DEFAULT_EXIT_TIER
+
+        # Keep later cached re-application and the army banner aligned with
+        # this fresher per-ticker broker observation while preserving cash and
+        # every unrelated holding from the last full account snapshot.
+        if isinstance(self._last_account, dict):
+            account = dict(self._last_account)
+            items = [dict(item) for item in
+                     (self._last_account.get('items') or [])]
+            found = next((item for item in items
+                          if item.get('ticker') == ticker), None)
+            if deployed:
+                if found is None:
+                    found = {'ticker': ticker}
+                    items.append(found)
+                found['shares'] = qty
+                found['avg'] = avg
+            else:
+                items = [item for item in items
+                         if item.get('ticker') != ticker]
+            account['items'] = items
+            self._last_account = account
+
+        self._rebuild_sections()
+        self._apply_live(
+            dict(self._last_data or {}), self._fx_rate, self._fx_avg_3m,
+            account=None, open_orders=None, quiet=True)
+        return True
 
     def _apply_live(self, data, fx_rate, fx_avg=None, account=None,
                     open_orders=None, quiet=False):

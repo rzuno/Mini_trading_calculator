@@ -34,9 +34,9 @@ VANTAGE — where the LOAD hangs from (manual Appendix A.4/A.5)
                      fifth session is live, so a peak made this morning lifts
                      the LOAD line the moment it happens.
     same session
-    after a full EXIT the actual final sell fill, with the LOAD a flat -3%
-                     under it. This session only; the two entry systems are
-                     never active at once.
+    after an immediately proven BOT full EXIT, its actual final sell fill,
+                     with the LOAD 3% under it. Manual, mixed, delayed, or
+                     price-less exits reset to Dynamic High5 instead.
     manual           a day the commander picked off the 5-day chart; frozen
                      until released.
 
@@ -72,7 +72,8 @@ _SAVE_FIELDS = ('campaign_id', 'campaign_state', 'vantage', 'vantage_src',
                 'tier_done', 'trading_date', 'chase_count', 'max_qty',
                 'max_cost', 'campaign_low', 'campaign_start',
                 'campaign_vantage', 'load_price', 'last_exit_date',
-                'last_exit_price', 'manually_modified', 'events')
+                'last_exit_price', 'manually_modified',
+                'campaign_ambiguous', 'events')
 
 _LEGACY_NON_TRADE_EVENTS = {
     'ADOPT', 'ADOPT_POSITION', 'GEAR', 'TIER', 'TIERS', 'HOLD'
@@ -162,6 +163,7 @@ class CampaignEngine:
         self.max_cost = 0.0              # peak cash deployed, own currency
         self.campaign_low = None
         self.manually_modified = False
+        self.campaign_ambiguous = False
 
         self.buy_state = 'OK'            # OK | EXHAUSTED | UNAVAILABLE
         self.crossed = {'BUY': None, 'SELL': None}
@@ -267,14 +269,36 @@ class CampaignEngine:
             filled_seen = max(0, int(value.get('filled_seen') or 0))
         except (TypeError, ValueError):
             filled_seen = 0
+        unknown_position_accepted = bool(
+            value.get('unknown_position_accepted'))
+        try:
+            unproven_seen = max(0, int(value.get('unproven_seen') or 0))
+        except (TypeError, ValueError):
+            unproven_seen = 0
+        try:
+            holdings_seen = max(
+                filled_seen, int(value.get('holdings_seen') or 0))
+        except (TypeError, ValueError):
+            holdings_seen = filled_seen
+        if unknown_position_accepted or unproven_seen:
+            # Older state may have counted an UNKNOWN net move as bot
+            # convergence. Never restore that unsafe inference.
+            holdings_seen = filled_seen
         try:
             submitted_at = float(value.get('submitted_at') or ts)
         except (TypeError, ValueError):
             submitted_at = ts
         try:
-            unresolved_event_qty = int(value.get('unresolved_event_qty') or 0)
+            terminal_filled = max(
+                0, int(round(float(value.get('terminal_filled') or 0))))
         except (TypeError, ValueError):
-            unresolved_event_qty = 0
+            terminal_filled = 0
+        try:
+            terminal_fill_price = float(value.get('terminal_fill_price'))
+            if terminal_fill_price <= 0:
+                terminal_fill_price = None
+        except (TypeError, ValueError):
+            terminal_fill_price = None
         tiers = []
         for tier in value.get('tiers') or []:
             try:
@@ -289,17 +313,29 @@ class CampaignEngine:
             'tiers': tiers, 'ts': ts,
             'order_id': order_id, 'client_order_id': client_order_id,
             'accepted': accepted,
+            # ``acknowledged`` distinguishes the pre-POST client-id binding
+            # from the broker's first definite acceptance.  It also makes a
+            # repeated identical acceptance callback a true no-op.
+            'acknowledged': bool(value.get('acknowledged', accepted)),
             'filled_seen': min(qty, filled_seen),
+            # Bot-proven quantity already reflected by holdings. Unproven net
+            # movement is deliberately separate and cannot release safety.
+            'holdings_seen': min(qty, holdings_seen),
+            'unknown_position_accepted': unknown_position_accepted,
+            'unproven_seen': min(qty, unproven_seen),
             'step_counted': bool(value.get('step_counted')),
             'cancelling': bool(value.get('cancelling')),
-            # ``unresolved`` means a request may have reached Toss, or a
-            # holdings change outran its execution detail.  It deliberately
-            # survives restarts: forgetting it could create a duplicate.
+            # ``unresolved`` is order-lifecycle safety only: a request may
+            # have reached Toss and forgetting its stable identity could
+            # create a duplicate. Position history itself is never retried.
             'unresolved': bool(value.get('unresolved')),
             'terminal_status': str(value.get('terminal_status') or '').upper(),
+            # Exact terminal execution can lead holdings. Keep that cumulative
+            # proof until the position endpoint has visibly caught up.
+            'terminal_filled': min(qty, terminal_filled),
+            'terminal_fill_price': terminal_fill_price,
+            'terminal_filled_at': value.get('terminal_filled_at'),
             'submitted_at': submitted_at,
-            'unresolved_event_index': value.get('unresolved_event_index'),
-            'unresolved_event_qty': unresolved_event_qty,
         }
 
     # ── Small helpers ─────────────────────────────────────────────────────────
@@ -330,10 +366,23 @@ class CampaignEngine:
         self.buy_state = 'OK'
         self._exhaust_logged = False
 
-    @staticmethod
-    def _split_orders(snap):
+    def _split_orders(self, snap):
         orders = [o for o in (snap.get('orders') or [])
                   if float(o.get('qty_open') or 0) > 0]
+        detail = snap.get('pending_order')
+        p = self._pending
+        if (isinstance(detail, dict) and p and p.get('accepted')
+                and not detail.get('terminal')
+                and float(detail.get('qty_open') or 0) > 0
+                and self._order_id(detail) is not None
+                and self._pending_matches_order(p, detail)
+                and not any(self._pending_matches_order(p, o)
+                            for o in orders)):
+            # OPEN can omit a live order while exact detail still proves it is
+            # working. Include that exact row in side reconciliation so an
+            # opposite crossed line cancels the old order and waits one poll;
+            # never rely on the final placement gate as a permanent stalemate.
+            orders.append(detail)
         buys = [o for o in orders
                 if str(o.get('side') or '').upper() == 'BUY']
         sells = [o for o in orders
@@ -348,17 +397,28 @@ class CampaignEngine:
                                             else 0.005)
 
     def _place(self, acts, side, price, qty, label, kind=None, tiers=None):
+        # This is the final placement gate. Callers normally reconcile the
+        # pending identity before reaching here, but an accepted order must
+        # never be overwritten even if an unusual snapshot slips past those
+        # side-specific checks.
+        if self._pending and self._pending.get('accepted'):
+            return False
         acts.append(('place', side, price, qty, label))
         self._pending = {'side': side, 'price': price, 'qty': qty,
                          'kind': (kind or side).upper(),
                          'tiers': list(tiers or []), 'ts': time.time(),
                          'order_id': None, 'client_order_id': None,
-                         'accepted': False, 'filled_seen': 0,
+                         'accepted': False, 'acknowledged': False,
+                         'filled_seen': 0, 'holdings_seen': 0,
+                         'unknown_position_accepted': False,
+                         'unproven_seen': 0,
                          'step_counted': False, 'cancelling': False,
                          'unresolved': False, 'terminal_status': '',
-                         'submitted_at': None,
-                         'unresolved_event_index': None,
-                         'unresolved_event_qty': 0}
+                         'terminal_filled': 0,
+                         'terminal_fill_price': None,
+                         'terminal_filled_at': None,
+                         'submitted_at': None}
+        return True
 
     def _pending_matches_intent(self, side, price, qty):
         p = self._pending
@@ -402,10 +462,43 @@ class CampaignEngine:
         if not self._pending_matches_intent(side, price, qty):
             return False
         p = self._pending
-        p.update({'accepted': True, 'order_id': order_id,
-                  'client_order_id': client_order_id, 'ts': time.time(),
-                  'cancelling': False, 'unresolved': False,
-                  'terminal_status': ''})
+        old_order_id = p.get('order_id')
+        old_client_id = p.get('client_order_id')
+        if (old_order_id is not None and order_id is not None
+                and str(old_order_id) != str(order_id)):
+            return False
+        if (old_client_id is not None and client_order_id is not None
+                and str(old_client_id) != str(client_order_id)):
+            return False
+
+        first_ack = not p.get('acknowledged')
+        if (first_ack and old_order_id is None and order_id is None
+                and old_client_id is None and client_order_id is None):
+            return False
+
+        identity_changed = False
+        if old_order_id is None and order_id is not None:
+            p['order_id'] = order_id
+            identity_changed = True
+        if old_client_id is None and client_order_id is not None:
+            p['client_order_id'] = client_order_id
+            identity_changed = True
+
+        if not first_ack and not identity_changed:
+            # The controller may observe the same exact detail every poll.
+            # Replaying that acknowledgement must not extend its age, undo a
+            # requested cancellation, or cause a needless state-file write.
+            return True
+
+        p['accepted'] = True
+        if first_ack:
+            p.update({'acknowledged': True, 'ts': time.time(),
+                      'unresolved': False, 'terminal_status': '',
+                      'terminal_filled': 0,
+                      'terminal_fill_price': None,
+                      'terminal_filled_at': None,
+                      'unknown_position_accepted': False,
+                      'unproven_seen': 0})
         self.dirty = True
         return True
 
@@ -516,6 +609,53 @@ class CampaignEngine:
                 'CHASE': 'CHASE_PENDING', 'EXIT': 'EXIT_PENDING'}.get(
                     kind, fallback)
 
+    @staticmethod
+    def _pending_awaits_holdings(pending):
+        """Whether exact terminal execution is ahead of position truth."""
+        if not pending:
+            return False
+        try:
+            return (int(pending.get('terminal_filled') or 0)
+                    > int(pending.get('filled_seen') or 0))
+        except (TypeError, ValueError):
+            return False
+
+    def _pending_progress_with_snapshot(self, pending, shares):
+        """Cumulative pending quantity reflected by this holdings snapshot."""
+        reflected = int(pending.get('filled_seen') or 0)
+        has_unproven = (pending.get('unknown_position_accepted')
+                        or int(pending.get('unproven_seen') or 0) > 0)
+        terminal_ahead = (bool(pending.get('terminal_status'))
+                          and int(pending.get('terminal_filled') or 0)
+                          > reflected)
+        if (has_unproven
+                and not (self._prev_shares is None and terminal_ahead)):
+            # A working/unresolved order plus same-direction offline movement
+            # is not enough to claim bot convergence.  Preserve the old
+            # watermark until exact terminal execution is known.
+            return reflected
+        baseline = (self._prev_shares if self._prev_shares is not None
+                    else self._restored_q)
+        if baseline is None:
+            return reflected
+        # On a restart, the persisted broker baseline already includes every
+        # UNKNOWN/unproven movement accepted before the save.  A later move
+        # from that exact baseline in the terminal order's direction is
+        # therefore post-save holdings convergence, not a rewrite of the old
+        # UNKNOWN row. This exception is terminal-only; a restored WORKING or
+        # unresolved identity above remains guarded. During an ordinary live
+        # delta this preview cannot release the identity by itself
+        # (`startup_caught_up` is false); exact evidence in
+        # `_advance_pending_fill` still owns attribution.
+        try:
+            movement = (int(shares) - int(baseline)
+                        if pending.get('side') == 'BUY'
+                        else int(baseline) - int(shares))
+        except (TypeError, ValueError):
+            movement = 0
+        return min(int(pending.get('qty') or 0),
+                   reflected + max(0, movement))
+
     def _restale(self, acts, orders, price, qty, what):
         """Reconcile bot-owned orders with one currently desired line.
 
@@ -550,6 +690,11 @@ class CampaignEngine:
         # for a later snapshot before replacing it.
         p = self._pending
         if not orders and p and p.get('side') == side:
+            if self._pending_awaits_holdings(p):
+                # Exact terminal execution is known, but the holdings feed is
+                # still behind it. There is nothing left to cancel and no
+                # replacement is safe until the position catches up.
+                return 'resting'
             same = (self._same_price(p.get('price'), price)
                     and int(p.get('qty') or 0) == int(qty))
             if p.get('cancelling'):
@@ -674,7 +819,18 @@ class CampaignEngine:
         completed = [h for d, h in highs if h and d != today]
         today_high = next((h for d, h in reversed(highs)
                            if h and d == today), None)
-        window = completed[-4:] + ([today_high] if today_high else [])
+        # FIVE sessions, always. Four completed plus the live one WHEN there
+        # is a live one — on a weekend, before the open, or whenever the
+        # provider has not produced today's bar yet, the fifth slot goes back
+        # to the fifth completed session instead of silently vanishing.
+        #
+        # Getting this wrong drops the OLDEST session from the window, which
+        # is precisely the one that often holds the peak: a 7/27 high would
+        # disappear on the Saturday and the vantage would fall to 7/31's.
+        if today_high:
+            window = completed[-4:] + [today_high]
+        else:
+            window = completed[-5:]
         v = max(window) if window else (snap.get('prev_close') or None)
         if not v or v <= 0:
             return
@@ -716,56 +872,100 @@ class CampaignEngine:
         if not p:
             return
         detail = snap.get('pending_order')
-        if isinstance(detail, dict) and self._pending_matches_order(p, detail):
+        detail_matches = (isinstance(detail, dict)
+                          and self._pending_matches_order(p, detail))
+        changed = False
+        if detail_matches:
             status = str(detail.get('status') or '').upper()
-            if detail.get('order_id') is not None:
+            if (detail.get('order_id') is not None
+                    and p.get('order_id') != detail.get('order_id')):
                 p['order_id'] = detail.get('order_id')
-            if detail.get('client_order_id') is not None:
+                changed = True
+            if (detail.get('client_order_id') is not None
+                    and p.get('client_order_id')
+                    != detail.get('client_order_id')):
                 p['client_order_id'] = detail.get('client_order_id')
+                changed = True
             if detail.get('terminal'):
-                p['terminal_status'] = status
-            else:
-                # Exact detail proves that the submission was accepted.  A
-                # prior transport ambiguity no longer needs to pause it.
+                try:
+                    detail_filled = min(
+                        int(p.get('qty') or 0),
+                        max(0, int(round(float(detail.get('filled') or 0)))))
+                except (TypeError, ValueError):
+                    detail_filled = 0
+                terminal_filled = max(
+                    int(p.get('terminal_filled') or 0), detail_filled)
+                try:
+                    fill_price = float(detail.get('actual_fill_price'))
+                    if fill_price <= 0:
+                        fill_price = None
+                except (TypeError, ValueError):
+                    fill_price = None
+                filled_at = self._fill_stamp(detail)
+                updates = {
+                    'unresolved': False,
+                    'terminal_status': status or 'CLOSED',
+                    'terminal_filled': terminal_filled,
+                }
+                if fill_price:
+                    updates['terminal_fill_price'] = fill_price
+                if filled_at:
+                    updates['terminal_filled_at'] = filled_at
+                for key, value in updates.items():
+                    if p.get(key) != value:
+                        p[key] = value
+                        changed = True
+            elif not p.get('terminal_status') and p.get('unresolved'):
+                # Exact nonterminal detail proves a working accepted order even
+                # when the eventually-consistent OPEN list omitted its row.
                 p['unresolved'] = False
-                p['terminal_status'] = ''
+                changed = True
 
         resting = self._matching_pending_order(snap, p)
         unchanged = shares == self._prev_shares
-        terminal = bool(isinstance(detail, dict) and detail.get('terminal')
-                        and self._pending_matches_order(p, detail))
-        detail_filled = (int(float(detail.get('filled') or 0))
-                         if isinstance(detail, dict) else 0)
-        seen = int(p.get('filled_seen') or 0)
-        # A same-side holdings change may already have been recorded UNKNOWN
-        # while execution detail lagged.  Let delayed reconciliation inspect
-        # even a zero-fill CANCELED/REJECTED detail before the pending identity
-        # is released; that exact exclusion proof turns the UNKNOWN row EXT.
-        has_unresolved_event = p.get('unresolved_event_index') is not None
-        if (terminal and unchanged and detail_filled <= seen
-                and not has_unresolved_event):
+        if resting is not None and not p.get('terminal_status'):
+            if p.get('unresolved'):
+                p['unresolved'] = False
+                changed = True
+
+        # Exact terminal execution may lead holdings. Retain the stable order
+        # identity until the position endpoint reflects the cumulative fill.
+        # A zero-fill terminal has no lagging position movement to guard.
+        terminal_filled = int(p.get('terminal_filled') or 0)
+        reflected = self._pending_progress_with_snapshot(p, shares)
+        startup_caught_up = (self._prev_shares is None
+                             and terminal_filled <= reflected)
+        already_caught_up = terminal_filled <= int(
+            p.get('filled_seen') or 0)
+        if (p.get('terminal_status')
+                and (terminal_filled == 0 or startup_caught_up
+                     or (unchanged and already_caught_up))):
             self._log(f"pending {p['side']} terminal state confirmed: "
                       f"{p.get('terminal_status') or 'CLOSED'}")
             self._pending = None
             self.dirty = True
             return
 
-        # OPEN-list absence is not terminal evidence.  Once an accepted intent
-        # becomes stale, retain its stable identity and pause reconciliation
-        # until exact order detail proves FILLED/CANCELED/REJECTED.  This is the
-        # central no-duplicate invariant.
-        if (p.get('accepted') and not resting and not terminal
-                and time.time() - float(p.get('ts') or 0) >= _PENDING_STALE_S):
-            p['unresolved'] = True
+        # Missing OPEN plus failed/empty exact detail is ambiguous immediately.
+        # Waiting for an age threshold creates a duplicate-order window.
+        if (p.get('accepted') and resting is None and not detail_matches
+                and not p.get('terminal_status')):
+            if not p.get('unresolved'):
+                p['unresolved'] = True
+                changed = True
             self.campaign_state = 'PAUSED_RECONCILE'
             self.status = ('accepted order is absent from OPEN but not proven '
                            'terminal — no replacement will be sent')
-            self.dirty = True
+            if changed:
+                self.dirty = True
             return
         if (not p.get('accepted') and unchanged
                 and time.time() - float(p.get('ts') or 0) >= _PENDING_STALE_S):
             self._log(f"unsubmitted {p['side']} intent expired")
             self._pending = None
+            self.dirty = True
+            return
+        if changed:
             self.dirty = True
 
     @staticmethod
@@ -896,7 +1096,26 @@ class CampaignEngine:
         detail = snap.get('pending_order')
         if (not isinstance(detail, dict)
                 or not self._pending_matches_order(p, detail)):
-            return None
+            # Once exact terminal evidence was seen, it remains valid while
+            # the separate holdings endpoint catches up. A later transient
+            # lookup failure must not strand the guard forever or turn the
+            # already-proven execution into an external trade.
+            if (not p or not p.get('terminal_status')
+                    or int(p.get('terminal_filled') or 0) <= 0):
+                return None
+            oid = p.get('order_id')
+            return {
+                'side': p.get('side'),
+                'qty': int(p.get('terminal_filled') or 0),
+                'price': p.get('terminal_fill_price'),
+                'actual_fill_price': p.get('terminal_fill_price'),
+                'filled_at': p.get('terminal_filled_at'),
+                'fill_time': p.get('terminal_filled_at'),
+                'order_id': oid, 'id': oid,
+                'client_order_id': p.get('client_order_id'),
+                'mine': True, 'status': p.get('terminal_status'),
+                'terminal': True,
+            }
         try:
             filled = max(0, int(round(float(detail.get('filled') or 0))))
         except (TypeError, ValueError):
@@ -938,6 +1157,22 @@ class CampaignEngine:
             merged['filled_at'] = self._fill_stamp(recent)
             merged['fill_time'] = self._fill_stamp(recent)
         return merged
+
+    def _pending_terminal_zero(self, snap, side):
+        """Immediate proof that the accepted bot order filled nothing."""
+        p = self._pending
+        detail = snap.get('pending_order')
+        if (not p or p.get('side') != str(side or '').upper()
+                or not isinstance(detail, dict)
+                or not self._pending_matches_order(p, detail)
+                or not detail.get('terminal')):
+            return False
+        try:
+            filled = int(float(detail.get('filled') or 0))
+        except (TypeError, ValueError):
+            return False
+        return (filled == 0 and str(detail.get('status') or '').upper()
+                in ('CANCELED', 'REJECTED'))
 
     def _pending_for_fill(self, snap, side, qty):
         p = self._pending
@@ -982,9 +1217,9 @@ class CampaignEngine:
 
         Returns True only when its full requested quantity filled. A partially
         filled order whose remainder was cancelled is resolved and forgotten,
-        but its exit tier is not spent.  ``filled_seen`` is deliberately the
-        quantity reflected in holdings, not the possibly-ahead cumulative
-        quantity reported by order detail.
+        but its exit tier is not spent. ``filled_seen`` is the quantity proved
+        BOT and reflected in holdings; ``unproven_seen`` records interleaved
+        movement without allowing it to satisfy terminal convergence.
         """
         if not pending:
             return False
@@ -992,6 +1227,10 @@ class CampaignEngine:
         pending['filled_seen'] = min(
             requested,
             int(pending.get('filled_seen') or 0) + int(qty))
+        # Only exact-evidence-backed quantity reaches this method. Keep the
+        # holdings watermark bot-proven; UNKNOWN/MIXED movement is tracked
+        # separately and never satisfies terminal convergence.
+        pending['holdings_seen'] = pending['filled_seen']
         order = self._matching_pending_order(snap, pending)
         detail = snap.get('pending_order')
         detail_matches = (isinstance(detail, dict)
@@ -1008,21 +1247,41 @@ class CampaignEngine:
             order = detail
         fully_filled = pending['filled_seen'] >= requested
         detail_ahead = detail_filled > pending['filled_seen']
-        if detail_ahead:
-            # The order endpoint has proved more execution than holdings has
-            # exposed.  Preserve the identity and pause instead of inventing a
-            # negative external quantity or releasing a replacement order.
-            pending['unresolved'] = True
-            self.campaign_state = 'PAUSED_RECONCILE'
-            self.status = ('order execution is ahead of broker holdings — '
-                           'waiting for the position snapshot to catch up')
+        if fully_filled:
+            resolved = True
+        elif detail_terminal or pending.get('terminal_status'):
+            # Lifecycle completion is not position completion. If cumulative
+            # execution is ahead, retain the guard through each holdings
+            # catch-up fragment. A partially filled CANCELED/REJECTED order
+            # resolves once its smaller terminal total is reflected.
+            if detail_terminal:
+                pending['terminal_status'] = str(
+                    detail.get('status') or pending.get('terminal_status')
+                    or 'CLOSED').upper()
+                pending['terminal_filled'] = max(
+                    int(pending.get('terminal_filled') or 0), detail_filled)
+                try:
+                    fill_price = float(detail.get('actual_fill_price'))
+                    if fill_price <= 0:
+                        fill_price = None
+                except (TypeError, ValueError):
+                    fill_price = None
+                if fill_price:
+                    pending['terminal_fill_price'] = fill_price
+                filled_at = self._fill_stamp(detail)
+                if filled_at:
+                    pending['terminal_filled_at'] = filled_at
+            pending['unresolved'] = False
+            sell_empty = (pending.get('side') == 'SELL'
+                          and int(snap.get('shares') or 0) == 0)
+            resolved = (int(pending.get('terminal_filled') or 0)
+                        <= int(pending.get('filled_seen') or 0)
+                        or sell_empty)
+        elif detail_ahead:
+            # A still-working exact order simply remains pending. Its stable
+            # identity blocks duplicates; there is no history-repair pause.
+            pending['unresolved'] = False
             resolved = False
-        elif fully_filled:
-            resolved = True
-        elif detail_terminal:
-            # A terminal partial fill has now been fully reflected; its
-            # cancelled/rejected remainder is not a completed tier.
-            resolved = True
         elif order is not None and int(order.get('qty_open') or 0) > 0:
             resolved = False
         elif pending.get('accepted'):
@@ -1056,6 +1315,7 @@ class CampaignEngine:
         self.max_cost = 0.0
         self.campaign_low = None
         self.manually_modified = False
+        self.campaign_ambiguous = False
         self.tier_done = [False, False, False]
         self.events = []
         self._pending = None
@@ -1070,6 +1330,17 @@ class CampaignEngine:
     def _first_snapshot(self, snap, shares, avg):
         """Reconcile persisted state to broker truth without inventing fills."""
         saved_q, saved_avg = self._restored_q, self._restored_avg
+        p = self._pending
+        if p:
+            # A restart may land midway through holdings catch-up. Adopt the
+            # already-visible portion into the safety watermark without
+            # manufacturing a campaign event; subsequent live deltas can then
+            # finish against the same stable order identity.
+            reflected = self._pending_progress_with_snapshot(p, shares)
+            if reflected > int(p.get('filled_seen') or 0):
+                p['filled_seen'] = reflected
+                p['holdings_seen'] = reflected
+                self.dirty = True
         if shares > 0:
             if not self.campaign_id:
                 self._adopt(shares, avg)
@@ -1088,15 +1359,6 @@ class CampaignEngine:
                           f'{saved_q if saved_q is not None else "?"} @ '
                           f'{self._fp(saved_avg)} → broker {shares} @ '
                           f'{self._fp(avg)}; exit tiers re-armed')
-                p = self._pending
-                if p and saved_q is not None:
-                    # Quantity direction alone is not ownership proof.  Keep a
-                    # restored accepted intent until OPEN or exact detail
-                    # resolves it; do not silently consume it as the offline
-                    # change or forget it because one OPEN page omitted it.
-                    if not self._matching_pending_order(snap, p):
-                        p['unresolved'] = True
-                        self.campaign_state = 'PAUSED_RECONCILE'
                 self.dirty = True
             return
 
@@ -1114,24 +1376,15 @@ class CampaignEngine:
             self._prev_shares, self._prev_avg = 0, 0.0
             return
 
-        # If the bot was offline over an actual full sell, only today's broker
-        # fill evidence can recover the reload. Otherwise discard the stale
-        # campaign with no synthetic EXIT row.
+        # Broker-flat is complete position truth. Do not reconstruct an
+        # external/offline sell from history or infer a same-day reload; only
+        # the exact pending-bot path in `_detect_fills` may prove such an exit.
         active = bool(self.campaign_id or self.campaign_state in (
             'DEPLOYED', 'CHASE_PENDING', 'EXIT_PENDING',
             'CHASE_CANCELLING', 'EXIT_CANCELLING', 'ORDER_CANCELLING',
             'PAUSED_RECONCILE'))
-        fill = self._recent_fill(snap, 'SELL', saved_q or 0, self._pending)
-        fill_today = fill and self._fill_date(fill) == snap.get('trading_date')
-        fill_covers_position = fill and self._fill_qty(fill) >= int(saved_q or 0)
-        if active and saved_q and fill_today and fill_covers_position:
-            self._prev_shares = int(saved_q)
-            self._prev_avg = float(saved_avg or 0.0)
-            self._on_sell_fill(snap, int(saved_q), 0, 0.0)
-            self._prev_shares, self._prev_avg = 0, 0.0
-            return
         if active:
-            self._log('RECONCILE_FLAT: broker holds zero; stale campaign '
+            self._log('RECONCILE_EMPTY: broker holds zero; stale campaign '
                       'discarded without inventing an exit')
             self._clear_stale_campaign()
         elif self.campaign_state not in ('FLAT', 'RELOAD_ARMED'):
@@ -1140,252 +1393,35 @@ class CampaignEngine:
             self.dirty = True
         self._prev_shares, self._prev_avg = 0, 0.0
 
-    def _replay_correlated_fills(self, snap, start_shares, start_avg,
-                                 final_shares):
-        """Replay broker executions when their gross net proves the position.
-
-        Holdings remain authoritative.  The replay is used only when every
-        time-correlated execution in the interval nets *exactly* from the last
-        accepted holding to the new one.  This lets a BUY+SELL round trip (net
-        zero), or opposing bot/app executions, enter the campaign log without
-        guessing from an incomplete history page.
-        """
-        pending_evidence = None
-        if self._pending:
-            # Exact detail remains available even after the controller has
-            # de-duplicated its CLOSED-history twin.  Collapse any pending-
-            # order rows to the strongest cumulative view so restart/catch-up
-            # replay cannot lose the remaining bot fragment.
-            pending_evidence = self._pending_fill_evidence(
-                snap, self._pending, self._pending.get('side'),
-                self._pending.get('qty') or 0)
-            if (pending_evidence is not None
-                    and not self._fill_matches_pending(
-                        pending_evidence, self._pending)):
-                pending_evidence = None
-        if not snap.get('fills_correlated') and pending_evidence is None:
-            return False
-        indexed = [(i, f) for i, f in enumerate(snap.get('recent_fills') or [])
-                   if snap.get('fills_correlated') and isinstance(f, dict)
-                   and self._fill_qty(f) > 0]
-        if self._pending:
-            if pending_evidence is not None:
-                pending_indexes = [
-                    i for i, fill in indexed
-                    if self._fill_matches_pending(fill, self._pending)
-                ]
-                indexed = [
-                    (i, fill) for i, fill in indexed
-                    if not self._fill_matches_pending(fill, self._pending)
-                ]
-                indexed.append((min(pending_indexes) if pending_indexes else
-                                len(snap.get('recent_fills') or []),
-                                pending_evidence))
-        if not indexed:
-            return False
-        indexed.sort(key=lambda pair: (str(self._fill_stamp(pair[1]) or ''),
-                                       pair[0]))
-
-        virtual_seen = int((self._pending or {}).get('filled_seen') or 0)
-        steps = []
-        for _index, fill in indexed:
-            side = str(fill.get('side') or '').upper()
-            if side not in ('BUY', 'SELL'):
-                continue
-            qty = self._fill_qty(fill)
-            if self._pending and self._fill_matches_pending(fill, self._pending):
-                # Exact order detail is cumulative.  Convert it to the new
-                # fragment so a prior partial fill cannot be counted twice.
-                qty = max(0, qty - virtual_seen)
-                virtual_seen += qty
-            if qty > 0:
-                steps.append((side, qty, fill))
-        if not steps:
-            return False
-
-        net = sum(qty if side == 'BUY' else -qty
-                  for side, qty, _fill in steps)
-        if int(start_shares) + int(net) != int(final_shares):
-            return False
-
-        # Validate the chronological path before mutating campaign state.
-        check = int(start_shares)
-        for side, qty, _fill in steps:
-            check += qty if side == 'BUY' else -qty
-            if check < 0:
-                return False
-
-        cur_shares, cur_avg = int(start_shares), float(start_avg or 0.0)
-        if cur_shares > 0 and not self.campaign_id:
-            self._adopt(cur_shares, cur_avg)
-        self._prev_shares, self._prev_avg = cur_shares, cur_avg
-        final_avg = float(snap.get('avg_cost') or 0.0)
-        for side, qty, fill in steps:
-            price = self._fill_price(fill)
-            next_shares = cur_shares + (qty if side == 'BUY' else -qty)
-            if side == 'BUY':
-                if price and next_shares > 0:
-                    next_avg = ((cur_avg * cur_shares + price * qty)
-                                / next_shares)
-                elif next_shares == final_shares and final_avg > 0:
-                    next_avg = final_avg
-                else:
-                    next_avg = cur_avg
-            else:
-                next_avg = cur_avg if next_shares > 0 else 0.0
-            step_snap = dict(snap)
-            step_snap['shares'] = next_shares
-            step_snap['avg_cost'] = next_avg
-            step_snap['recent_fills'] = [fill]
-            if side == 'BUY':
-                self._on_buy_fill(step_snap, cur_shares, next_shares, next_avg)
-            else:
-                self._on_sell_fill(step_snap, cur_shares, next_shares, next_avg)
-            cur_shares, cur_avg = next_shares, next_avg
-            self._prev_shares, self._prev_avg = cur_shares, cur_avg
-        return True
-
-    def _reconcile_delayed_pending_fill(self, snap, shares):
-        """Repair an UNKNOWN row when exact detail arrives after retry timeout."""
-        p = self._pending
-        if not p or p.get('unresolved_event_index') is None:
-            return False
-        try:
-            index = int(p.get('unresolved_event_index'))
-            event = self.events[index]
-        except (TypeError, ValueError, IndexError):
-            return False
-        recorded = abs(int(event.get('qty') or 0))
-        if recorded <= 0:
-            return False
-
-        detail = snap.get('pending_order')
-        detail_matches = (isinstance(detail, dict)
-                          and self._pending_matches_order(p, detail))
-        terminal = bool(detail_matches and detail.get('terminal'))
-        status = str(detail.get('status') or '').upper() \
-            if detail_matches else ''
-        try:
-            detail_filled = (max(0, int(float(detail.get('filled') or 0)))
-                             if detail_matches else 0)
-        except (TypeError, ValueError):
-            detail_filled = 0
-
-        # Exact zero-fill terminal detail excludes the bot order as the cause
-        # of this same-side holdings movement.  Repair UNKNOWN to EXT before
-        # releasing the pending identity; CANCELED and REJECTED are both
-        # positive non-fill evidence.
-        if terminal and detail_filled == 0 and status in (
-                'CANCELED', 'REJECTED'):
-            event['source'] = 'EXT'
-            proof = f'bot order {status.lower()} with 0 filled'
-            event['note'] = ((str(event.get('note') or '') + '; ')
-                             if event.get('note') else '') + proof
-            self.manually_modified = shares > 0
-            self._pending = None
-            self.dirty = True
-            return True
-
-        evidence = self._pending_fill_evidence(
-            snap, p, p.get('side'), p.get('qty') or 0)
-        if not evidence or not self._fill_matches_pending(evidence, p):
-            return False
-        total = self._fill_qty(evidence)
-        old = int(p.get('filled_seen') or 0)
-        available = max(0, min(int(p.get('qty') or 0), total) - old)
-        # As in the immediate path, cumulative order detail may be ahead of
-        # holdings.  It can explain no more than the UNKNOWN movement already
-        # recorded; the rest remains pending until holdings catches up.
-        progress = min(recorded, available)
-        if progress <= 0:
-            return False
-
-        source = 'BOT' if progress == recorded else 'MIXED'
-        event['source'] = source
-        external = recorded - progress
-        if source == 'MIXED':
-            event['note'] = (str(event.get('note') or '') + '; '
-                             if event.get('note') else '') + (
-                                 f'bot {progress}, external/net {external}')
-            self.manually_modified = shares > 0
-        actual = self._fill_price(evidence)
-        if actual and source == 'BOT':
-            event['price'] = actual
-
-        p['filled_seen'] = min(
-            int(p.get('qty') or 0), old + progress)
-        complete = p['filled_seen'] >= int(p.get('qty') or 0)
-        if p.get('side') == 'SELL' and shares == 0 and actual and source == 'BOT':
-            # The earlier UNKNOWN full exit deliberately refused to guess a
-            # reload. Exact delayed execution evidence can now restore it.
-            self.last_exit_price = actual
-            self.vantage = actual
-            self.vantage_src = 'reload'
-            self.campaign_state = 'RELOAD_ARMED'
-        if complete:
-            for tier in p.get('tiers') or []:
-                if 0 <= tier < 3:
-                    self.tier_done[tier] = True
-        cumulative_seen = min(int(p.get('qty') or 0), total)
-        detail_ahead = cumulative_seen > p['filled_seen']
-        p['unresolved_event_index'] = None
-        p['unresolved_event_qty'] = 0
-        if complete or (terminal and not detail_ahead):
-            self._pending = None
-        elif detail_ahead:
-            p['unresolved'] = True
-            self.campaign_state = 'PAUSED_RECONCILE'
-            self.status = ('order execution is ahead of broker holdings — '
-                           'waiting for the position snapshot to catch up')
-        else:
-            p['unresolved'] = False
-        self._consume_fill(evidence)
-        self.dirty = True
-        return True
-
     def _detect_fills(self, snap, shares):
         prev = self._prev_shares
         avg = float(snap.get('avg_cost') or 0)
         if prev is None:
-            restored = self._restored_q
-            if (restored is not None and self._replay_correlated_fills(
-                    snap, int(restored), self._restored_avg, shares)):
-                return
-            # Exact stable-id evidence can be cumulatively ahead on the first
-            # snapshot after restart.  Even when the full cumulative quantity
-            # does not yet net to holdings (so gross replay declines), adopt
-            # only the visible delta through the normal capped fill path.
-            if restored is not None and int(restored) != int(shares):
-                p = self._pending
-                side = 'BUY' if int(shares) > int(restored) else 'SELL'
-                evidence = self._pending_fill_evidence(
-                    snap, p, side, abs(int(shares) - int(restored)))
-                if (p and p.get('accepted') and p.get('side') == side
-                        and evidence is not None
-                        and self._fill_matches_pending(evidence, p)):
-                    total = min(int(p.get('qty') or 0),
-                                self._fill_qty(evidence))
-                    if total > int(p.get('filled_seen') or 0):
-                        self._prev_shares = int(restored)
-                        self._prev_avg = float(self._restored_avg or 0.0)
-                        if side == 'BUY':
-                            self._on_buy_fill(
-                                snap, int(restored), shares, avg)
-                        else:
-                            self._on_sell_fill(
-                                snap, int(restored), shares, avg)
-                        return
             self._first_snapshot(snap, shares, avg)
-            return
-        if shares == prev and self._reconcile_delayed_pending_fill(snap, shares):
-            return
-        if self._replay_correlated_fills(
-                snap, int(prev), self._prev_avg, shares):
             return
         if shares > prev:
             self._on_buy_fill(snap, prev, shares, avg)
         elif shares < prev:
             self._on_sell_fill(snap, prev, shares, avg)
+
+    def _note_pending_unproven_delta(self, side, qty, bot_qty):
+        """Record interleaved movement without claiming it as bot progress."""
+        p = self._pending
+        if (not p or not p.get('accepted') or p.get('side') != side
+                or int(qty) <= 0):
+            return False
+        unproven = max(0, int(qty) - int(bot_qty or 0))
+        if unproven <= 0:
+            return False
+        old = int(p.get('unproven_seen') or 0)
+        new = min(int(p.get('qty') or 0), old + unproven)
+        if new != old:
+            p['unproven_seen'] = new
+            # Correct any pre-fix state that counted raw movement toward bot
+            # convergence. Only `_advance_pending_fill` may move this value.
+            p['holdings_seen'] = int(p.get('filled_seen') or 0)
+            self.dirty = True
+        return True
 
     def _adopt(self, shares, avg):
         """Shares exist but no live campaign in this process: take the broker's
@@ -1408,6 +1444,7 @@ class CampaignEngine:
         self.max_cost = 0.0
         self.campaign_low = price
         self.manually_modified = bool(adopted)
+        self.campaign_ambiguous = False
         self.tier_done = [False, False, False]
         self.events = []
         self.dirty = True
@@ -1416,9 +1453,11 @@ class CampaignEngine:
         qty = shares - prev
         pend, evidence, bot_qty = self._pending_for_fill(
             snap, 'BUY', qty)
+        terminal_zero = self._pending_terminal_zero(snap, 'BUY')
         ambiguous_pending = (not pend and not evidence and self._pending
                              and self._pending.get('accepted')
-                             and self._pending.get('side') == 'BUY')
+                             and self._pending.get('side') == 'BUY'
+                             and not terminal_zero)
         mixed = bool(pend and bot_qty != qty)
         if pend:
             price = self._fill_price(evidence) or pend['price']
@@ -1436,12 +1475,20 @@ class CampaignEngine:
                          else (avg or None))
             source = ('BOT' if evidence and evidence.get('mine') else
                       ('UNKNOWN' if ambiguous_pending else 'EXT'))
+        interleaved = self._note_pending_unproven_delta('BUY', qty, bot_qty)
+        if source == 'UNKNOWN' and self._pending:
+            # This position delta has already been accepted into immutable
+            # campaign history. Later detail may resolve lifecycle safety only
+            # after holdings catches up; it must never rewrite this row.
+            self._pending['unknown_position_accepted'] = True
         self._consume_fill(evidence)
         order_kind = str((pend or {}).get('kind') or '').upper()
         if pend and order_kind == 'CHASE' and not pend.get('step_counted'):
             self.chase_count += 1
             pend['step_counted'] = True
         self._advance_pending_fill(snap, pend, bot_qty)
+        if terminal_zero:
+            self._pending = None
         if prev == 0:
             self._open_campaign(price)
             if mixed:
@@ -1474,10 +1521,12 @@ class CampaignEngine:
         if price:
             self.campaign_low = (price if self.campaign_low is None
                                  else min(self.campaign_low, price))
-        if source == 'UNKNOWN' and self._pending and self._pending.get(
-                'unresolved'):
-            self._pending['unresolved_event_index'] = len(self.events) - 1
-            self._pending['unresolved_event_qty'] = qty
+        if source in ('UNKNOWN', 'MIXED') or interleaved:
+            self.campaign_ambiguous = True
+        # MANUALLY_MODIFIED describes only the latest unresolved position
+        # change. A clean, exactly owned bot delta establishes a new broker
+        # baseline and clears it; EXT/MIXED/UNKNOWN sets it again.
+        self.manually_modified = source != 'BOT'
         self.max_qty = max(self.max_qty, shares)
         self.max_cost = max(self.max_cost, shares * avg)
         self.dirty = True
@@ -1486,9 +1535,11 @@ class CampaignEngine:
         qty = prev - shares
         pend, evidence, bot_qty = self._pending_for_fill(
             snap, 'SELL', qty)
+        terminal_zero = self._pending_terminal_zero(snap, 'SELL')
         ambiguous_pending = (not pend and not evidence and self._pending
                              and self._pending.get('accepted')
-                             and self._pending.get('side') == 'SELL')
+                             and self._pending.get('side') == 'SELL'
+                             and not terminal_zero)
         mixed = bool(pend and bot_qty != qty)
         actual_price = self._fill_price(evidence)
         if pend:
@@ -1502,8 +1553,15 @@ class CampaignEngine:
             price = actual_price
             source = ('BOT' if evidence and evidence.get('mine') else
                       ('UNKNOWN' if ambiguous_pending else 'EXT'))
+        interleaved = self._note_pending_unproven_delta('SELL', qty, bot_qty)
+        if source == 'UNKNOWN' and self._pending:
+            self._pending['unknown_position_accepted'] = True
+        if source in ('UNKNOWN', 'MIXED') or interleaved:
+            self.campaign_ambiguous = True
         self._consume_fill(evidence)
         complete = self._advance_pending_fill(snap, pend, bot_qty)
+        if terminal_zero:
+            self._pending = None
         if pend and complete:
             for i in (pend.get('tiers') or []):
                 if 0 <= i < 3:
@@ -1516,18 +1574,13 @@ class CampaignEngine:
         if shares > 0:
             # A partial exit is normal when several tiers are armed; a hand
             # trim is not, and is flagged so the log stays honest.
-            if source in ('EXT', 'MIXED', 'UNKNOWN'):
-                self.manually_modified = True
+            self.manually_modified = source != 'BOT'
             kind = ('T' + '/'.join(str(i + 1) for i in pend['tiers'])
                     if pend and pend.get('tiers') else 'SELL')
             if mixed:
                 note = (note + '; ' if note else '') + (
                     f'bot {bot_qty}, external/net {qty - bot_qty}')
             self._event(kind, -qty, price, shares, avg, source, note=note)
-            if source == 'UNKNOWN' and self._pending and self._pending.get(
-                    'unresolved'):
-                self._pending['unresolved_event_index'] = len(self.events) - 1
-                self._pending['unresolved_event_qty'] = -qty
             self._log(f'{kind} filled ({source}): {prev} → {shares} shares '
                       f'— {self._tier_text()} armed, campaign still open')
             self.dirty = True
@@ -1541,10 +1594,6 @@ class CampaignEngine:
             note = (note + '; ' if note else '') + (
                 f'bot {bot_qty}, external/net {qty - bot_qty}')
         self._event('EXIT', -qty, price, shares, avg, source, note=note)
-        if source == 'UNKNOWN' and self._pending and self._pending.get(
-                'unresolved'):
-            self._pending['unresolved_event_index'] = len(self.events) - 1
-            self._pending['unresolved_event_qty'] = -qty
         at = f' @ {self._fp(price)}' if price else ' (fill price unavailable)'
         self._log(f'EXIT ({source}): campaign {self.campaign_id} closed — '
                   f'-{qty}{at}')
@@ -1552,27 +1601,34 @@ class CampaignEngine:
         self.campaign_id = None
         self.manually_modified = False
         self.tier_done = [False, False, False]
-        self.last_exit_date = self.trading_date
-        self.last_exit_price = price
+        ambiguous_close = self.campaign_ambiguous
+        immediate_bot_reload = bool(source == 'BOT' and actual_price
+                                    and not ambiguous_close)
+        self.last_exit_date = (self.trading_date
+                               if immediate_bot_reload else None)
+        self.last_exit_price = (actual_price
+                                if immediate_bot_reload else None)
         self.vantage_manual = None
         self.vantage_manual_label = ''
-        if price:
+        self.campaign_ambiguous = False
+        if immediate_bot_reload:
             # Rest of this session: one fast reload at the actual sell fill -3%.
-            self.vantage = price
+            self.vantage = actual_price
             self.vantage_src = 'reload'
             self.campaign_state = 'RELOAD_ARMED'
-            self._log(f'RELOAD_ARMED: {self._fp(calc_reload_price(price))} '
+            self._log(f'RELOAD_ARMED: '
+                      f'{self._fp(calc_reload_price(actual_price))} '
                       f'(sell fill -{RELOAD_DROP_PCT}%) — this session only; '
                       f'tomorrow returns to the Dynamic High5 LOAD')
         else:
-            # A live quote or prior average is not execution evidence. Keep the
-            # audit row honest and use the normal Dynamic High5 LOAD instead of
-            # inventing a sell anchor and a guessed -3% reload.
+            # Manual/external, mixed, delayed-unknown, or price-less full sells
+            # all reset directly to EMPTY. Only an immediately proven bot exit
+            # can create the same-session reload.
             self.vantage = None
             self.vantage_src = 'high5'
             self.campaign_state = 'FLAT'
-            self._log('full sell detected but its fill price is unavailable — '
-                      'Dynamic High5 restored; no reload was guessed')
+            self._log('full sell reset to EMPTY — Dynamic High5 restored; '
+                      'no bot reload was inferred')
         self.dirty = True
 
     # ── Line publication ─────────────────────────────────────────────────────
@@ -1667,7 +1723,7 @@ class CampaignEngine:
 
     def _watch_order_cleanup(self, snap, tag):
         """WATCH owns no live orders: cancel ours, preserve everyone else's."""
-        if snap.get('can_trade', True):
+        if snap.get('can_trade', True) or snap.get('safety_guarded'):
             return None
         orders = [o for o in (snap.get('orders') or [])
                   if float(o.get('qty_open') or 0) > 0 and self._order_owned(o)]
@@ -1722,14 +1778,21 @@ class CampaignEngine:
         price = snap.get('price')
         if price and shares > 0 and self.campaign_low is not None:
             self.campaign_low = min(self.campaign_low, price)
-        guarded = bool(self._pending and self._pending.get('unresolved'))
+        awaiting_holdings = self._pending_awaits_holdings(self._pending)
+        guarded = bool(self._pending and (self._pending.get('unresolved')
+                                         or awaiting_holdings))
         decision_snap = snap
         if guarded and snap.get('can_trade', True):
             decision_snap = dict(snap)
             decision_snap['can_trade'] = False
+            decision_snap['safety_guarded'] = True
         acts = (self._poll_deployed(decision_snap, shares) if shares > 0
                 else self._poll_flat(decision_snap))
-        if self._pending and self._pending.get('unresolved'):
+        if self._pending_awaits_holdings(self._pending):
+            self.campaign_state = 'PAUSED_RECONCILE'
+            self.status = ('broker fill confirmed — waiting for holdings to '
+                           'catch up; no new order will be sent')
+        elif self._pending and self._pending.get('unresolved'):
             self.campaign_state = 'PAUSED_RECONCILE'
             self.status = ('broker order outcome unresolved — exact terminal '
                            'confirmation required; no replacement will be sent')
@@ -1811,10 +1874,13 @@ class CampaignEngine:
                 self.status = (f'[{tag}] exit crossed — cancelling the bot '
                                'buy first; sell waits for the next snapshot')
                 return acts
-            self._place(acts, 'SELL', line, qty, label, kind='EXIT',
-                        tiers=tiers)
-            self.campaign_state = 'EXIT_PENDING'
-            self.status = f'[{tag}] {label} fired: {qty} @ {self._fp(line)}'
+            if self._place(acts, 'SELL', line, qty, label, kind='EXIT',
+                           tiers=tiers):
+                self.campaign_state = 'EXIT_PENDING'
+                self.status = (f'[{tag}] {label} fired: {qty} @ '
+                               f'{self._fp(line)}')
+            else:
+                self._set_order_wait(tag, 'DEPLOYED')
             return acts
 
         # 2) CHASE — while the army can fund it.
@@ -1846,11 +1912,14 @@ class CampaignEngine:
                 self.status = (f'[{tag}] chase crossed — cancelling the bot '
                                'sell first; buy waits for the next snapshot')
                 return acts
-            self._place(acts, 'BUY', chase_p, chase_q,
-                        f'CHASE -{chase_drop(self.gear)}% ×{g["frac"]} '
-                        f'(G{self.gear})', kind='CHASE')
-            self.campaign_state = 'CHASE_PENDING'
-            self.status = f'[{tag}] CHASE fired: {chase_q} @ {self._fp(chase_p)}'
+            if self._place(acts, 'BUY', chase_p, chase_q,
+                           f'CHASE -{chase_drop(self.gear)}% ×{g["frac"]} '
+                           f'(G{self.gear})', kind='CHASE'):
+                self.campaign_state = 'CHASE_PENDING'
+                self.status = (f'[{tag}] CHASE fired: {chase_q} @ '
+                               f'{self._fp(chase_p)}')
+            else:
+                self._set_order_wait(tag, 'DEPLOYED')
             return acts
 
         # 3) Nothing crossed — retire any order of ours still sitting out here.
@@ -1878,11 +1947,8 @@ class CampaignEngine:
         self.campaign_state = 'DEPLOYED'
         lo = self._fp(chase_p) if chase_q > 0 else '--'
         hi = self._fp(min(e['price'] for e in exits)) if exits else '--'
-        tail = ''
-        if self.manually_modified:
-            tail += ' · MANUALLY_MODIFIED'
         self.status = (f'[{tag}] watching: {lo} < now {self._fp(price)} '
-                       f'< {hi}{tail}')
+                       f'< {hi}')
         return acts
 
     # ── FLAT: the LOAD hanging off the vantage, plus its projected ladder ────
@@ -1892,7 +1958,7 @@ class CampaignEngine:
         self._refresh_flat_vantage(snap)
         if not self.vantage or self.vantage <= 0:
             self.campaign_state = 'FLAT'
-            self.status = 'flat — waiting for the vantage'
+            self.status = 'empty — waiting for the vantage'
             self.lines = {}
             return []
 
@@ -1908,7 +1974,7 @@ class CampaignEngine:
         if load_q <= 0:
             self.lines = {}
             self.campaign_state = 'FLAT'
-            self.status = 'flat — unit cash unknown'
+            self.status = 'empty — unit cash unknown'
             return []
 
         kind = 'RELOAD' if reload_mode else 'LOAD'
@@ -1953,7 +2019,7 @@ class CampaignEngine:
             return acts
         pending_kind = str((self._pending or {}).get('kind') or '').upper()
         if pending_kind not in ('', 'LOAD', 'RELOAD') and buys:
-            if self._cancel_owned(acts, buys, 'old campaign buy (flat)'):
+            if self._cancel_owned(acts, buys, 'old campaign buy (empty)'):
                 self.campaign_state = 'LOAD_CANCELLING'
                 self.status = (f'[{tag}] clearing the old bot buy before a new '
                                'load — waiting for the next snapshot')
@@ -1987,10 +2053,13 @@ class CampaignEngine:
                 self.status = (f'[{tag}] LOAD line crossed @ '
                                f'{self._fp(price)} — WATCH mode, not sent')
                 return acts
-            self._place(acts, 'BUY', load_p, load_q,
-                        f'{kind} -{drop}% (G{self.gear})', kind=kind)
-            self.campaign_state = 'ARMED_LOAD'
-            self.status = f'[{tag}] {kind} fired: {load_q} @ {self._fp(load_p)}'
+            if self._place(acts, 'BUY', load_p, load_q,
+                           f'{kind} -{drop}% (G{self.gear})', kind=kind):
+                self.campaign_state = 'ARMED_LOAD'
+                self.status = (f'[{tag}] {kind} fired: {load_q} @ '
+                               f'{self._fp(load_p)}')
+            else:
+                self._set_order_wait(tag, 'FLAT', 'load')
             return acts
 
         order_state = self._restale(acts, buys, load_p, load_q, kind.lower())

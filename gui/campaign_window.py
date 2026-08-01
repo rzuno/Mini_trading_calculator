@@ -1,6 +1,6 @@
-"""Campaign window — the Gearbox V-Commandos cockpit for one watched stock.
+"""Campaign window — the Gearbox autopilot cockpit for one watched stock.
 
-Opened by the card's V-COMMANDOS button. Opening it arms WATCH mode: the
+Opened by the card's AUTOPILOT button. Opening it arms WATCH mode: the
 stock is polled every few seconds and this window follows every tick. The bot
 follows exactly the lines the CARD draws — same gear and armed exit tiers.
 
@@ -37,11 +37,11 @@ keeps running in the background (the card button stays colored).
 """
 
 import time as _time
+import re
 from datetime import datetime as _dt
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox
 
 from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, exit_pct, fmt_price,
                        gear_button_color, gear_button_fg, gear_params,
@@ -169,6 +169,18 @@ def sell_tier_colors(pct):
     return sell_pct_color(float(pct)), sell_pct_foreground(float(pct))
 
 
+def user_facing_state(value):
+    """Translate the engine's internal FLAT name at the presentation edge."""
+    return re.sub(r'\bFLAT\b', 'EMPTY', str(value or ''), flags=re.IGNORECASE)
+
+
+def cockpit_gear_style(gear, selected_gear, default_bg):
+    """Only the selected cockpit Gear carries its G1..G5 identity color."""
+    if gear == selected_gear:
+        return gear_button_color(gear), gear_button_fg(gear)
+    return default_bg, '#666666'
+
+
 def status_banner_color(ui):
     """Reserve exhaustion is ordinary strategy state, not a red alarm."""
     state = ui.get('campaign_state') or ui.get('state') or ''
@@ -214,8 +226,6 @@ def campaign_age_line(ui, currency):
         bits.append(f"low {fmt_price(c['campaign_low'], currency)}")
     if c.get('max_cost'):
         bits.append(f"peak {fmt_price(c['max_cost'], currency)}")
-    if c.get('manually_modified'):
-        bits.append('MANUALLY_MODIFIED')
     return '   ·   '.join(bits)
 
 
@@ -308,12 +318,12 @@ def empty_fill_status(ui, currency):
         return (f'(current DEPLOYED: {position}; no new buy/sell change '
                 'recorded in this log)\n')
     if state in ('FLAT', 'RELOAD_ARMED'):
-        return '(current FLAT: no shares; waiting for LOAD)\n'
-    return f'(current {state}; watcher is arming)\n'
+        return '(current EMPTY: no shares; waiting for LOAD)\n'
+    return f'(current {user_facing_state(state)}; watcher is arming)\n'
 
 
 class CampaignWindow:
-    """Live cockpit for one V-Commandos campaign. Subscribes to the
+    """Live cockpit for one autopilot campaign. Subscribes to the
     controller and redraws on every tick."""
 
     def __init__(self, parent, ticker, currency, ap_ctx):
@@ -324,7 +334,7 @@ class CampaignWindow:
 
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
-        self.win.title(f'{name} — V-Commandos campaign')
+        self.win.title(f'{name} — AUTOPILOT')
         self.win.geometry('1420x980')
         self.win.minsize(1100, 760)
         self._ref_font = tkfont.Font(root=self.win, font=_F_REF)
@@ -332,7 +342,8 @@ class CampaignWindow:
         # ── Header ────────────────────────────────────────────────────────────
         head = tk.Frame(self.win, padx=12, pady=8)
         head.pack(fill='x')
-        tk.Label(head, text=f'{name}  — V-Commandos Gearbox', font=_F_TITLE
+        self._head = head
+        tk.Label(head, text=f'{name}  — AUTOPILOT Gearbox', font=_F_TITLE
                  ).pack(side='left')
         self._state_lbl = tk.Label(head, text='', font=_F_TITLE)
         self._state_lbl.pack(side='left', padx=(16, 0))
@@ -343,6 +354,26 @@ class CampaignWindow:
         self._default_bg = self._live_btn.cget('bg')
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
+
+        # LIVE confirmation stays inside this modeless window. Native message
+        # boxes take an application-wide grab on Windows and make the main card
+        # window feel disabled while the commander compares its numbers.
+        self._live_confirm_frame = tk.Frame(
+            self.win, bd=1, relief='solid', padx=10, pady=7,
+            background='#FFF4E5')
+        self._live_confirm_lbl = tk.Label(
+            self._live_confirm_frame, text='', justify='left', anchor='w',
+            wraplength=1220, font=_F_SM, background='#FFF4E5')
+        self._live_confirm_lbl.pack(side='left', fill='x', expand=True)
+        confirm_actions = tk.Frame(self._live_confirm_frame,
+                                   background='#FFF4E5')
+        confirm_actions.pack(side='right', padx=(12, 0))
+        tk.Button(confirm_actions, text='CONFIRM LIVE', font=_F_SM_B,
+                  bg=_LIVE_BG, fg='white', activebackground=_LIVE_BG,
+                  activeforeground='white', command=self._confirm_live
+                  ).pack(fill='x', pady=(0, 4))
+        tk.Button(confirm_actions, text='Keep WATCH', font=_F_SM,
+                  command=self._hide_live_confirmation).pack(fill='x')
 
         # ── Gearbox strip: the same choice as the card, at the cockpit ────────
         box = tk.Frame(self.win, padx=12, pady=3)
@@ -452,6 +483,7 @@ class CampaignWindow:
 
     def _on_live(self):
         if self.ap['mode_of']() == 'LIVE':       # click again → back to WATCH
+            self._hide_live_confirmation()
             self.ap['set_mode']('WATCH')
             return
         ui = self.ap['ui_state']() or {}
@@ -484,12 +516,30 @@ class CampaignWindow:
         ]
         if any(not e.get('armed') for e in sell_lines(ui)):
             detail.append('* projected after the LOAD fills')
-        if not messagebox.askyesno('Campaign LIVE', '\n'.join(detail),
-                                   parent=self.win):
-            return
+        self._show_live_confirmation(detail)
+
+    def _show_live_confirmation(self, detail):
+        """Show the LIVE decision without taking a Tk/application grab."""
+        self._live_confirm_lbl.config(text='\n'.join(detail))
+        if not self._live_confirm_frame.winfo_manager():
+            self._live_confirm_frame.pack(
+                fill='x', padx=12, pady=(0, 6), after=self._head)
+
+    def _hide_live_confirmation(self):
+        if self._live_confirm_frame.winfo_manager():
+            self._live_confirm_frame.pack_forget()
+
+    def _confirm_live(self):
+        """Second, explicit step of the inline modeless LIVE confirmation."""
+        self._hide_live_confirmation()
         ok, msg = self.ap['set_mode']('LIVE')
         if not ok:
-            messagebox.showwarning('Autopilot', msg, parent=self.win)
+            self._show_notice(msg)
+
+    def _show_notice(self, message):
+        """Surface a control failure without disabling the other windows."""
+        self._status_lbl.config(text=user_facing_state(message),
+                                fg=_STATUS_ERROR)
 
     # ── Gearbox strip ─────────────────────────────────────────────────────────
 
@@ -519,7 +569,7 @@ class CampaignWindow:
             return
         ok, msg = self.ap['set_vantage'](None)
         if not ok:
-            messagebox.showwarning('Vantage', msg, parent=self.win)
+            self._show_notice(msg)
 
     def _on_pick_day(self, bar):
         """A day was clicked on the 5-day chart: pin its HIGH as the vantage.
@@ -534,7 +584,7 @@ class CampaignWindow:
         label = bar.get('_vantage_label') or f'{day} high'
         ok, msg = self.ap['set_vantage'](high, label)
         if not ok:
-            messagebox.showwarning('Vantage', msg, parent=self.win)
+            self._show_notice(msg)
 
     def _update_gearbox(self, ui):
         c = ui.get('campaign') or {}
@@ -550,7 +600,7 @@ class CampaignWindow:
             activebackground=('#2E8B57' if auto else '#E6B800'))
         for g, b in self._gear_btns.items():
             picked = (g == gear)
-            bg, fg = gear_button_color(g), gear_button_fg(g)
+            bg, fg = cockpit_gear_style(g, gear, self._default_bg)
             b.config(bg=bg, fg=fg, activebackground=bg,
                      activeforeground=fg,
                      relief=('sunken' if picked else 'raised'),
@@ -605,6 +655,7 @@ class CampaignWindow:
         except tk.TclError:
             return
         if ui is None or not self.ap['is_enabled']():
+            self._hide_live_confirmation()
             self._state_lbl.config(text='off', fg='#888')
             self._status_lbl.config(text='')
             self.ui = None
@@ -613,9 +664,12 @@ class CampaignWindow:
         self.ui = ui
 
         state = ui.get('campaign_state') or ui.get('state', '?')
-        self._state_lbl.config(text=state, fg=_STATE_CLR.get(state, '#666'))
+        self._state_lbl.config(text=user_facing_state(state),
+                               fg=_STATE_CLR.get(state, '#666'))
 
         mode = ui.get('mode', 'WATCH')
+        if mode == 'LIVE':
+            self._hide_live_confirmation()
         self._live_btn.config(
             bg=(_LIVE_BG if mode == 'LIVE' else self._default_bg),
             fg=('white' if mode == 'LIVE' else 'black'))
@@ -630,9 +684,15 @@ class CampaignWindow:
         self._age_lbl.config(text=campaign_age_line(ui, self.ccy))
         self._info_lbl.config(text=self._info_text(ui))
         self._next_lbl.config(text=next_line(ui, self.ccy))
+        # An alert from the poll thread (no data, a rejected order) takes the
+        # status line. It used to be a modal dialog, which could land behind
+        # this window and freeze the whole app.
+        alert = ui.get('alert')
         self._status_lbl.config(
-            text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}",
-            fg=status_banner_color(ui))
+            text=(f"⚠ {alert}" if alert else
+                  f"{user_facing_state(ui.get('status', ''))}    "
+                  f"poll {ui.get('ts', '--')}"),
+            fg=('#CC0000' if alert else status_banner_color(ui)))
         self._update_log(ui)
         self._draw()
         self._refresh_candles()

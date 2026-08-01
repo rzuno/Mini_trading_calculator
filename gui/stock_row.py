@@ -306,7 +306,7 @@ class StockRow:
         # -- Autopilot button: opens the campaign cockpit and arms WATCH -------
         if self.on_autopilot:
             self.ap_btn = tk.Button(
-                wrap, text='V-COMMANDOS', font=_F_SM_B, width=12,
+                wrap, text='AUTOPILOT', font=_F_SM_B, width=12,
                 height=3, bd=2, takefocus=0,
                 command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
@@ -553,10 +553,9 @@ class StockRow:
         else:
             self.current_var.set('--')
 
-        # Deployed: current vs average cost. Flat: LOAD vs current, so the
-        # number rises toward zero as the bait gets closer (historical card
-        # semantics). FLAT keeps one blue lightness scale; deployed remains the
-        # red/grey/blue position P&L scale.
+        # Deployed: current vs average cost. Empty: current vs LOAD, so a price
+        # below the bait is negative. Deployed keeps red/blue P&L colors; EMPTY
+        # uses orange above LOAD and purple below it.
         if self.deployed and self.current_price and anchor_price:
             gap = calc_gap_rate(self.current_price, anchor_price)
             self._gap = gap
@@ -624,9 +623,9 @@ class StockRow:
 
     # Autopilot button styling per status (None = off).
     _AP_STYLES = {
-        None:    ('V-COMMANDOS',        None,      'black'),
-        'WATCH': ('V-COMMANDOS\nWATCH', '#3366CC', 'white'),
-        'LIVE':  ('V-COMMANDOS\nLIVE',  '#CC0000', 'white'),
+        None:    ('AUTOPILOT',        None,      'black'),
+        'WATCH': ('AUTOPILOT\nWATCH', '#3366CC', 'white'),
+        'LIVE':  ('AUTOPILOT\nLIVE',  '#CC0000', 'white'),
     }
     def set_autopilot(self, key):
         """Color the autopilot button to its status (None/'WATCH'/'LIVE')."""
