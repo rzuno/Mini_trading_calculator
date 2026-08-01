@@ -7,53 +7,57 @@ fills and ends only when the broker says the holding is zero.
     FLAT ─ LOAD ─▶ DEPLOYED ─ CHASE… ─▶ full EXIT ─▶ COMPLETED ─▶ FLAT
                                                   └▶ RELOAD_ARMED (same day)
 
-Two lines are watched at a time, never more:
+One buy line and one sell line are ARMED at a time:
 
     next CHASE BUY   avg × (1 - gear.chase%)  ×  shares × gear.ratio
     full EXIT SELL   avg × (1 + tier%)        ×  every share held
 
-Everything is recomputed from the BROKER's quantity and average cost after
-every fill, so the bot can adopt a position that was traded by hand in the
-app and keep going — it never needs to reconstruct the historical ladder.
+and the following chases are published as PROJECTIONS so the window can show
+where the ladder goes next. Everything is recomputed from the BROKER's
+quantity and average cost after every fill, so the bot can adopt a position
+that was traded by hand in the app and keep going — it never needs to
+reconstruct the historical ladder.
 
-Gear and exit tier are fixed for the campaign's life. The card may override
-them mid-campaign; that is an explicit, logged event (GEAR_OVERRIDE /
-EXIT_TIER_OVERRIDE), not adaptive behaviour.
+There is no capital cap. **The only wall is the army**: a chase fires while
+the broker's cash covers it, and stops when it does not.
 
-WATCH mode never places orders: a crossed line is exposed as `trigger` so the
-campaign window's Buy/Sell buttons can fire it by hand. State survives
-restarts through to_dict()/`saved` (the controller persists it).
+Gear and exit tier follow the card at all times, deployed or not — only the
+average cost and the two lines matter, and both are recomputed on the spot.
+Every change is written to the campaign log.
+
+State survives restarts through to_dict()/`saved` (the controller persists it).
 """
 
 import time
 from datetime import datetime
 
-from core.calc import (CAMPAIGN_CAP_UNITS, DEFAULT_EXIT_TIER, DEFAULT_GEAR,
-                       RELOAD_DROP_PCT, calc_chase_price, calc_chase_shares,
-                       calc_exit_price, calc_load_price, calc_reload_price,
-                       chase_drop, clamp_gear, clamp_tier, exit_pct,
-                       gear_params, load_drop, round_half_up, trim_buy_price,
+from core.calc import (DEFAULT_EXIT_TIER, DEFAULT_GEAR, RELOAD_DROP_PCT,
+                       calc_chase_price, calc_chase_shares, calc_exit_price,
+                       calc_load_price, calc_reload_price, chase_drop,
+                       clamp_gear, clamp_tier, exit_pct, gear_params,
+                       load_drop, round_half_up, trim_buy_price,
                        trim_sell_price)
 
-POLL_SECONDS = 10        # watcher tick
+POLL_SECONDS = 5         # watcher tick (4 light reads per watched ticker)
 
 _PENDING_STALE_S = 90    # forget an order intent this long after placing it
                          # if nothing rests and nothing filled (a DAY order
                          # died, or it was cancelled outside)
 
 _SAVE_FIELDS = ('campaign_id', 'campaign_state', 'vantage', 'vantage_src',
-                'gear', 'exit_tier', 'cap_units', 'trading_date',
-                'chase_count', 'max_qty', 'max_cost', 'campaign_low',
-                'campaign_start', 'campaign_vantage', 'load_price',
-                'manually_modified', 'events', 'overrides')
+                'gear', 'exit_tier', 'trading_date', 'chase_count',
+                'max_qty', 'max_cost', 'campaign_low', 'campaign_start',
+                'campaign_vantage', 'load_price', 'manually_modified',
+                'events')
 
 STRATEGY_ID = 'V_COMMANDOS_GEARBOX'
+
+PROJECTED_CHASES = 2     # chase lines published beyond the armed one
 
 
 def default_card_config() -> dict:
     """Fallback when the card has not pushed its config yet."""
-    return {'gear': DEFAULT_GEAR, 'exit_tier': DEFAULT_EXIT_TIER,
-            'cap_units': CAMPAIGN_CAP_UNITS}
+    return {'gear': DEFAULT_GEAR, 'exit_tier': DEFAULT_EXIT_TIER}
 
 
 class CampaignEngine:
@@ -70,9 +74,9 @@ class CampaignEngine:
         'trading_date': str          market-local date 'YYYY-MM-DD',
         'high5':        float|None   highest completed-session high, 5 days,
         'prev_close':   float|None   fallback vantage when High5 is missing,
-        'can_trade':    bool         False in WATCH mode → the crossed line
-                                     is exposed as `trigger`, NOT fired,
-        'card':         dict|None    {'gear','exit_tier','cap_units'},
+        'can_trade':    bool         False in WATCH mode → lines are watched
+                                     and drawn, but nothing is placed,
+        'card':         dict|None    {'gear','exit_tier'},
     }
 
     actions: ('cancel', order_id, label) — only ever our own orders —
@@ -86,19 +90,17 @@ class CampaignEngine:
         self.state = 'ARMING'            # coarse state for the card badge
         self.campaign_state = 'FLAT'     # the manual's §13 state machine
         self.status = 'arming…'
-        self.lines = {}                  # 'load'|'chase'|'exit'|'pexit'
+        self.lines = {}                  # see _publish_lines
         self.events = []                 # THIS campaign's fills
-        self.overrides = []              # GEAR_OVERRIDE / EXIT_TIER_OVERRIDE
         self.trading_date = trading_date
 
-        # -- Campaign header (manual §14.1) ------------------------------------
+        # -- Campaign header ---------------------------------------------------
         self.campaign_id = None
         self.campaign_start = None
         self.campaign_vantage = None     # the vantage that generated the LOAD
         self.load_price = None
         self.gear = DEFAULT_GEAR
         self.exit_tier = DEFAULT_EXIT_TIER
-        self.cap_units = CAMPAIGN_CAP_UNITS
 
         # -- Live vantage (flat state) -----------------------------------------
         self.vantage = None
@@ -111,9 +113,8 @@ class CampaignEngine:
         self.campaign_low = None
         self.manually_modified = False
 
-        self.buy_state = 'OK'            # 'OK' | 'EXHAUSTED' | 'CAPPED'
-        self.trigger = {'BUY': None, 'SELL': None}
-        self.trigger_note = None
+        self.buy_state = 'OK'            # 'OK' | 'EXHAUSTED'
+        self.crossed = {'BUY': None, 'SELL': None}   # lines crossed right now
 
         self.dirty = False
         self._exhaust_logged = False
@@ -138,7 +139,6 @@ class CampaignEngine:
             if f in saved:
                 setattr(self, f, saved[f])
         self.events = list(self.events or [])
-        self.overrides = list(self.overrides or [])
         self.gear = clamp_gear(self.gear)
         self.exit_tier = clamp_tier(self.exit_tier)
 
@@ -147,34 +147,40 @@ class CampaignEngine:
     def _fp(self, p):
         return f'{p:,.0f}' if self.currency == 'KRW' else f'{p:,.2f}'
 
-    def _now(self):
-        return datetime.now().strftime('%m/%d %H:%M')
-
-    def _event(self, kind, qty, price, shares, avg, source='BOT'):
-        self.events.append({'ts': self._now(), 'kind': kind, 'qty': qty,
-                            'price': price, 'shares': shares, 'avg': avg,
-                            'source': source})
+    def _event(self, kind, qty, price, shares, avg, source='BOT', note=''):
+        """One row of the campaign log. `date` is the market-local trading
+        date, so a campaign that runs for days reads day by day."""
+        self.events.append({'date': self.trading_date or '',
+                            'ts': datetime.now().strftime('%m/%d %H:%M'),
+                            'kind': kind, 'qty': qty, 'price': price,
+                            'shares': shares, 'avg': avg,
+                            'source': source, 'note': note})
         del self.events[:-300]
         self.dirty = True
 
-    def _override(self, kind, old, new, reason=''):
-        self.overrides.append({'ts': self._now(), 'kind': kind,
-                               'old': old, 'new': new, 'reason': reason})
-        del self.overrides[:-50]
-        self._log(f'{kind}: {old} → {new}' + (f' ({reason})' if reason else ''))
+    def _note(self, kind, text):
+        """A non-fill row in the campaign log (gear shifts, adoptions)."""
+        self.events.append({'date': self.trading_date or '',
+                            'ts': datetime.now().strftime('%m/%d %H:%M'),
+                            'kind': kind, 'qty': 0, 'price': None,
+                            'shares': self._prev_shares or 0,
+                            'avg': self._prev_avg or None,
+                            'source': 'BOT', 'note': text})
+        del self.events[:-300]
+        self._log(f'{kind}: {text}')
         self.dirty = True
 
-    def _exhaust(self, what, kind='EXHAUSTED'):
-        """Buy side out of army (or at the campaign cap): no popup — the
-        window shows the muted buy line. Logged once per transition."""
-        self.buy_state = kind
+    def _exhaust(self, what):
+        """The army cannot fund the next buy: no popup — the window draws the
+        line muted and says why. Logged once per transition."""
+        self.buy_state = 'EXHAUSTED'
         if not self._exhaust_logged:
             self._exhaust_logged = True
-            self._log(f'{kind}: {what}')
+            self._log(f'EXHAUSTED: {what}')
 
     def _buy_ok(self):
         if self.buy_state != 'OK' and self._exhaust_logged:
-            self._log('buying resumes')
+            self._log('army available again — buying resumes')
         self.buy_state = 'OK'
         self._exhaust_logged = False
 
@@ -189,41 +195,33 @@ class CampaignEngine:
         self._pending = {'side': side, 'price': price, 'qty': qty,
                          'kind': kind or side, 'ts': time.time()}
 
-    def note_manual_order(self, side, price, qty, kind=None):
-        """Register a manually-fired order (the window's Buy/Sell buttons in
-        WATCH mode) so its fill is attributed exactly like a bot order."""
-        self._pending = {'side': side, 'price': price, 'qty': qty,
-                         'kind': kind or side, 'ts': time.time()}
-
-    # ── Gear / tier resolution (the card is the source; changes are logged) ──
+    # ── Gear / tier follow the card, always ──────────────────────────────────
 
     def _apply_card(self, snap):
+        """The card is the source of truth for gear and exit tier — deployed
+        or not. Only the average cost is history; both lines are recomputed
+        from it on the spot, so a mid-campaign shift is safe. It is still
+        written to the campaign log, because it changes where the bot buys."""
         card = dict(snap.get('card') or default_card_config())
         gear = clamp_gear(card.get('gear', self.gear))
         tier = clamp_tier(card.get('exit_tier', self.exit_tier))
-        try:
-            cap = float(card.get('cap_units') or self.cap_units)
-        except (TypeError, ValueError):
-            cap = self.cap_units
-
         deployed = (self._prev_shares or 0) > 0
+
         if gear != self.gear:
-            if deployed:
-                self._override('GEAR_OVERRIDE', self.gear, gear,
-                               'card gear changed mid-campaign')
+            old = self.gear
             self.gear = gear
             self.dirty = True
-        if tier != self.exit_tier:
             if deployed:
-                self._override('EXIT_TIER_OVERRIDE', self.exit_tier, tier,
-                               'card tier changed mid-campaign')
+                self._note('GEAR', f'G{old} → G{gear} '
+                                   f'(chase -{chase_drop(gear)}% '
+                                   f'×{gear_params(gear)["frac"]})')
+        if tier != self.exit_tier:
+            old = self.exit_tier
             self.exit_tier = tier
             self.dirty = True
-        if cap != self.cap_units:
             if deployed:
-                self._override('CAP_OVERRIDE', self.cap_units, cap, '')
-            self.cap_units = cap
-            self.dirty = True
+                self._note('TIER', f'T{old} → T{tier} '
+                                   f'(+{exit_pct(self.gear, tier)}%)')
 
     # ── Day rollover: the reload dies, the vantage returns to High5 ──────────
 
@@ -296,12 +294,18 @@ class CampaignEngine:
         """ADOPT_POSITION (manual §12.2): shares exist but no live campaign in
         this process. The fixed-gear design needs nothing but the broker's
         quantity and average — no Step history to reconstruct."""
-        if not self.campaign_id:
+        fresh = not self.campaign_id
+        if fresh:
             self._open_campaign(avg, adopted=True)
+        self._prev_shares, self._prev_avg = shares, avg
         self.max_qty = max(self.max_qty, shares)
         self.max_cost = max(self.max_cost, shares * avg)
-        self._log(f'ADOPT_POSITION: {shares} @ {self._fp(avg)} '
-                  f'(G{self.gear}, T{self.exit_tier})')
+        if fresh:
+            self._note('ADOPT', f'{shares} sh @ {self._fp(avg)} '
+                                f'(G{self.gear}, T{self.exit_tier})')
+        else:
+            self._log(f're-armed on the open campaign: {shares} @ '
+                      f'{self._fp(avg)}')
 
     def _open_campaign(self, price, adopted=False):
         self.campaign_id = f"{self.ticker}-{datetime.now():%Y%m%d-%H%M%S}"
@@ -314,7 +318,6 @@ class CampaignEngine:
         self.campaign_low = price
         self.manually_modified = bool(adopted)
         self.events = []
-        self.overrides = []
         self.dirty = True
 
     def _on_buy_fill(self, snap, prev, shares, avg):
@@ -327,7 +330,7 @@ class CampaignEngine:
             price = ((avg * shares - self._prev_avg * prev) / qty
                      if avg > 0 and self._prev_avg > 0 and prev > 0
                      else (avg or None))
-            source = 'EXTERNAL'
+            source = 'EXT'
         if prev == 0:
             self._open_campaign(price)
             kind = 'RELOAD' if self.vantage_src == 'reload' else 'LOAD'
@@ -338,12 +341,10 @@ class CampaignEngine:
             self.vantage_src = 'high5'
         else:
             self.chase_count += 1
-            self._event('CHASE', qty, price, shares, avg, source)
+            self._event('CHASE', qty, price, shares, avg, source,
+                        note=f'#{self.chase_count}')
             self._log(f'CHASE filled ({source}): {prev} → {shares} shares '
                       f'(chase #{self.chase_count})')
-            if source == 'EXTERNAL':
-                self._log('EXTERNAL_BUY — lines recalculated from the new '
-                          'broker average')
         if price:
             self.campaign_low = (price if self.campaign_low is None
                                  else min(self.campaign_low, price))
@@ -359,21 +360,25 @@ class CampaignEngine:
             source = 'BOT'
         else:
             price = snap.get('price') or self._prev_avg or None
-            source = 'EXTERNAL'
+            source = 'EXT'
 
         if shares > 0:
             # A partial sell is not part of the strategy (manual §12.4).
             self.manually_modified = True
-            self._event('PARTIAL', -qty, price, shares, avg, source)
+            self._event('PARTIAL', -qty, price, shares, avg, source,
+                        note='hand-trimmed')
             self._log(f'EXTERNAL_PARTIAL_SELL: {prev} → {shares} shares — '
                       f'campaign flagged MANUALLY_MODIFIED; lines recalculated '
                       f'from the remainder')
             self.dirty = True
             return
 
-        self._event('EXIT', -qty, price, shares, avg, source)
-        tag = 'EXIT' if source == 'BOT' else 'EXTERNAL_FULL_EXIT'
-        self._log(f'{tag}: campaign {self.campaign_id} closed — '
+        gain = ((price - self._prev_avg) * qty
+                if price and self._prev_avg else None)
+        self._event('EXIT', -qty, price, shares, avg, source,
+                    note=(f'{self._fp(gain)} gross' if gain is not None
+                          else ''))
+        self._log(f'EXIT ({source}): campaign {self.campaign_id} closed — '
                   f'-{qty} @ {self._fp(price or 0)}')
         self.campaign_state = 'COMPLETED'
         self.campaign_id = None
@@ -388,6 +393,44 @@ class CampaignEngine:
                       f'(sell fill -{RELOAD_DROP_PCT}%) until the session ends')
         self.dirty = True
 
+    # ── Line publication ─────────────────────────────────────────────────────
+
+    def _publish_lines(self, armed_buy, projections, sell, sell_armed):
+        """`lines` is what the window draws, ordered bottom-up.
+
+        Each entry is {'price', 'qty', 'label', 'kind', 'armed'}. Exactly one
+        buy and one sell are armed; the rest are projections showing where the
+        ladder goes next."""
+        self.lines = {}
+        if armed_buy:
+            self.lines[armed_buy['kind']] = armed_buy
+        for p in projections:
+            self.lines[p['kind']] = p
+        if sell:
+            self.lines['exit' if sell_armed else 'pexit'] = sell
+
+    def _chase_projection(self, shares, avg, count=PROJECTED_CHASES):
+        """The chases AFTER the armed one, each folded into the running
+        average exactly as the campaign would run them."""
+        out = []
+        cur_shares, cur_avg = shares, avg
+        for i in range(count + 1):
+            if cur_shares <= 0 or cur_avg <= 0:
+                break
+            price = trim_buy_price(self.ticker,
+                                   calc_chase_price(cur_avg, self.gear))
+            qty = calc_chase_shares(cur_shares, self.gear)
+            if price <= 0 or qty <= 0:
+                break
+            if i > 0:
+                out.append({'price': price, 'qty': qty,
+                            'kind': f'chase{i + 1}',
+                            'label': f'chase {i + 1}', 'armed': False})
+            new_shares = cur_shares + qty
+            cur_avg = (cur_avg * cur_shares + price * qty) / new_shares
+            cur_shares = new_shares
+        return out
+
     # ── Main decision cycle ───────────────────────────────────────────────────
 
     def poll(self, snap: dict) -> list:
@@ -398,15 +441,14 @@ class CampaignEngine:
         self._detect_fills(snap, shares)
         self._prev_shares = shares
         self._prev_avg = float(snap.get('avg_cost') or 0)
-        self.trigger = {'BUY': None, 'SELL': None}
-        self.trigger_note = None
+        self.crossed = {'BUY': None, 'SELL': None}
         price = snap.get('price')
         if price and shares > 0 and self.campaign_low is not None:
             self.campaign_low = min(self.campaign_low, price)
         return (self._poll_deployed(snap, shares) if shares > 0
                 else self._poll_flat(snap))
 
-    # ── DEPLOYED: exactly two lines — next CHASE, full EXIT ──────────────────
+    # ── DEPLOYED: armed CHASE + full EXIT, plus the next chases ──────────────
 
     def _poll_deployed(self, snap, shares):
         self.state = 'DEPLOYED'
@@ -422,26 +464,25 @@ class CampaignEngine:
         chase_p = trim_buy_price(self.ticker, calc_chase_price(avg, self.gear))
         chase_q = calc_chase_shares(shares, self.gear)
         exit_p = trim_sell_price(self.ticker,
-                                 calc_exit_price(avg, self.gear, self.exit_tier))
-
-        self.lines = {'exit': (exit_p, shares)}
-        if chase_q > 0:
-            self.lines['chase'] = (chase_p, chase_q)
+                                 calc_exit_price(avg, self.gear,
+                                                 self.exit_tier))
+        armed_buy = ({'price': chase_p, 'qty': chase_q, 'kind': 'chase',
+                      'label': f'CHASE -{chase_drop(self.gear)}% ×{g["frac"]}',
+                      'armed': True} if chase_q > 0 else None)
+        self._publish_lines(
+            armed_buy, self._chase_projection(shares, avg),
+            {'price': exit_p, 'qty': shares, 'armed': True,
+             'kind': 'exit',
+             'label': f'EXIT T{self.exit_tier} '
+                      f'+{exit_pct(self.gear, self.exit_tier)}%'},
+            True)
 
         acts = []
-        # Campaign cap and army are both checked every poll so the window can
-        # flag an unaffordable chase before the line is crossed.
-        unit = snap.get('unit_cash') or 0.0
-        spent = shares * avg
-        need = chase_p * chase_q
-        cap_room = (self.cap_units * unit - spent) if unit > 0 else None
+        # The army is the only wall.
         bp = snap.get('buying_power')
-        capped = cap_room is not None and need > cap_room
-        broke = bp is not None and need > bp
-        if capped:
-            self._exhaust(f'next chase needs {self._fp(need)}, campaign cap '
-                          f'leaves {self._fp(max(0.0, cap_room))}', 'CAPPED')
-        elif broke:
+        need = chase_p * chase_q
+        affordable = bp is None or need <= bp
+        if not affordable:
             self._exhaust(f'next chase needs {chase_q} @ {self._fp(chase_p)}')
         else:
             self._buy_ok()
@@ -456,17 +497,15 @@ class CampaignEngine:
 
         # 1) EXIT first — the campaign always prefers to finish.
         if price >= exit_p:
+            self.crossed['SELL'] = {'price': exit_p, 'qty': shares}
             if sells:
                 self.campaign_state = 'EXIT_PENDING'
                 self.status = f'[{tag}] EXIT resting — waiting for the fill'
                 return acts
             label = f'EXIT T{self.exit_tier} (full)'
-            self.trigger['SELL'] = {'side': 'SELL', 'price': exit_p,
-                                    'qty': shares, 'label': label,
-                                    'kind': 'EXIT'}
             if not snap.get('can_trade', True):
-                self.status = (f'[{tag}] EXIT trigger met @ {self._fp(price)} '
-                               f'(watching only)')
+                self.status = (f'[{tag}] EXIT line crossed @ '
+                               f'{self._fp(price)} — WATCH mode, not sent')
                 return acts
             acts += [('cancel', o['id'], 'our chase (exit first)')
                      for o in buys if o.get('mine')]
@@ -475,28 +514,22 @@ class CampaignEngine:
             self.status = f'[{tag}] EXIT fired: {shares} @ {self._fp(exit_p)}'
             return acts
 
-        # 2) CHASE — only when both the army and the campaign cap allow it.
+        # 2) CHASE — while the army can fund it.
         if chase_q > 0 and price <= chase_p:
+            self.crossed['BUY'] = {'price': chase_p, 'qty': chase_q}
             if buys:
                 self.campaign_state = 'CHASE_PENDING'
                 self.status = f'[{tag}] chase resting — waiting for the fill'
                 return acts
-            if capped or broke:
-                why = ('campaign cap reached' if capped
-                       else 'no reserve army')
-                self.trigger_note = (f'▼ CHASE crossed — {why}; the manual '
-                                     f'Buy button is off')
-                self.status = (f'[{tag}] CHASE crossed but {why} — watching '
-                               f'EXIT only')
+            if not affordable:
+                self.status = (f'[{tag}] CHASE crossed but no reserve army '
+                               f'remains — watching EXIT only')
                 return acts
             label = (f'CHASE -{chase_drop(self.gear)}% ×{g["frac"]} '
                      f'(G{self.gear})')
-            self.trigger['BUY'] = {'side': 'BUY', 'price': chase_p,
-                                   'qty': chase_q, 'label': label,
-                                   'kind': 'CHASE'}
             if not snap.get('can_trade', True):
-                self.status = (f'[{tag}] CHASE trigger met @ '
-                               f'{self._fp(price)} (watching only)')
+                self.status = (f'[{tag}] CHASE line crossed @ '
+                               f'{self._fp(price)} — WATCH mode, not sent')
                 return acts
             acts += [('cancel', o['id'], 'our exit (chase first)')
                      for o in sells if o.get('mine')]
@@ -507,18 +540,14 @@ class CampaignEngine:
 
         self.campaign_state = 'DEPLOYED'
         lo = self._fp(chase_p) if chase_q > 0 else '--'
-        tail = ''
-        if self.buy_state == 'CAPPED':
-            tail = ' · CAP reached (chase off)'
-        elif self.buy_state == 'EXHAUSTED':
-            tail = ' · EXHAUSTED (chase off)'
+        tail = ' · EXHAUSTED (chase off)' if self.buy_state != 'OK' else ''
         if self.manually_modified:
             tail += ' · MANUALLY_MODIFIED'
         self.status = (f'[{tag}] watching: {lo} < now {self._fp(price)} '
                        f'< {self._fp(exit_p)}{tail}')
         return acts
 
-    # ── FLAT: one line — the LOAD hanging off the vantage ────────────────────
+    # ── FLAT: the LOAD hanging off the vantage, plus its projected ladder ────
 
     def _poll_flat(self, snap):
         self.state = 'FLAT'
@@ -548,10 +577,17 @@ class CampaignEngine:
             self.status = 'flat — unit cash unknown'
             return []
 
-        # Projected exit if the load filled here (informational only).
+        kind = 'RELOAD' if reload_mode else 'LOAD'
         pexit = trim_sell_price(
             self.ticker, calc_exit_price(load_p, self.gear, self.exit_tier))
-        self.lines = {'load': (load_p, load_q), 'pexit': (pexit, load_q)}
+        self._publish_lines(
+            {'price': load_p, 'qty': load_q, 'kind': 'load', 'armed': True,
+             'label': f'{kind} -{drop}%'},
+            self._chase_projection(load_q, load_p),
+            {'price': pexit, 'qty': load_q, 'kind': 'pexit', 'armed': False,
+             'label': f'exit if loaded T{self.exit_tier} '
+                      f'+{exit_pct(self.gear, self.exit_tier)}%'},
+            False)
 
         acts = []
         bp = snap.get('buying_power')
@@ -567,32 +603,26 @@ class CampaignEngine:
             self.status = 'no price — watching paused'
             return acts
         buys, _sells = self._split_orders(snap)
-        label = (f'RELOAD -{drop}%' if reload_mode
-                 else f'LOAD -{drop}% (G{self.gear})')
         tag = f'G{self.gear}' + (' reload' if reload_mode else '')
 
         if price <= load_p:
+            self.crossed['BUY'] = {'price': load_p, 'qty': load_q}
             if buys:
                 self.campaign_state = 'ARMED_LOAD'
                 self.status = f'[{tag}] load resting — waiting for the fill'
                 return acts
             if not affordable:
-                self.trigger_note = ('▼ LOAD crossed — no reserve army; the '
-                                     'manual Buy button is off')
                 self.status = (f'[{tag}] LOAD crossed but no reserve army '
                                f'remains')
                 return acts
-            self.trigger['BUY'] = {'side': 'BUY', 'price': load_p,
-                                   'qty': load_q, 'label': label,
-                                   'kind': 'RELOAD' if reload_mode else 'LOAD'}
             if not snap.get('can_trade', True):
-                self.status = (f'[{tag}] LOAD trigger met @ '
-                               f'{self._fp(price)} (watching only)')
+                self.status = (f'[{tag}] LOAD line crossed @ '
+                               f'{self._fp(price)} — WATCH mode, not sent')
                 return acts
-            self._place(acts, 'BUY', load_p, load_q, label,
-                        kind='RELOAD' if reload_mode else 'LOAD')
+            self._place(acts, 'BUY', load_p, load_q,
+                        f'{kind} -{drop}% (G{self.gear})', kind=kind)
             self.campaign_state = 'ARMED_LOAD'
-            self.status = f'[{tag}] LOAD fired: {load_q} @ {self._fp(load_p)}'
+            self.status = f'[{tag}] {kind} fired: {load_q} @ {self._fp(load_p)}'
             return acts
 
         self.campaign_state = ('RELOAD_ARMED' if reload_mode else 'FLAT')
@@ -626,7 +656,6 @@ class CampaignEngine:
             'chase_count': self.chase_count,
             'max_qty': self.max_qty,
             'max_cost': self.max_cost,
-            'cap_units': self.cap_units,
             'manually_modified': self.manually_modified,
             'exit_price': exit_p,
             'gross_target': ((exit_p - avg) * shares

@@ -1,25 +1,27 @@
 """Campaign window — the Gearbox V-Commandos cockpit for one watched stock.
 
-Opened by the card's big V-COMMANDOS button. Opening it arms WATCH mode: the
+Opened by the card's V-COMMANDOS button. Opening it arms WATCH mode: the
 stock is polled every few seconds and this window follows every tick. The bot
 follows exactly the lines the CARD draws — same gear, same exit tier.
 
-    WATCH  polling + line watching + fill detection; nothing is placed. A
-           crossed line lights the trigger row so it can be fired by hand.
-    LIVE   the bot places the LOAD / CHASE / full EXIT by itself the moment a
-           line is crossed; allowed only during regular market hours (drops
-           back to WATCH at the close).
+    WATCH  polling, lines and fill detection only; nothing is placed.
+    LIVE   the bot sends the LOAD / CHASE / full EXIT by ITSELF the moment
+           the curve crosses a line; regular market hours only (drops back
+           to WATCH at the close).
 
-Layout:
+There are no manual Buy/Sell buttons: the point of the bot is that the offer
+goes out when the curve touches the line. The only intervention left is
+"Cancel all", the escape hatch.
+
+Layout is ONE information banner over TWO charts, plus the campaign log:
 
     header   name · campaign state · market phase · LIVE
-    banner   gear line (G/​tier · load% / chase% ×frac · vantage · cap)
+    banner   gear line (G/tier · load% / chase% ×frac · vantage)
              position · reserve · campaign age / chases / low
-             ▼ next CHASE   ▲ full EXIT
+             ▲ the EXIT   ▼ the next buy and its size, then the ones after
              engine status + poll time
-             trigger row (Buy / Sell / Cancel all)
-             campaign fill log
-    charts   live tick curve with the campaign lines | 5-day candle panel
+    charts   live tick curve inside the campaign | 5-day candle panel
+    log      RECORDED FILLS — one row per trade, grouped by trading day
 
 Closing the window in WATCH mode stops the polling; in LIVE the campaign
 keeps running in the background (the card button stays colored).
@@ -42,17 +44,20 @@ _F_BTN   = ('Segoe UI', 13, 'bold')
 _F_INFO  = ('Segoe UI', 12)
 _F_AXIS  = ('Segoe UI', 10)
 _F_REF   = ('Segoe UI', 11, 'bold')
-_F_FILLS = ('Consolas', 11)
+_F_LOG   = ('Consolas', 11)
 
-# KR color language: red = the EXIT (sell) side, blue = the LOAD/CHASE side.
+# KR color language: red = the EXIT (sell) side, blue = the buy side. Soft
+# shades are the projected lines the ladder has not reached yet.
 _CLR = {
-    'exit':    '#CC3333',
-    'buy':     '#3366CC',
-    'vantage': '#E08000',
-    'avg':     '#7E3FBF',
-    'path':    '#1A1A1A',
-    'now':     '#CC0000',
-    'zone':    '#F4F1FA',
+    'exit':      '#CC3333',
+    'exit_soft': '#E4A9A9',
+    'buy':       '#3366CC',
+    'buy_soft':  '#A9C4E4',
+    'vantage':   '#E08000',
+    'avg':       '#7E3FBF',
+    'path':      '#1A1A1A',
+    'now':       '#CC0000',
+    'zone':      '#F4F1FA',
 }
 _PHASE_TXT = {'REGULAR': ('OPEN (regular)', '#007700'),
               'PRE':     ('pre-market', '#B8860B'),
@@ -66,7 +71,15 @@ _STATE_CLR = {
     'COMPLETED': '#007700', 'RELOAD_ARMED': '#E08000',
     'PAUSED_RECONCILE': '#CC0000', 'ARMING': '#666666',
 }
-_FILLS_SHOWN = 10
+_KIND_CLR = {'LOAD': '#0033AA', 'RELOAD': '#E08000', 'CHASE': '#3366CC',
+             'EXIT': '#CC3333', 'PARTIAL': '#B8860B',
+             'ADOPT': '#7E3FBF', 'GEAR': '#666666', 'TIER': '#666666'}
+
+_VANTAGE_SRC = {'high5': 'High5', 'close': 'prev close',
+                'reload': 'sell fill'}
+
+# Buy lines in the order they would fire, armed first.
+_BUY_KEYS = ('load', 'chase', 'chase2', 'chase3')
 
 
 def campaign_line(ui, currency):
@@ -79,10 +92,8 @@ def campaign_line(ui, currency):
              f"CHASE -{c['chase_pct']}% ×{c['add_frac']}",
              f"EXIT T{c['exit_tier']} +{c['exit_pct']}% (full)"]
     if c.get('vantage'):
-        src = {'high5': 'High5', 'close': 'prev close',
-               'reload': 'sell fill'}.get(c.get('vantage_src'), '')
+        src = _VANTAGE_SRC.get(c.get('vantage_src'), '')
         parts.append(f"vantage {fmt_price(c['vantage'], currency)} ({src})")
-    parts.append(f"cap {c.get('cap_units', 32):g}u")
     return '  ·  '.join(parts)
 
 
@@ -104,51 +115,66 @@ def campaign_age_line(ui, currency):
     return '   ·   '.join(bits)
 
 
+def buy_lines(ui):
+    """The buy ladder in firing order: the armed line, then the projections."""
+    lines = ui.get('lines') or {}
+    return [lines[k] for k in _BUY_KEYS if lines.get(k)]
+
+
 def next_line(ui, currency):
-    """'▼ next CHASE …   ▲ full EXIT …' straight off the engine's two lines."""
+    """'▲ EXIT …   ▼ next buy …   then …' — the sell line on top, the next
+    buy and its size below it, and where the ladder goes after that."""
     lines = ui.get('lines') or {}
     parts = []
-    chase = lines.get('chase')
-    load = lines.get('load')
-    if load:
-        tail = (' [NO ARMY]' if ui.get('buy_state') == 'EXHAUSTED' else '')
-        parts.append(f"▼ LOAD {fmt_price(load[0], currency)} × {load[1]}{tail}")
-    elif chase:
-        state = ui.get('buy_state')
-        tail = (' [CAP]' if state == 'CAPPED'
-                else ' [NO ARMY]' if state == 'EXHAUSTED' else '')
-        parts.append(f"▼ CHASE {fmt_price(chase[0], currency)} × "
-                     f"{chase[1]}{tail}")
-    else:
-        parts.append('▼ no chase line')
-    ex = lines.get('exit') or lines.get('pexit')
-    if ex:
-        tag = 'EXIT' if lines.get('exit') else 'exit (projected)'
-        parts.append(f"▲ {tag} {fmt_price(ex[0], currency)} × {ex[1]}")
+    sell = lines.get('exit') or lines.get('pexit')
+    if sell:
+        tag = 'EXIT' if lines.get('exit') else 'exit if loaded'
+        parts.append(f"▲ {tag} {fmt_price(sell['price'], currency)} × "
+                     f"{sell['qty']}")
     else:
         parts.append('▲ no exit line')
+
+    ladder = buy_lines(ui)
+    if ladder:
+        armed = ladder[0]
+        tail = (' [NO ARMY]' if ui.get('buy_state') != 'OK' else '')
+        parts.append(f"▼ {armed['label']} {fmt_price(armed['price'], currency)}"
+                     f" × {armed['qty']}{tail}")
+        rest = ['%s × %s' % (fmt_price(e['price'], currency), e['qty'])
+                for e in ladder[1:]]
+        if rest:
+            parts.append('then ' + '  ·  '.join(rest))
+    else:
+        parts.append('▼ no buy line')
     return '      '.join(parts)
 
 
-def fills_text(ui, currency, limit=_FILLS_SHOWN):
-    """This campaign's fills — '' before the first one."""
-    events = ui.get('events') or []
-    if not events:
-        return ''
-    shown = events[-limit:]
-    head = f'campaign fills ({len(events)})'
-    if len(events) > len(shown):
-        head += f' — last {len(shown)}'
-    lines = [head + ':']
-    for e in shown:
+def fill_log_rows(ui, currency, limit=40):
+    """[(text, kind)] for the campaign log — newest last, one row per trade,
+    with a day header whenever the trading date changes."""
+    events = (ui.get('events') or [])[-limit:]
+    rows, day = [], None
+    for e in events:
+        d = e.get('date') or ''
+        if d and d != day:
+            day = d
+            rows.append((f'── {d} ' + '─' * 24, 'DAY'))
         price = e.get('price')
         p = fmt_price(price, currency) if price else '--'
-        src = (e.get('source') or 'BOT')[:3]
-        avg = e.get('avg')
-        lines.append(f"  {e['ts']}  {e['kind']:<8} {src:<4}{e['qty']:+d} @ {p}"
-                     f"  → {e['shares']} sh"
-                     + (f" @ {fmt_price(avg, currency)}" if avg else ''))
-    return '\n'.join(lines)
+        kind = e.get('kind', '?')
+        if e.get('qty'):
+            line = (f"{e['ts']}  {kind:<7} {e['qty']:+d} @ {p}"
+                    f"  → {e['shares']} sh")
+            if e.get('avg'):
+                line += f" @ {fmt_price(e['avg'], currency)}"
+            if e.get('source') == 'EXT':
+                line += '  [hand]'
+        else:
+            line = f"{e['ts']}  {kind:<7} {e.get('note', '')}"
+        if e.get('note') and e.get('qty'):
+            line += f"  {e['note']}"
+        rows.append((line, kind if kind in _KIND_CLR else 'OTHER'))
+    return rows
 
 
 class CampaignWindow:
@@ -164,7 +190,7 @@ class CampaignWindow:
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
         self.win.title(f'{name} — V-Commandos campaign')
-        self.win.geometry('1260x880')
+        self.win.geometry('1260x900')
         self.win.minsize(980, 640)
         self._ref_font = tkfont.Font(root=self.win, font=_F_REF)
 
@@ -180,6 +206,9 @@ class CampaignWindow:
                                    command=self._on_live)
         self._live_btn.pack(side='right', padx=(6, 0))
         self._default_bg = self._live_btn.cget('bg')
+        self._cancel_btn = tk.Button(head, text='Cancel all', font=_F_INFO,
+                                     command=self._do_cancel)
+        self._cancel_btn.pack(side='right', padx=(6, 0))
         self._phase_lbl = tk.Label(head, text='', font=_F_STAT)
         self._phase_lbl.pack(side='right', padx=(0, 8))
 
@@ -198,30 +227,29 @@ class CampaignWindow:
         self._next_lbl.pack(fill='x', padx=14)
         self._status_lbl = tk.Label(self.win, text='', font=_F_INFO,
                                     fg='#4B0082', anchor='w')
-        self._status_lbl.pack(fill='x', padx=14)
+        self._status_lbl.pack(fill='x', padx=14, pady=(0, 4))
 
-        # ── Trigger row: fire a crossed line by hand (WATCH mode) ─────────────
-        trig = tk.Frame(self.win, padx=14, pady=2)
-        trig.pack(fill='x')
-        self._trig_lbl = tk.Label(trig, text='', font=_F_INFO, anchor='w')
-        self._trig_lbl.pack(side='left')
-        self._cancel_btn = tk.Button(trig, text='Cancel all', font=_F_INFO,
-                                     command=self._do_cancel)
-        self._cancel_btn.pack(side='right', padx=(6, 0))
-        self._sell_btn = tk.Button(trig, text='SELL', font=_F_BTN, width=8,
-                                   command=lambda: self._do_fire('SELL'))
-        self._sell_btn.pack(side='right', padx=(6, 0))
-        self._buy_btn = tk.Button(trig, text='BUY', font=_F_BTN, width=8,
-                                  command=lambda: self._do_fire('BUY'))
-        self._buy_btn.pack(side='right', padx=(6, 0))
-
-        self._fills_lbl = tk.Label(self.win, text='', font=_F_FILLS,
-                                   fg='#333', anchor='w', justify='left')
-        # packed/unpacked on demand in _update_fills
+        # ── Campaign log (bottom strip, grows with the campaign) ─────────────
+        log_box = tk.Frame(self.win)
+        log_box.pack(fill='x', side='bottom', padx=12, pady=(0, 10))
+        self._log_txt = tk.Text(log_box, height=7, font=_F_LOG, bd=1,
+                                relief='sunken', wrap='none',
+                                background='#FBFBFB')
+        bar = tk.Scrollbar(log_box, command=self._log_txt.yview)
+        self._log_txt.config(yscrollcommand=bar.set)
+        bar.pack(side='right', fill='y')
+        self._log_txt.pack(side='left', fill='x', expand=True)
+        self._log_txt.tag_config('HEADER', foreground='#000000',
+                                 font=('Consolas', 11, 'bold'))
+        self._log_txt.tag_config('DAY', foreground='#888888')
+        self._log_txt.tag_config('OTHER', foreground='#333333')
+        for kind, color in _KIND_CLR.items():
+            self._log_txt.tag_config(kind, foreground=color)
+        self._log_txt.config(state='disabled')
 
         # ── Body: live chart | 5-day candle panel ─────────────────────────────
         self._body = tk.Frame(self.win)
-        self._body.pack(fill='both', expand=True, padx=12, pady=(6, 12))
+        self._body.pack(fill='both', expand=True, padx=12, pady=(6, 8))
 
         self.canvas = tk.Canvas(self._body, bg='white', highlightthickness=0)
         self.canvas.pack(side='left', fill='both', expand=True)
@@ -241,6 +269,8 @@ class CampaignWindow:
         if self._cb:
             self.ap['unsubscribe'](self._cb)
             self._cb = None
+        # Bare watching stops with its window; LIVE keeps running in the
+        # background (the card's button stays colored).
         if self.ap['mode_of']() == 'WATCH':
             self.ap['disable']()
 
@@ -254,26 +284,24 @@ class CampaignWindow:
         c = ui.get('campaign') or {}
         lines = ui.get('lines') or {}
         detail = [f'Go LIVE on {self.ticker}?', '',
-                  'The V-Commandos campaign bot places these by ITSELF the '
-                  'moment a line is crossed:']
-        if lines.get('load'):
-            detail.append(f"  LOAD   {lines['load'][1]} @ "
-                          f"{fmt_price(lines['load'][0], self.ccy)}")
-        if lines.get('chase'):
-            detail.append(f"  CHASE  {lines['chase'][1]} @ "
-                          f"{fmt_price(lines['chase'][0], self.ccy)}")
+                  'The campaign bot sends these by ITSELF the moment the '
+                  'price touches the line:']
+        for e in buy_lines(ui)[:1]:
+            detail.append(f"  BUY   {e['qty']} @ "
+                          f"{fmt_price(e['price'], self.ccy)}   ({e['label']})")
         if lines.get('exit'):
-            detail.append(f"  EXIT   {lines['exit'][1]} (ALL) @ "
-                          f"{fmt_price(lines['exit'][0], self.ccy)}")
+            detail.append(f"  SELL  {lines['exit']['qty']} (ALL) @ "
+                          f"{fmt_price(lines['exit']['price'], self.ccy)}")
         detail += [
             '',
-            f"Gear {c.get('gear', '?')} is fixed for the campaign: LOAD "
-            f"-{c.get('load_pct', '?')}%, CHASE -{c.get('chase_pct', '?')}% "
-            f"×{c.get('add_frac', '?')}, one full EXIT at T"
-            f"{c.get('exit_tier', '?')} +{c.get('exit_pct', '?')}%. "
-            f"One order at a time; every fill recomputes both lines from the "
-            f"broker's real average; the campaign ends only when the holding "
-            f"is zero. LIVE drops back to WATCH when the market closes.",
+            f"Gear {c.get('gear', '?')}: LOAD -{c.get('load_pct', '?')}%, "
+            f"CHASE -{c.get('chase_pct', '?')}% ×{c.get('add_frac', '?')}, "
+            f"one full EXIT at T{c.get('exit_tier', '?')} "
+            f"+{c.get('exit_pct', '?')}%. One order at a time; every fill "
+            f"recomputes both lines from the broker's real average; the "
+            f"campaign ends only when the holding is zero. The chase stops "
+            f"when the army runs out — there is no other cap. LIVE drops "
+            f"back to WATCH when the market closes.",
         ]
         if not messagebox.askyesno('Campaign LIVE', '\n'.join(detail),
                                    parent=self.win):
@@ -281,19 +309,6 @@ class CampaignWindow:
         ok, msg = self.ap['set_mode']('LIVE')
         if not ok:
             messagebox.showwarning('Autopilot', msg, parent=self.win)
-
-    def _do_fire(self, side):
-        trig = ((self.ui or {}).get('trigger') or {}).get(side)
-        if not trig:
-            return
-        text = (f"{trig.get('label', side)}\n\n{side} {trig['qty']} @ "
-                f"{fmt_price(trig['price'], self.ccy)}\n\nSend this order now?")
-        if not messagebox.askyesno('Fire the crossed line', text,
-                                   parent=self.win):
-            return
-        ok, msg = self.ap['manual_fire'](side)
-        if not ok:
-            messagebox.showwarning('Order', msg, parent=self.win)
 
     def _do_cancel(self):
         if not messagebox.askyesno(
@@ -338,9 +353,9 @@ class CampaignWindow:
         self._info_lbl.config(text=self._info_text(ui))
         self._next_lbl.config(text=next_line(ui, self.ccy))
         self._status_lbl.config(
-            text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}")
-        self._update_trigger_row(ui)
-        self._update_fills(ui)
+            text=f"{ui.get('status', '')}    poll {ui.get('ts', '--')}",
+            fg=('#CC0000' if ui.get('buy_state') != 'OK' else '#4B0082'))
+        self._update_log(ui)
         self._draw()
         self._refresh_candles()
 
@@ -363,105 +378,90 @@ class CampaignWindow:
             parts.append(f"target {fmt_price(c['gross_target'], self.ccy)}")
         bp = ui.get('buying_power')
         if bp is not None:
-            parts.append(f'reserve {fmt_price(bp, self.ccy)}')
+            parts.append(f'army {fmt_price(bp, self.ccy)}')
         orders = ui.get('orders') or []
         if orders:
             sides = sorted({o.get('side') for o in orders if o.get('side')})
             parts.append('● resting: ' + '/'.join(sides))
         return '      '.join(parts)
 
-    def _update_trigger_row(self, ui):
-        trig = ui.get('trigger') or {}
-        live = ui.get('mode') == 'LIVE'
-        note = ui.get('trigger_note')
-        msgs = []
-        for side, btn in (('BUY', self._buy_btn), ('SELL', self._sell_btn)):
-            t = trig.get(side)
-            if t and not live:
-                btn.config(state='normal',
-                           text=f"{side} {t['qty']}",
-                           bg=(_CLR['buy'] if side == 'BUY' else _CLR['exit']),
-                           fg='white')
-                msgs.append(f"{t.get('label', side)} @ "
-                            f"{fmt_price(t['price'], self.ccy)}")
-            else:
-                btn.config(state='disabled', text=side,
-                           bg=self._default_bg, fg='black')
-        if live:
-            text, color = 'LIVE — the bot fires by itself', '#CC0000'
-        elif note:
-            text, color = note, _NO_ARMY_CLR
-        elif msgs:
-            text, color = 'line crossed:  ' + '   ·   '.join(msgs), '#0033AA'
-        else:
-            text, color = 'no line crossed — watching', '#888'
-        self._trig_lbl.config(text=text, fg=color)
-
-    def _update_fills(self, ui):
-        text = fills_text(ui, self.ccy)
-        if text:
-            self._fills_lbl.config(text=text)
-            if not self._fills_lbl.winfo_ismapped():
-                self._fills_lbl.pack(fill='x', padx=14, pady=(2, 0),
-                                     before=self._body)
-        elif self._fills_lbl.winfo_ismapped():
-            self._fills_lbl.pack_forget()
+    def _update_log(self, ui):
+        rows = fill_log_rows(ui, self.ccy)
+        txt = self._log_txt
+        txt.config(state='normal')
+        txt.delete('1.0', 'end')
+        txt.insert('end', 'RECORDED FILLS\n', 'HEADER')
+        if not rows:
+            state = ui.get('campaign_state') or ui.get('state') or 'ARMING'
+            txt.insert('end', {
+                'DEPLOYED': '(no buy/sell change recorded since this '
+                            'campaign was adopted)\n',
+                'FLAT': '(no campaign open — waiting for the LOAD)\n',
+            }.get(state, '(watcher is arming)\n'), 'OTHER')
+        for line, kind in rows:
+            txt.insert('end', line + '\n', kind)
+        txt.config(state='disabled')
+        txt.see('end')
 
     # ── Campaign reference lines, shared by both charts ──────────────────────
 
     def _line_rows(self, ui):
-        """[(price, color, text, bold)] — the campaign's real lines only."""
+        """[(price, color, text, bold)] — the armed lines are bold, the
+        projected ones soft, exactly like the grid window's watch levels."""
         rows = []
         lines = ui.get('lines') or {}
         c = ui.get('campaign') or {}
         avg = ui.get('avg_cost') or 0
-        state = ui.get('buy_state')
+        no_army = ui.get('buy_state') != 'OK'
 
-        if lines.get('load'):
-            p, q = lines['load']
-            tag = 'RELOAD' if c.get('vantage_src') == 'reload' else 'LOAD'
-            text = f'{tag} {fmt_price(p, self.ccy)} × {q}'
-            color = _CLR['buy']
-            if state == 'EXHAUSTED':
+        for key in _BUY_KEYS:
+            e = lines.get(key)
+            if not e:
+                continue
+            armed = bool(e.get('armed'))
+            text = (f"{e['label']} {fmt_price(e['price'], self.ccy)} "
+                    f"× {e['qty']}")
+            color = _CLR['buy'] if armed else _CLR['buy_soft']
+            if armed and no_army:
                 color, text = _NO_ARMY_CLR, f'✕ {text} (no army)'
-            rows.append((p, color, text, True))
-        if lines.get('chase'):
-            p, q = lines['chase']
-            text = (f"CHASE -{c.get('chase_pct', '?')}% "
-                    f"{fmt_price(p, self.ccy)} × {q}")
-            color = _CLR['buy']
-            if state in ('EXHAUSTED', 'CAPPED'):
-                why = 'cap' if state == 'CAPPED' else 'no army'
-                color, text = _NO_ARMY_CLR, f'✕ {text} ({why})'
-            rows.append((p, color, text, True))
+            rows.append((e['price'], color, text, armed))
+
         if avg > 0:
             rows.append((avg, _CLR['avg'],
                          f'avg {fmt_price(avg, self.ccy)}', True))
-        if lines.get('exit'):
-            p, q = lines['exit']
-            rows.append((p, _CLR['exit'],
-                         f"EXIT T{c.get('exit_tier', '?')} "
-                         f"+{c.get('exit_pct', '?')}% "
-                         f"{fmt_price(p, self.ccy)} × {q} (all)", True))
-        elif lines.get('pexit'):
-            p, q = lines['pexit']
-            rows.append((p, _CLR['exit'],
-                         f'exit if loaded {fmt_price(p, self.ccy)} × {q}',
-                         False))
+
+        sell = lines.get('exit') or lines.get('pexit')
+        if sell:
+            armed = bool(sell.get('armed'))
+            rows.append((sell['price'],
+                         _CLR['exit'] if armed else _CLR['exit_soft'],
+                         f"{sell['label']} "
+                         f"{fmt_price(sell['price'], self.ccy)} × {sell['qty']}"
+                         + ('' if armed else ' (projected)'),
+                         armed))
+
         if c.get('vantage'):
             v = c['vantage']
-            src = {'high5': 'High5', 'close': 'prev close',
-                   'reload': 'sell fill'}.get(c.get('vantage_src'), '')
+            src = _VANTAGE_SRC.get(c.get('vantage_src'), '')
             rows.append((v, _CLR['vantage'],
                          f'vantage {fmt_price(v, self.ccy)} ({src})', False))
         return rows
 
     def _refresh_candles(self):
+        """The candle panel draws the SAME rows as the live chart. Bold rows
+        (the armed buy, the average, the exit) always show; soft projections
+        only when they fall inside the candles' own price range."""
         ui = self.ui
         ohlc = self.ap['ohlc']() or []
         refs = []
         if ui:
+            span = [b['low'] for b in ohlc] + [b['high'] for b in ohlc]
+            if ui.get('price'):
+                span.append(ui['price'])
+            lo, hi = (min(span), max(span)) if span else (None, None)
             for price, color, text, bold in self._line_rows(ui):
+                if not (bold or (lo is not None and lo <= price <= hi)):
+                    continue
                 refs.append({'label': text, 'price': price, 'color': color,
                              'dash': ((2, 4) if bold else (3, 6)),
                              'width': (1.8 if bold else 1.1)})
@@ -486,14 +486,18 @@ class CampaignWindow:
         ticks = ui.get('ticks') or []
         rows = self._line_rows(ui)
 
+        # Scale to the action: the ticks, the current price, and the lines the
+        # campaign is actually working between. Far projections only draw when
+        # they already fall inside that range.
         prices = [p for _, p in ticks]
         if ui.get('price'):
             prices.append(ui['price'])
-        # Scale to the two watched lines plus the average; the vantage only
-        # widens the chart when it is already close.
         for price, _clr, _txt, bold in rows:
             if bold:
                 prices.append(price)
+        ladder = buy_lines(ui)
+        if len(ladder) > 1:
+            prices.append(ladder[1]['price'])     # one projection of headroom
         if not prices:
             c.create_text(w / 2, h / 2, text='waiting for the first tick…',
                           font=_F_STAT, fill='#888')
@@ -518,10 +522,11 @@ class CampaignWindow:
         def y_of(p):
             return top + ch * (1 - (p - p_min) / p_rng)
 
-        # Shade the corridor the campaign lives in: next buy line → EXIT.
+        # Shade the corridor the campaign lives in: armed buy → exit.
         lines = ui.get('lines') or {}
-        lo = (lines.get('chase') or lines.get('load') or (None,))[0]
-        hi = (lines.get('exit') or lines.get('pexit') or (None,))[0]
+        lo = ladder[0]['price'] if ladder else None
+        sell = lines.get('exit') or lines.get('pexit')
+        hi = sell['price'] if sell else None
         if lo and hi and hi > lo:
             c.create_rectangle(left, y_of(min(hi, p_max)),
                                left + cw, y_of(max(lo, p_min)),
@@ -534,6 +539,8 @@ class CampaignWindow:
             c.create_text(left - 5, y, text=fmt_price(p, self.ccy),
                           anchor='e', font=_F_AXIS, fill='#888')
 
+        # Time axis from the first tick (min span 30 min so early ticks don't
+        # smear across the full width).
         now = _time.time()
         t0 = ticks[0][0] if ticks else now
         span = max(now - t0, 1800.0)

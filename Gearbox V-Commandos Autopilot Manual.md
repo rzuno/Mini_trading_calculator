@@ -1,11 +1,11 @@
 # Gearbox V-Commandos Autopilot Manual
 
-**Version:** 0.2.0 — *as built*
-**Strategy ID:** `V_COMMANDOS_GEARBOX`
+**Version:** 0.3.0 — *as built*
+**Strategy ID:** `V_COMMANDOS_GEARBOX` — the only strategy in the app
 **Subtitle:** Fixed-Gear V-Campaign Trading System
-**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`. Verified offline by `scripts/test_vcommandos.py`. Not yet run live.
+**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Verified offline by `scripts/test_vcommandos.py` (100 checks) and `scripts/test_autopilot_ui.py` (62). Not yet run live.
 
-> **v0.2.0 changes are listed in §22.** The largest one: the volatility→gear cut points were **raised** so that gear 5 — the share-doubling gear — is reserved for genuinely violent stocks. The second: the card and the bot are now **one system**, not two.
+> **v0.3.0 changes are listed in §22.** In short: **there is no capital cap** — the army is the only wall (§8); the **gear is no longer pinned** by a live campaign (§11); the daily v^ grid was **removed** so this bot can be stabilised alone (§3); the cockpit was rebuilt around the price curve and now shows the next buy *and the ones after it* (§15); and the crash that made the whole autopilot silently do nothing was fixed.
 
 ---
 
@@ -28,9 +28,7 @@ The central design principle is:
 
 > Observe the two ends of the V. Enter deeply enough on the left, keep the exit gap reachable on the right, and complete the entire campaign cleanly.
 
-This system replaces automatic intra-campaign gear adaptation with a five-speed gearbox. A Gear is selected before LOAD and remains stable so that deployment, expected depth, and exit behavior are known in advance.
-
-A manual Gear override is allowed, but it must be explicit and logged.
+This system replaces per-fill gear escalation with a five-speed gearbox. A Gear is selected before LOAD, so deployment, expected depth, and exit behavior are known in advance — and because every line is derived from the broker's average cost alone, it can be shifted later without unwinding anything (§11).
 
 ---
 
@@ -58,39 +56,19 @@ The bot does not need perfect knowledge of every historical Step to continue saf
 
 ---
 
-## 3. Relationship to Other Strategy Modes
+## 3. The Only Strategy
 
-This strategy coexists with, and does not replace, the separate daily bidirectional grid strategy.
-
-```text
-V_COMMANDOS_GEARBOX
-    Campaign-based
-    BUY low → chase average → full SELL
-    Designed for one V cycle
-    High5 or campaign Vantage
-    Full-position exit
-
-DAILY_V_HAT_LINEAR_GRID
-    Daily coordinate-grid strategy
-    BUY-then-SELL and SELL-then-BUY
-    Designed to scalp repeated intraday oscillation
-    Daily anchor and inventory targets
-```
-
-The broker/account layer, logging layer, order reconciliation, market-hours gate, and the candle panel are shared.
-
-The trading logic must not be mixed inside one campaign.
-
-### 3.1 How the two are selected (as built)
-
-Every stock card carries **two** autopilot buttons:
+`V_COMMANDOS_GEARBOX` is the app's only bot. Each card carries one button:
 
 ```text
-[ V-COMMANDOS ]   the campaign bot — big button, the default
-[   v^ grid   ]   the daily grid bot — small button
+[ V-COMMANDOS ]   arms WATCH on that stock and opens its cockpit
 ```
 
-`gui/autopilot_ctrl.py` runs **one strategy per stock at a time**. Asking for the other one is refused while that stock is LIVE or holds shares — a campaign and a grid must never share a holding. Each strategy keeps its own saved state (`data/autopilot_state.json`, keyed `ticker#strategy`), so switching never overwrites the other's campaign.
+The separate `DAILY_V_HAT_LINEAR_GRID` (the daily v^ adventure) was **removed on 2026-08-01** so this strategy could be stabilised on its own. It was working, and it is not repudiated — its engine, cockpit and 86-check test suite are recoverable from commit `e148da6`, and its specification is kept in `Daily v^ Grid Autopilot Manual.md`. Restoring it means bringing back `core/autopilot.py`, `gui/autopilot_window.py` and `scripts/test_grid.py`, and re-adding the strategy branch in `gui/autopilot_ctrl.py`.
+
+Campaign state is saved under `ticker#VCG` in `data/autopilot_state.json`. Any v^ grid record already saved under the bare ticker key is left untouched, and the engine refuses to restore it as a campaign — so a future restoration finds its own history intact.
+
+The two trading logics must never share a holding. That is why only one runs.
 
 ---
 
@@ -186,7 +164,7 @@ The program calculates the new average and all next lines from actual broker fil
 
 ## 6. Five-Speed Gearbox
 
-| Gear | Name | 5D range | LOAD | CHASE | Add ratio | Exit Tiers | Default | Max chase under 32u | Final BUY | Capital |
+| Gear | Name | 5D range | LOAD | CHASE | Add ratio | Exit Tiers | Default | Chases in the 32u table | Final BUY | Capital |
 |---:|:--|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | Smooth   | ≤ 15% | −6% | −4% | ×1/2 | 1%/3%/5% | Tier 2 | 8 | 82.15 | 23.02u |
 | 2 | Moderate | ≤ 20% | −7% | −5% | ×2/3 | 2%/4%/6% | Tier 2 | 7 | 78.26 | 31.01u |
@@ -195,6 +173,8 @@ The program calculates the new average and all next lines from actual broker fil
 | 5 | Extreme  | > 30% | −10% | −8% | ×1 | 5%/7%/9% | Tier 2 | 5 | 70.33 | 26.09u |
 
 Bounds are **inclusive** on the upper edge: exactly 20.0% is gear 2, 20.1% is gear 3.
+
+The last three columns are the normalized reference ladder (§21, Appendix A): how far a campaign would run **if** 32 units were spent on it. They are a yardstick for comparing gears, **not a cap** — see §8.
 
 The 5-day range is a starting recommendation, not a mandatory classification rule. Market structure, recent rebound behavior, campaign capital, and the user's desired risk level may justify a lower or higher Gear.
 
@@ -207,7 +187,7 @@ Alphabet may use Gear 1 or 2.
 Samsung may use Gear 2 or 3 depending on the observed V depth.
 ```
 
-### 6.1 Why the cut points were raised (v0.2.0)
+### 6.1 Why the cut points were raised
 
 The previous ladder was 8 / 12 / 16 / 20. Under it a stock with a perfectly ordinary 22% five-day range was handed **gear 5** — the gear that buys the entire position again on every chase and can consume 26 units. Gear 5 is a weapon for a stock that actually moves 30%+ in a week; handing it to a merely-normal stock is how a martingale runs out of funding before the V completes.
 
@@ -219,7 +199,7 @@ G4 now requires above 25%                 (was: above 16%)
 most ordinary sessions land on G1 or G2   — shallow ladders, cheap campaigns
 ```
 
-This is the answer to the funding problem: **not a capital-allocation layer on top of the strategy, but a gearbox that stops selecting the expensive gear by accident.**
+This is the answer to the funding problem: **not a capital-allocation layer on top of the strategy, but a gearbox that stops selecting the expensive gear by accident.** It is also why no cap is needed (§8.2) — deployment is governed where the choice is still free, before the LOAD.
 
 ### 6.2 Heavy-unit entry floor (implementation addition)
 
@@ -280,63 +260,36 @@ Changing Tier during a campaign is allowed only as an explicit manual override, 
 
 ---
 
-## 8. Battlefield and Concurrency Policy
+## 8. What Limits a Campaign
 
-### 8.1 Gear 3–5
+### 8.1 The army is the only wall
 
-Default policy:
-
-```text
-one active battlefield globally
-```
-
-These Gears can consume 10–30 units quickly and should not depend on capital trapped elsewhere.
-
-### 8.2 Gear 1–2
-
-Possible policy:
+There is **no capital cap**. A campaign chases as long as the broker's cash covers the next line:
 
 ```text
-one to three active battlefields
+next_chase_cost ≤ buying_power   →  the chase is armed and fires
+next_chase_cost > buying_power   →  the chase is disabled, the line is drawn
+                                    muted (✕ … no army), and the campaign
+                                    keeps watching its EXIT
 ```
 
-This is permitted only when:
+The engine re-checks this every poll, so the buy side comes back by itself the moment cash returns — a completed exit elsewhere refills the army and the line goes live again without intervention.
 
-- each battlefield has its own maximum capital allocation;
-- combined worst-case planned deployment remains fully funded;
-- no campaign expects reinforcement from capital assigned to another campaign;
-- the global buying-power manager prevents double counting.
+The 32-unit figure in the normalized tables (§21, Appendix A) is a **reference scale**, not a limit: it is how far the ladder would run on 32 units, published so gears can be compared. Total deployment may exceed it. Nothing in the code stops at any unit count.
 
-### 8.3 Pre-Funding Rule
+### 8.2 Why there is no cap
 
-Before LOAD is armed, the maximum fully supported chase row for that campaign should be estimated. If the selected campaign cannot be supported to the configured limit:
+A fixed cap is a second, softer wall standing in front of the real one, and it fails in the direction that hurts: it stops the ladder while cash is still available — exactly at the bottom of a deep V, where the remaining chases are the cheapest shares of the whole campaign. The army running out is a fact; a cap is a guess about that fact.
 
-```text
-do not arm LOAD
-```
+The gear ladder is where deployment is actually governed (§6.1): choosing G2 instead of G5 is what makes a campaign cheap, and that decision is made **before** the LOAD, when it is still free to make.
 
-or explicitly reduce:
+### 8.3 Concurrency — not enforced
 
-```text
-unit_cash
-maximum_chase_count
-campaign_cap_units
-```
+Deep gears can consume many units quickly and should not depend on capital trapped elsewhere. The sensible policy is one active battlefield for G3–G5 and up to three for G1–G2.
 
-### 8.4 What is actually enforced (as built) — read this
+**None of this is enforced by code.** There is no global buying-power manager, no per-campaign reservation, and no limit on how many stocks may run campaigns at once. Two campaigns can compete for the same reserve, and the second one to reach its line simply finds the army gone.
 
-**Enforced by code, per campaign:**
-
-- `campaign_cap_units` (default **32u**). Before every chase the engine checks `next_chase_cost ≤ cap_units × unit_cash − current_cost_basis`. Over the cap, the chase is disabled, the buy line is drawn muted `✕ … (cap)`, and the campaign keeps watching its EXIT only.
-- The broker's own buying power. If the next line costs more than the cash on hand, the buy is not fired and the state reads `EXHAUSTED`; the EXIT stays managed.
-
-**NOT enforced by code:**
-
-- The one-battlefield / three-battlefield concurrency limits of §8.1–8.2. Nothing stops several stocks from running campaigns at once.
-- The §8.3 pre-arm refusal. Funding is checked chase-by-chase, not before the LOAD.
-- Any global reservation of buying power across campaigns.
-
-Those remain the commander's discipline. **Do not read §8.1–8.3 as an implemented safety net.** The honest statement of the current state is: one campaign cannot exceed its own cap, and no campaign can spend cash that is not there — but two campaigns can still compete for the same reserve.
+**Do not read §8.3 as an implemented safety net.** The honest statement of the current state is: no campaign can spend cash that is not there, and that is the whole of the protection.
 
 ---
 
@@ -412,12 +365,16 @@ next CHASE BUY
 full EXIT SELL
 ```
 
-If the campaign capital cap makes the next CHASE unaffordable:
+If the army cannot fund the next CHASE:
 
 ```text
 disable CHASE
 continue watching EXIT only
 ```
+
+and re-check every poll, so buying resumes by itself when cash returns.
+
+Beyond the armed CHASE the engine also publishes the **next two projected chases**, folded into the running average exactly as the campaign would run them. They are drawn soft on both charts and named in the banner. Nothing is ever ordered from a projection — they exist so the depth of the ladder ahead is visible before it is needed.
 
 **Order priority:** when both lines are crossed in the same poll, the **EXIT wins** — the campaign always prefers to finish. Any resting buy of ours is cancelled first.
 
@@ -427,26 +384,33 @@ continue watching EXIT only
 
 ## 11. Gear Changes During a Campaign
 
-Automatic adaptive switching is not used.
+The gear may be changed at any time, deployed or not.
 
-A manual Gear override may be applied because a fixed Gear does not depend on reconstructing the entire historical ladder.
+Nothing in a campaign depends on the gear that opened it. The only piece of history the engine carries is the **average cost**, and both lines are derived from it on the spot:
 
-After a Gear change:
+```text
+next CHASE = actual_avg × (1 - new_gear.chase%)
+full EXIT  = actual_avg × (1 + new_tier%)
+```
+
+So a shift is not a repair — it is just a different pair of lines from the same position. After a change:
 
 ```text
 keep actual holdings
 keep actual average cost
 keep campaign ID
-replace next CHASE line using the new Gear
-replace EXIT only if the Exit Tier or exit rate also changes
-log GEAR_OVERRIDE
+replace the CHASE line and the projected ladder with the new gear
+replace the EXIT if the tier changed
+write GEAR / TIER to the campaign log
 ```
 
-**As built:** AUTO mode picks the gear from volatility **only while the card is FLAT**. Once the card is DEPLOYED the gear is pinned (the card shows `pinned`) and the picker stays live — using it *is* the override path, and the engine writes `GEAR_OVERRIDE` with the old and new values.
+**As built:** the card is the source. In AUTO the gear tracks the 5-day range continuously, deployed or not — a stock that turns violent mid-campaign gets a deeper ladder without being touched. In MANUAL it holds whatever the commander picked. Either way, a change on a live campaign is written into the campaign log, so the reason a chase line moved is always on the record.
 
-The default recommendation remains:
+The heavy-unit floor (§6.2) is the one exception: it applies only while FLAT, because it is an **entry** rule about whether a position can be opened with useful resolution — not about one that already exists.
 
-> Keep one Gear for one campaign whenever possible so that backtests and live results remain interpretable.
+The default recommendation still stands:
+
+> Keep one Gear for one campaign whenever you can, so backtests and live results stay interpretable. Shift it when the stock's behaviour actually changes, not to chase a feeling about the position.
 
 ---
 
@@ -571,31 +535,37 @@ campaign_start
 campaign_state
 ```
 
-### 14.2 Fill Record
+### 14.2 Log Record
+
+One list holds the whole campaign, trades and decisions together, so the log
+reads as a narrative rather than two files to cross-reference:
 
 ```text
-ts
-source: BOT / EXTERNAL
-event_type: LOAD / CHASE / EXIT / RELOAD / PARTIAL
-price
-qty (signed)
-shares_after
-average_after
+date            market-local trading date — the log groups by day
+ts              MM/DD HH:MM
+source          BOT / EXT   (EXT = traded by hand in the broker app)
+kind            LOAD / RELOAD / CHASE / EXIT / PARTIAL   (trades)
+                ADOPT / GEAR / TIER                      (decisions)
+price, qty      signed quantity; blank on a decision row
+shares, avg     the position AFTER the row
+note            chase number, gross result, or the gear/tier change
 ```
 
-### 14.3 Override Events
+The cockpit renders it as `RECORDED FILLS` with a header row whenever the trading date changes, so a campaign that runs for days is read day by day.
+
+### 14.3 Decision rows
 
 ```text
-GEAR_OVERRIDE
-EXIT_TIER_OVERRIDE
-CAP_OVERRIDE
+ADOPT   the bot took over a position it did not open
+GEAR    G3 → G5 (chase -8% ×1.0)
+TIER    T2 → T3 (+7%)
 ```
 
-Each event records old value, new value, timestamp, and an optional reason.
+A gear or tier change on a live campaign always writes a row: the reason a chase line moved is on the record even though the shift itself is routine.
 
 ### 14.4 Completion Metrics
 
-Tracked live and shown in the campaign window banner:
+Tracked live and shown in the cockpit banner:
 
 ```text
 campaign_start
@@ -610,18 +580,29 @@ Not yet computed: trading-days-open, fees, taxes, net profit, return on maximum 
 
 ---
 
-## 15. Campaign Chart
+## 15. The Cockpit
 
-**As built:** the campaign window draws two panels side by side —
+Opened by the card's V-COMMANDOS button; opening it arms WATCH.
 
 ```text
-left    live tick curve since the window opened, with the campaign's own
-        reference lines: LOAD or CHASE (blue), the broker average (purple),
-        the full EXIT (red), and the vantage (orange)
-right   the 5-day candle panel, carrying the same reference lines
+header   name · campaign state · market phase · Cancel all · LIVE
+banner   G3 Balanced · LOAD -8% · CHASE -6% ×3/4 · EXIT T2 +5% (full)
+                     · vantage 100.00 (High5)
+         campaign id · since · chases · low · peak
+         31 sh @ 92.00 avg · 2.85 u deployed · now 91.20 · P&L -0.87%
+                     · target 142.60 · army 4,200.00
+         ▲ EXIT 96.60 × 31    ▼ CHASE -6% ×3/4 86.48 × 23
+                              then 84.26 × 41 · 82.09 × 71
+         engine status + poll time
+charts   live tick curve inside the campaign | 5-day candle panel
+log      RECORDED FILLS, grouped by trading day
 ```
 
-The full campaign-spanning chart of the original §15 (LOAD marker, every chase marker, campaign low, exit marker, with a 10-trading-day view policy) is **not built yet**. The fill log in the banner carries the same information as text.
+The sell line reads first because it sits at the top of the chart; the next buy and **its size** read below it, then where the ladder goes after that. Both charts draw the same rows: the armed buy, the broker average, and the EXIT bold; the projected chases and the vantage soft. An unfundable buy line is drawn grey and relabelled `✕ … (no army)`.
+
+**There are no manual Buy/Sell buttons.** The point of the bot is that the offer goes out when the curve touches the line. WATCH shows the crossed line and says plainly that it did not send; LIVE sends. The one intervention left is **Cancel all**, the escape hatch.
+
+The full campaign-spanning chart of the original §15 (a LOAD marker, every chase marker, the campaign low, the exit marker, with a 10-trading-day view policy) is **not built**. The 5-day panel plus the day-grouped log carries the same information.
 
 ---
 
@@ -629,7 +610,7 @@ The full campaign-spanning chart of the original §15 (LOAD marker, every chase 
 
 Not built. The card shows per-stock cost basis, army %, and the live gap; the campaign window shows unrealized P&L, peak deployment in units, and the gross target of the armed exit.
 
-Realized campaign profit, fees/taxes, campaign duration statistics, completion-rate comparisons, and buy-and-hold benchmarking remain future work (§21).
+Realized campaign profit, fees/taxes, campaign duration statistics, completion-rate comparisons, and buy-and-hold benchmarking remain future work (§22).
 
 ---
 
@@ -638,9 +619,8 @@ Realized campaign profit, fees/taxes, campaign duration statistics, completion-r
 **As built:** the dashboard is the card itself. Each card shows
 
 ```text
-V 18.2% → G3            volatility gear, live
-V 18.2% → G5 ▲heavy     the heavy-unit floor overrode volatility
-V 18.2% · G3 pinned     deployed — the campaign keeps its gear
+V 18.2% → G2            the volatility gear, tracked live
+V 18.2% → G5 ▲heavy     the heavy-unit floor (FLAT only) overrode volatility
 V 18.2% → reload -3%    a same-day reload is armed
 ```
 
@@ -670,7 +650,7 @@ This is a recommendation, not an automatic order command. Switching the card to 
 4. **No new campaign until actual shares are zero.**
 5. **Never assume a fill price** — a fill's price comes from our own order intent, or is derived from the broker's average-cost move.
 6. **Recalculate from actual average cost after every fill.**
-7. **Stop CHASE at the configured campaign cap.**
+7. **Stop CHASE when the army cannot fund it** — and resume when it can.
 8. **Cancel only bot-owned orders.**
 9. **On ambiguous reconciliation, pause instead of guessing.**
 10. **A failed data poll skips the whole cycle** — nothing is placed or cancelled on missing data.
@@ -684,12 +664,15 @@ This is a recommendation, not an automatic order command. Switching the card to 
 ```text
 WATCH
     calculate, watch, detect fills; place nothing.
-    A crossed line lights the trigger row so it can be fired by hand
-    from the campaign window (attributed exactly like a bot fill).
+    A crossed line is drawn and named, and the status says it was not sent.
 
 LIVE
-    place real broker LIMIT/DAY orders when a line is crossed.
+    the bot sends the real broker LIMIT/DAY order by ITSELF the moment the
+    curve crosses a line. Regular market hours only; drops back to WATCH at
+    the close.
 ```
+
+Manual firing was removed with v0.3.0: the reason to run a bot is that the offer goes out when the curve touches the line. Trades made by hand in the broker app are still first-class — the engine detects them and folds them into the campaign (§12).
 
 The original §19 also specified a **DRY** runtime mode (simulate orders and fills inside the app). That was not built: its job is done by `scripts/test_vcommandos.py`, an offline simulator that runs whole price paths through the real engine behind a fake broker. WATCH covers the live-observation half.
 
@@ -714,21 +697,26 @@ auto_mode: true                 # gear follows volatility while FLAT
 # core/calc.py constants
 VOL_THRESHOLDS:      [15, 20, 25, 30]
 WEIGHT_GEAR_THRESHOLDS: [1.2, 1.6, 2.0, 2.5]
-CAMPAIGN_CAP_UNITS:  32.0
 RELOAD_DROP_PCT:     3
 DEFAULT_GEAR:        3
 DEFAULT_EXIT_TIER:   2
 rounding_mode:       HALF_UP
 minimum_order_qty:   1
+
+# core/vcommandos.py
+POLL_SECONDS:        5
+PROJECTED_CHASES:    2      # buy lines published beyond the armed one
 ```
+
+There is no `campaign_cap_units`. The army is the cap (§8).
 
 `positions.csv` keeps the pre-gearbox columns (`load_gear`, `buy_pct`, `t1_pct`…`t3_active`) written from the gear, so older builds and scripts still read the file. On load, a legacy file is migrated: a bait drop percent becomes its gear (4%→G1 … 8%→G5) and the lowest active sell tier becomes the single exit tier.
 
 ---
 
-## 21. Maximum-Deployment Comparison
+## 21. Reference Ladder Comparison
 
-The following rows use Vantage 100, theoretical fractional sizing, a 32-unit capital limit, no fees, and exact fills. `scripts/test_vcommandos.py` re-derives every one of them from the shipped gear parameters.
+The following rows use Vantage 100, theoretical fractional sizing, **32 units of spend as a common yardstick** (not a cap — see §8), no fees, and exact fills. `scripts/test_vcommandos.py` re-derives every one of them from the shipped gear parameters.
 
 | Gear | Final average | T1 EXIT | T2 EXIT | T3 EXIT | Rebound to T2 | T2 gross profit |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -749,33 +737,41 @@ Higher Gears can tolerate a lower right-side endpoint because they lower average
 | Manual section | Status |
 |---|---|
 | §5–§7 gearbox, tiers, sizing | **built** — `core/calc.py`, verified against Part II |
-| §6.1 raised volatility ladder | **built** — new in v0.2.0 |
+| §6.1 raised volatility ladder | **built** |
 | §6.2 heavy-unit entry floor | **built** — implementation addition |
+| §8 army-only limit, resume when cash returns | **built** |
 | §9 High5 vantage, LOAD, same-day reload | **built** |
-| §10 two watched lines, tick trimming, exit priority | **built** |
-| §11 fixed gear + logged override | **built** |
+| §10 armed CHASE + full EXIT, two projected chases, tick trimming, exit priority | **built** |
+| §11 free gear shift, logged | **built** |
 | §12 adopt / external buy / partial / full exit | **built** |
 | §13 state machine | **built** |
-| §14.1–14.3 campaign header, fill log, overrides | **built** |
-| §8.4 per-campaign cap + buying-power wall | **built** |
+| §14 campaign log — trades and decisions, grouped by day | **built** |
+| §15 cockpit: curve, both charts, day-grouped log | **built** |
 | §17 gear dashboard on the card | **built** |
-| §19 WATCH / LIVE | **built** (DRY replaced by the offline simulator) |
-| §8.1–8.3 concurrency limits, pre-arm funding check | **NOT built** — commander's discipline |
+| §19 WATCH / LIVE, bot fires by itself | **built** (DRY replaced by the offline simulator) |
+| §8.3 concurrency limits, global buying-power manager | **NOT built** — commander's discipline |
 | §14.4 full completion metrics (fees, duration, ROC) | **NOT built** |
-| §15 campaign-spanning chart | **NOT built** — 5-day panel + fill log instead |
+| §15 campaign-spanning chart | **NOT built** — 5-day panel + day-grouped log instead |
 | §16 accounting views | **NOT built** |
 | Portfolio orchestrator (candidate ranking, army split) | **NOT built** |
 
-### v0.2.0 amendment log
+### v0.3.0 amendment log
 
-1. **Volatility→gear cut points raised** from 8/12/16/20 to 15/20/25/30, with the upper bound inclusive (§6, §6.1, §17). Gear 5 now requires a 5-day range above 30%.
-2. **Heavy-unit entry floor** added as a second input to the automatic entry gear (§6.2).
-3. **The card and the bot are one system** (§3.1, §11, §17). The card pushes `{gear, exit_tier, cap_units}` to the engine on every recompute; the engine watches exactly the lines the card draws. Previously they ran on separate logic.
-4. **Two autopilot buttons per card** (§3.1), one strategy at a time per stock, separate saved state.
-5. **§8.4 added** to state honestly which funding rules are enforced by code and which are not.
-6. **§5.1 clarified**: LOAD quantity is sized off the trimmed, orderable price.
-7. **§19 DRY** replaced by the offline simulator; documented rather than silently dropped.
-8. **§15 / §16** marked as not built rather than left reading as specification.
+1. **The capital cap is gone** (§8). `CAMPAIGN_CAP_UNITS`, the `CAPPED` buy state and `cap_units` in the card config were removed. The army is the only wall, re-checked every poll. The 32-unit figure survives only as the reference scale of the normalized tables.
+2. **The gear is no longer pinned by a live campaign** (§11). AUTO tracks the 5-day range continuously, deployed or not; MANUAL holds. Nothing but the average cost is history, so both lines simply move. The change is logged as a `GEAR` / `TIER` row instead of an "override".
+3. **The daily v^ grid was removed** (§3) so this bot could be stabilised alone. Recoverable from commit `e148da6`; its manual is kept. The card lost its second button; the controller lost its strategy switch, the grid-scale picker and the shared `_push_ui`.
+4. **Manual Buy/Sell was removed** (§15, §19). The bot exists to send the offer when the curve touches the line. `Cancel all` remains as the escape hatch. Hand trading in the broker app is unaffected and still reconciles (§12).
+5. **The cockpit was rebuilt** (§15) around the price curve, with the EXIT named first and the next buy carrying its size, followed by the next two projected chases. The campaign log came back in its old `RECORDED FILLS` form, now with a header row per trading day.
+6. **The campaign log records the day** (§14.2) and holds decisions (`ADOPT`, `GEAR`, `TIER`) alongside trades.
+7. **Two projected chase lines are published** beyond the armed one (§10), so the depth of the ladder ahead is visible before it is needed.
+
+### The v0.2.0 defect
+
+v0.2.0 shipped an autopilot that **did nothing at all**, and did it quietly. `_push_ui` — the one function every poll ends in — still read grid-only engine fields (`engine.anchor`) that the campaign engine does not have. Every cycle raised `AttributeError` after the engine had already computed correctly, so the cockpit never received a payload, no chart was ever drawn, and the failure surfaced only as a line in `logs/autopilot443.log`.
+
+Two things let it through: the window was tested against hand-written payloads rather than payloads the controller actually produced, and the controller's poll loop catches every exception per stock so it can survive a bad network read — which also swallowed this one.
+
+`scripts/test_autopilot_ui.py` now drives the **real controller** through a full `_cycle` against a fake provider and asserts on the payload it emits, including that no grid-only field survives in it.
 
 ---
 
@@ -787,7 +783,7 @@ Long-term normalized references. Assumptions:
 Vantage = 100
 initial LOAD capital = 1 unit
 fractional theoretical sizing
-maximum campaign capital = 32 units
+32 units of spend as a common yardstick (not a cap — see §8)
 no fees, taxes, slippage, or integer-share rounding
 ```
 
@@ -897,18 +893,18 @@ Bottom-to-exit rebound **9.57% / 11.65% / 13.74%** · gross target **1.305u / 1.
 The stock card is the display and audit surface, and the bot's source for gear and tier. It reads:
 
 ```text
-1. Samsung (KR)        (12.3%)  [AUTO]  V 18.2% · G3 pinned
+1. Samsung (KR)        (12.3%)  [AUTO]  V 18.2% → G2
                                 Avg Cost [280,315]  Shares [31]   DEPLOYED
 
 Total Cost: 8,689,765   Current: 232,000   Gap: -17.24%
 
-Chase 1: 263,496 × 23   Chase 2: 256,762 × 41   Chase 3: 250,114 × 71
-   T1: 288,724             ▶ T2: 294,331 × 31      T3: 299,937
+Chase 1: 266,299 × 21   Chase 2: 260,922 × 35   Chase 3: 255,674 × 58
+   T1: 285,921             ▶ T2: 291,528 × 31      T3: 297,134
 
-                         Gear (G3 Balanced)   Exit (T2 +5%)   [ V-COMMANDOS ]
-                         [-8% / -6% ×3/4]     [ T3 +7% ]      [   v^ grid   ]
-                         gear: ③              [ T2 +5% ]
-                                              [ T1 +3% ]
+                         Gear (G2 Moderate)   Exit (T2 +4%)   [ V-COMMANDOS ]
+                         [-7% / -5% ×2/3]     [ T3 +6% ]
+                         gear: ②  live        [ T2 +4% ]
+                                              [ T1 +2% ]
 ```
 
 A FLAT card shows `Vantage:` instead of `Total Cost:`, and its ladder reads `Load / Chase 1 / Chase 2` with the exit tiers computed as if the load had filled.

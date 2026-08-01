@@ -2,36 +2,40 @@
 
 **Version:** 0.2.1 (system edition)
 **Adapted from:** strategy manual `DAILY_V_HAT_LINEAR_WEIGHTED_GRID_MANUAL` v0.1.0
-**Implemented in:** `core/autopilot.py` (`GridEngine`), `gui/autopilot_ctrl.py`, `gui/autopilot_window.py`
-**Status:** simulated offline (86 engine checks + fuzz); LIVE-ready pending a small real trial
-**Role since 2026-08-01:** **secondary, selectable mode — no longer the only bot**
+**Was implemented in:** `core/autopilot.py` (`GridEngine`), `gui/autopilot_window.py`, and a strategy branch in `gui/autopilot_ctrl.py`
+**Status since 2026-08-01:** **code removed — specification kept, fully recoverable**
 
-> ### Where this strategy now sits
+> ### This strategy is not running
 >
-> `V_COMMANDOS_GEARBOX` (see [`Gearbox V-Commandos Autopilot Manual.md`](Gearbox%20V-Commandos%20Autopilot%20Manual.md))
-> is the **default** autopilot: a campaign bot that follows exactly the lines the
-> stock card draws. This grid is kept as the **second selectable strategy**.
+> The grid worked. It was removed anyway, on 2026-08-01, so that
+> `V_COMMANDOS_GEARBOX` — which had just been rolled back in and was crashing
+> on every poll — could be stabilised as the app's only bot without a second
+> engine sharing the controller, the state file and the UI push.
+>
+> **To restore it**, from commit `e148da6`:
 >
 > ```text
-> card button  [ V-COMMANDOS ]  big    → the campaign bot (default)
-> card button  [   v^ grid   ]  small  → THIS strategy
+> core/autopilot.py            the GridEngine
+> gui/autopilot_window.py      the grid cockpit + ScaleSelector
+> scripts/test_grid.py         86 checks + fuzz
+> gui/autopilot_ctrl.py        the STRATEGIES map, watch(ticker, strategy),
+>                              set_scale, per-strategy state keys, and the
+>                              grid fields in _push_ui
+> gui/stock_row.py             the small "v^ grid" button
+> gui/main_window.py           the strategy branch in _open_autopilot
 > ```
 >
-> One strategy runs per stock at a time; the app refuses to switch while that
-> stock is LIVE or holds shares, because a campaign and a grid must never share
-> a position. Each keeps its own saved state (`data/autopilot_state.json`,
-> keyed `ticker#strategy`).
+> Saved grid state was never overwritten: campaigns write to `ticker#VCG`, and
+> the campaign engine refuses to restore a record that is not its own, so any
+> grid history at the bare ticker key in `data/autopilot_state.json` is intact.
 >
-> Everything below still describes this strategy accurately. Two statements in
-> the original text are now **out of date**:
+> Two statements in the original text below are out of date. *"The old
+> card-line follower is retired as a BOT strategy"* — it was brought back as
+> the Gearbox campaign bot and is now the only one. *"The autopilot no longer
+> reads the cards"* — the campaign bot reads them by design; that was true of
+> this strategy only.
 >
-> - *"The old card-line follower is retired as a BOT strategy"* — it was
->   brought back, rebuilt as the Gearbox campaign bot, and is now the default.
-> - *"The autopilot no longer reads the cards"* — true of THIS strategy only.
->   The campaign bot does read them, by design.
->
-> The card gear system is no longer a manual-trading aid running beside the
-> bot: it is the campaign bot's source of truth for gear and exit tier.
+> Current bot: [`Gearbox V-Commandos Autopilot Manual.md`](Gearbox%20V-Commandos%20Autopilot%20Manual.md)
 
 ---
 

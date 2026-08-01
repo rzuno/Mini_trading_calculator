@@ -64,7 +64,8 @@ def display_name(ticker: str) -> str:
 #
 #   vol_max   upper bound (inclusive) of the 5-day range that recommends this
 #             gear; None = open-ended (gear 5 catches everything above).
-#   max_chase how many chases the 32-unit campaign cap funds (manual Part II).
+#   max_chase reference only — how many chases 32 units would fund in the
+#             normalized table (manual Part II). It is NOT a cap: the army is.
 GEARS = {
     1: {'name': 'Smooth',   'load':  6, 'chase': 4, 'ratio': 1 / 2,
         'frac': '1/2', 'tiers': (1, 3, 5), 'vol_max': 15.0, 'max_chase': 8,
@@ -92,8 +93,9 @@ DEFAULT_GEAR = 3
 DEFAULT_EXIT_TIER = 2            # the middle tier is the standing default
 EXIT_TIERS = (1, 2, 3)
 
-# One campaign may not consume more than this many units of cash (manual §8.3).
-CAMPAIGN_CAP_UNITS = 32.0
+# There is NO fixed campaign capital cap. The only wall is the army: a chase
+# fires while the broker's cash covers it and stops when it does not. The
+# 32-unit figure in the normalized tables is a reference scale, not a limit.
 
 # After a full EXIT the same session, one fast reload hangs at the actual
 # final sell fill −3%. This is NOT the gear's load drop (manual §9.3).
@@ -461,23 +463,6 @@ def calc_exit_lines(shares: int, avg_cost: float, gear) -> list:
     """All three tiers of this gear (for display). Each carries the whole
     position — only the SELECTED one is armed."""
     return [calc_exit(shares, avg_cost, gear, t) for t in EXIT_TIERS]
-
-
-# ── Campaign capital ─────────────────────────────────────────────────────────
-def campaign_cost(ladder: list) -> float:
-    """Cash a ladder consumes if every line fills."""
-    return sum((e['price'] or 0) * (e['qty'] or 0) for e in ladder)
-
-
-def chase_affordable(shares: int, avg_cost: float, gear, unit_cash: float,
-                     spent: float, cap_units: float = CAMPAIGN_CAP_UNITS):
-    """(ok, need, room) for the next chase against the campaign cap. `spent` is
-    the campaign's cost basis so far, in the stock's own currency."""
-    price = calc_chase_price(avg_cost, gear)
-    qty = calc_chase_shares(shares, gear)
-    need = price * qty
-    room = max(0.0, cap_units * unit_cash - spent) if unit_cash > 0 else 0.0
-    return (need <= room, need, room)
 
 
 # ── Gap rate ─────────────────────────────────────────────────────────────────

@@ -513,13 +513,10 @@ class App:
 
     # ── Autopilot window (big card button) ────────────────────────────────────
 
-    def _open_autopilot(self, ticker, strategy='VCG'):
-        """A card's autopilot button: start watching the stock (bare WATCH
-        mode — polling only, no orders) and pop that strategy's live window.
-
-        The big V-COMMANDOS button opens the campaign cockpit; the small v^
-        button opens the daily-grid cockpit. Only one strategy runs on a stock
-        at a time, so switching closes the other window."""
+    def _open_autopilot(self, ticker):
+        """The card's V-COMMANDOS button: start watching the stock (bare WATCH
+        mode — polling only, no orders) and pop its campaign cockpit.
+        Reuses an already-open window instead of stacking duplicates."""
         if not self._auto:
             self.status_var.set('Autopilot needs Toss (auto) mode.')
             return
@@ -529,27 +526,19 @@ class App:
         if win is not None:
             try:
                 if win.win.winfo_exists():
-                    if getattr(win, 'strategy', None) == strategy:
-                        win.win.lift()
-                        return
-                    win.win.destroy()
+                    win.win.lift()
+                    return
             except tk.TclError:
                 pass
             self._ap_windows.pop(ticker, None)
-        ok, msg = self.autopilot.watch(ticker, strategy)
+        ok, msg = self.autopilot.watch(ticker)
         if not ok:
             self.status_var.set(f'Autopilot: {msg}')
             return
+        from gui.campaign_window import CampaignWindow
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
-        ctx = self.autopilot.graph_context(ticker)
-        if strategy == 'GRID':
-            from gui.autopilot_window import AutopilotWindow
-            win = AutopilotWindow(self.root, ticker, ccy, ctx)
-        else:
-            from gui.campaign_window import CampaignWindow
-            win = CampaignWindow(self.root, ticker, ccy, ctx)
-        win.strategy = strategy
-        self._ap_windows[ticker] = win
+        self._ap_windows[ticker] = CampaignWindow(
+            self.root, ticker, ccy, self.autopilot.graph_context(ticker))
 
     def _account_seq(self, prov):
         if self._toss_acct_seq is None:

@@ -1,37 +1,33 @@
-"""Autopilot controller — the bridge between the pure strategy engines and
-the running app.
+"""Autopilot controller — the bridge between the pure campaign engine
+(core/vcommandos.py) and the running app.
 
 One background thread polls every watched stock every POLL_SECONDS (5 s),
 touching ONLY that ticker: price, holdings(symbol), open orders(symbol),
 buying power. The main panel stays refresh-button-driven; only the autopilot
 windows (and the cards' button colors) follow ticks.
 
-TWO selectable strategies, one at a time per stock (they must never share a
-position — see the Gearbox manual §3):
+ONE strategy: V_COMMANDOS_GEARBOX (`core/vcommandos.py`). It follows exactly
+the lines the CARD draws — every card pushes {'gear','exit_tier'} on each
+compute, so whatever the commander reads off the card IS what the bot watches.
 
-    'VCG'   V_COMMANDOS_GEARBOX (core/vcommandos.py) — the campaign bot, and
-            the default. It follows exactly the lines the CARD draws: every
-            card pushes {'gear','exit_tier','cap_units'} on each compute, so
-            whatever the commander reads off the card IS what the bot watches.
-    'GRID'  DAILY_V_HAT_LINEAR_GRID (core/autopilot.py) — the daily adventure
-            grid. Fully self-contained; it does NOT read the card.
+The Daily v^ grid was removed on 2026-08-01 to stabilise this one; it is
+recoverable from commit e148da6 (see "Daily v^ Grid Autopilot Manual.md").
 
 Modes per stock:
-    WATCH — grid + ticks + fill detection, NO orders from the bot. A due
-            transition is exposed as a trigger; the window's Buy/Sell
-            buttons can fire it manually (through this controller).
-    LIVE  — real Toss LIMIT/DAY orders, fired only when a grid level is
-            crossed. Allowed only while the market is in REGULAR hours;
-            when the session ends, LIVE drops back to WATCH automatically.
+    WATCH — lines + ticks + fill detection, NO orders. A crossed line is
+            drawn and named, but nothing is sent.
+    LIVE  — real Toss LIMIT/DAY orders, sent by the bot itself the moment a
+            line is crossed. Allowed only while the market is in REGULAR
+            hours; when the session ends, LIVE drops back to WATCH.
 
 Error policy: a failed poll skips the whole cycle and retries; ~6 straight
 failures announce a data problem once. insufficient-buying-power announces
 once and backs off 5 min (the SELL side stays managed — no hard stop);
 order-hours-closed backs off 5 min; opposite-pending retries next cycle.
 
-Engine state persists in data/autopilot_state.json, keyed 'ticker#strategy',
-so a restart re-arms exactly where it left off and the two strategies never
-overwrite each other's campaign.
+Engine state persists in data/autopilot_state.json under 'ticker#VCG', so a
+restart re-arms exactly where it left off (and any saved v^ grid state at the
+bare ticker key is left untouched, ready if the grid is ever restored).
 """
 
 import os
@@ -44,16 +40,8 @@ from datetime import datetime, date, timezone, timedelta
 import tkinter as tk
 from tkinter import messagebox
 
-from core.autopilot import GridEngine, GRID_SCALES, POLL_SECONDS
-from core.vcommandos import CampaignEngine
+from core.vcommandos import CampaignEngine, POLL_SECONDS, STRATEGY_ID
 from core.calc import fmt_order_price
-
-# strategy key -> (engine class, human name)
-STRATEGIES = {
-    'VCG':  (CampaignEngine, 'V-Commandos Gearbox'),
-    'GRID': (GridEngine,     'Daily v^ Grid'),
-}
-DEFAULT_STRATEGY = 'VCG'
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
@@ -70,7 +58,7 @@ _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
 def avg_completed_day_v(bars, trading_date):
     """Mean of the last five COMPLETED days' ranges ((H−L)/L in %). Today's
     in-progress bar is excluded — its range is still growing. This is the
-    scale-picking indicator: the commander reads avg/3 as the grid hint."""
+    a plain volatility read-out under the candle panel."""
     today_iso = trading_date or ''
     today_md = (today_iso[5:].replace('-', '/')
                 if len(today_iso) >= 10 else None)
@@ -162,21 +150,21 @@ class AutopilotController:
             return {}
 
     @staticmethod
-    def _store_key(ticker, strategy):
-        """One saved campaign per (stock, strategy) — the grid's day log must
-        never land on top of a V-Commandos campaign."""
-        return f'{ticker}#{strategy}'
+    def _store_key(ticker):
+        """Campaigns save under 'ticker#VCG'. Any v^ grid state saved at the
+        bare ticker key is left alone so the grid can be restored later."""
+        return f'{ticker}#VCG'
 
-    def _saved_for(self, ticker, strategy):
-        saved = self._store.get(self._store_key(ticker, strategy))
-        if saved is None and strategy == 'GRID':
-            # Pre-split state files stored the grid under the bare ticker.
-            saved = self._store.get(ticker)
-        return saved
+    def _saved_for(self, ticker):
+        """Only ever restore a V-Commandos campaign — a leftover grid record
+        under the same ticker must not be read as one."""
+        saved = self._store.get(self._store_key(ticker))
+        if isinstance(saved, dict) and saved.get('strategy') == STRATEGY_ID:
+            return saved
+        return None
 
     def _save_state(self, ticker, engine):
-        strategy = getattr(engine, 'strategy_key', None) or DEFAULT_STRATEGY
-        self._store[self._store_key(ticker, strategy)] = engine.to_dict()
+        self._store[self._store_key(ticker)] = engine.to_dict()
         try:
             os.makedirs('data', exist_ok=True)
             tmp = _STATE_STORE + '.tmp'
@@ -204,37 +192,16 @@ class AutopilotController:
         self._units['KRW'] = self.app._get_unit_cash('KRW')
         self._units['USD'] = self.app._get_unit_cash('USD')
 
-    def watch(self, ticker, strategy=DEFAULT_STRATEGY):
+    def watch(self, ticker):
         """Start (or keep) watching a stock — bare WATCH mode, no orders.
-        Called when an autopilot window opens. No stock-count limit.
-
-        Only ONE strategy runs on a stock at a time. Asking for the other one
-        while a position is open is refused: a campaign and a grid must not
-        share a holding."""
+        Called when the campaign window opens. No stock-count limit."""
         if not self.app._auto:
             return False, 'Switch to Toss (auto) mode first.'
-        if strategy not in STRATEGIES:
-            return False, f'unknown strategy {strategy}'
         with self._lock:
-            cur = self._slots.get(ticker)
-            if cur is not None:
-                if cur['strategy'] == strategy:
-                    return True, 'already watching'
-                if cur['mode'] == 'LIVE':
-                    return False, ('turn LIVE off before switching strategy')
-                if (cur['ui'].get('shares') or 0) > 0:
-                    return False, (
-                        f"{ticker} holds a live "
-                        f"{STRATEGIES[cur['strategy']][1]} position — close it "
-                        f"before switching strategy")
-                self._log(ticker, f"strategy {cur['strategy']} → {strategy}")
-                self._slots.pop(ticker, None)
-                switched = cur['strategy']
-            else:
-                switched = None
+            if ticker in self._slots:
+                return True, 'already watching'
             self._slots[ticker] = {
-                'engine': None, 'mode': 'WATCH', 'strategy': strategy,
-                'card': None,
+                'engine': None, 'mode': 'WATCH', 'card': None,
                 'backoff_until': 0.0,
                 'prev_close': None, 'high5': None, 'daily_date': None,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
@@ -242,22 +209,15 @@ class AutopilotController:
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
-                       'status': 'arming…', 'grid': [], 'mode': 'WATCH',
-                       'strategy': strategy,
+                       'status': 'arming…', 'mode': 'WATCH', 'lines': {},
                        'price': None, 'phase': market_phase(ticker)},
             }
-        if switched:
-            self.root.after(0, self._apply_row_badge, ticker, None, switched)
         self.refresh_units()
         self._pull_card_config(ticker)      # UI thread: read the card now
-        self._log(ticker, f'WATCH started [{strategy}]')
+        self._log(ticker, 'WATCH started')
         self._ensure_thread()
         self._wake.set()
         return True, 'watching'
-
-    def strategy_of(self, ticker):
-        slot = self._slots.get(ticker)
-        return slot['strategy'] if slot else None
 
     def disable(self, ticker):
         with self._lock:
@@ -265,15 +225,14 @@ class AutopilotController:
         if slot:
             self._log(ticker, 'autopilot off (watch stopped; any resting '
                               'orders left as-is)')
-            self.root.after(0, self._apply_row_badge, ticker, None,
-                            slot['strategy'])
+            self.root.after(0, self._apply_row_badge, ticker, None)
         self._notify(ticker, None)
 
     # ── Card config: the card IS the campaign strategy (UI thread) ───────────
 
     def set_card_config(self, ticker, cfg):
-        """The card pushes {'gear','exit_tier','cap_units'} on every compute.
-        Only the V-Commandos engine consumes it; the grid ignores it."""
+        """The card pushes {'gear','exit_tier'} on every compute — the gear
+        the commander is looking at is the gear the bot trades."""
         slot = self._slots.get(ticker)
         if slot is None or not cfg:
             return
@@ -317,67 +276,7 @@ class AutopilotController:
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
 
-    # ── Grid scale (UI thread, from the Autopilot window) ────────────────────
-
-    def set_scale(self, ticker, step):
-        """Choose the grid spacing for this stock (persists across days).
-        Refused while LIVE, and — one grid per day — after the first grid
-        trade of the adventure."""
-        slot = self._slots.get(ticker)
-        if not slot:
-            return False, 'not watching'
-        if slot['strategy'] != 'GRID':
-            return False, 'the grid scale belongs to the v^ grid strategy'
-        if slot['mode'] == 'LIVE':
-            return False, 'turn LIVE off before changing the grid scale'
-        engine = slot.get('engine')
-        if engine is None:
-            return False, 'still arming — try again in a moment'
-        ok, msg = engine.set_scale(step)
-        self._log(ticker, f'scale request {step * 100:g}%: {msg}')
-        if ok and getattr(engine, 'dirty', False):
-            if self._save_state(ticker, engine):
-                engine.dirty = False
-        self._wake.set()
-        return ok, msg
-
-    # ── Manual fire / cancel (UI thread, from the Autopilot window) ──────────
-
-    def manual_fire(self, ticker, side):
-        """Fire the currently-crossed line manually (WATCH mode). Sends the
-        exact same order the bot would send in LIVE."""
-        slot = self._slots.get(ticker)
-        if not slot:
-            return False, 'not watching'
-        if slot['mode'] == 'LIVE':
-            return False, 'LIVE mode fires by itself'
-        with self._lock:
-            trig = (slot['ui'].get('trigger') or {}).get(side)
-            engine = slot['engine']
-        if not trig:
-            return False, f'no {side} line crossed'
-        prov = self.app._toss_provider()
-        if prov is None:
-            return False, 'Toss unavailable'
-        try:
-            seq = self.app._account_seq(prov)
-        except Exception as e:
-            return False, f'account error: {e}'
-        if not seq:
-            return False, 'no Toss account'
-        ok, msg = self._place_real(ticker, slot, prov, seq,
-                                   side, trig['price'], trig['qty'],
-                                   trig.get('label', side) + ' (manual)')
-        if ok and engine is not None:
-            if slot['strategy'] == 'GRID':
-                engine.note_manual_order(side, trig['price'], trig['qty'],
-                                         level=trig.get('level'),
-                                         target=trig.get('target'))
-            else:
-                engine.note_manual_order(side, trig['price'], trig['qty'],
-                                         kind=trig.get('kind'))
-        self._wake.set()
-        return ok, msg
+    # ── Cancel (UI thread, from the campaign window) ─────────────────────────
 
     def cancel_all(self, ticker):
         """Cancel every live Toss order for this ticker (ours or not)."""
@@ -420,7 +319,6 @@ class AutopilotController:
         """Callables for the Autopilot window."""
         return {
             'ticker': ticker,
-            'strategy': lambda: self.strategy_of(ticker),
             'is_enabled': lambda: self.is_enabled(ticker),
             'ui_state': lambda: self.ui_state(ticker),
             'mode_of': lambda: self.mode_of(ticker),
@@ -429,11 +327,8 @@ class AutopilotController:
             'market_phase': lambda: market_phase(ticker),
             'subscribe': lambda fn: self.subscribe(ticker, fn),
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
-            'manual_fire': lambda side: self.manual_fire(ticker, side),
             'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
-            'set_scale': lambda s: self.set_scale(ticker, s),
-            'scales': lambda: list(GRID_SCALES),
         }
 
     def _ohlc_for(self, ticker):
@@ -454,18 +349,17 @@ class AutopilotController:
                 return row
         return None
 
-    def _apply_row_badge(self, ticker, badge_key, strategy=DEFAULT_STRATEGY):
+    def _apply_row_badge(self, ticker, badge_key):
         row = self._find_row(ticker)
         if row is not None:
-            row.set_autopilot(badge_key, strategy)
+            row.set_autopilot(badge_key)
 
     def on_rows_rebuilt(self):
         """Cards are recreated on every refresh — re-apply statuses, units,
         and re-read the (new) cards' gear configs."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
-            self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'),
-                                  slot['strategy'])
+            self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'))
             self._pull_card_config(ticker)
 
     # ── Poll thread ───────────────────────────────────────────────────────────
@@ -537,8 +431,7 @@ class AutopilotController:
     def _daily_vantage(self, prov, ticker, slot):
         """(prev_close, High5) from the last five COMPLETED sessions, fetched
         once per trading day. High5 is the campaign's standard flat-state
-        vantage (Gearbox manual §9.1); prev_close is the fallback and what the
-        grid uses as its reference close."""
+        vantage (Gearbox manual §9.1); prev_close is the fallback."""
         today = self._trading_date(ticker)
         if slot['daily_date'] != today:
             try:
@@ -641,7 +534,6 @@ class AutopilotController:
             self._data_failure(ticker, slot, 'no price from Toss')
 
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
-        strategy = slot['strategy']
         snap['unit_cash'] = self._units.get(ccy) or 0.0
         snap['trading_date'] = self._trading_date(ticker)
         snap['prev_close'], snap['high5'] = self._daily_vantage(
@@ -652,14 +544,11 @@ class AutopilotController:
         self._refresh_ohlc(prov, ticker, slot, snap)
 
         if slot['engine'] is None:
-            cls, name = STRATEGIES[strategy]
-            saved = self._saved_for(ticker, strategy)
-            engine = cls(ticker, trading_date=snap['trading_date'],
-                         saved=saved,
-                         log=lambda m, t=ticker: self._log(t, m))
-            engine.strategy_key = strategy
-            slot['engine'] = engine
-            self._log(ticker, f'{name} engine armed'
+            saved = self._saved_for(ticker)
+            slot['engine'] = CampaignEngine(
+                ticker, trading_date=snap['trading_date'], saved=saved,
+                log=lambda m, t=ticker: self._log(t, m))
+            self._log(ticker, 'campaign engine armed'
                               + (' (state restored)' if saved else ''))
         engine = slot['engine']
 
@@ -721,7 +610,7 @@ class AutopilotController:
             kind = act[0]
             if kind == 'notify':
                 # Reserved for explicit one-time engine warnings. Reserve
-                # exhaustion itself is visual-only in the Autopilot window.
+                # exhaustion itself is visual-only in the campaign window.
                 self._popup(ticker, act[1])
             elif mode != 'LIVE':
                 continue           # engine emits none in WATCH; safety net
@@ -758,47 +647,27 @@ class AutopilotController:
     # ── UI push (marshaled to the tk thread) ──────────────────────────────────
 
     def _push_ui(self, ticker, slot, snap=None, status=None):
+        """One flat dict describing the campaign right now, handed to the
+        window on the tk thread. Every field is read defensively so a poll can
+        never die on the way to the screen."""
         engine = slot.get('engine')
         badge_key = slot['mode']
-        strategy = slot['strategy']
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
         shares = (snap or {}).get('shares') or 0
         avg = (snap or {}).get('avg_cost') or 0.0
         ui = {
             'ticker': ticker,
-            'strategy': strategy,
-            'strategy_name': STRATEGIES[strategy][1],
             'state': engine.state if engine else 'ARMING',
-            'status': status or (engine.status if engine else 'arming…'),
-            'trigger': dict(engine.trigger) if engine else {},
-            'trigger_note': getattr(engine, 'trigger_note', None),
-            'lines': dict(getattr(engine, 'lines', {}) or {}),
-            # Campaign (V-Commandos gearbox) exposure
-            'campaign': (engine.summary(shares, avg, (snap or {}).get('price'))
-                         if (engine is not None and strategy == 'VCG')
-                         else None),
             'campaign_state': getattr(engine, 'campaign_state', None),
-            # Grid (daily adventure) exposure
-            'grid': [dict(g) for g in getattr(engine, 'grid', []) or []],
-            'level': getattr(engine, 'current_level', 0),
-            'grid_ready': getattr(engine, 'grid_ready', False),
-            'anchor': engine.anchor if engine else None,
-            'anchor_level': getattr(engine, 'anchor_level', 0),
-            'step': getattr(engine, 'step', 0.03),
-            'scale_locked': bool(engine
-                                 and (getattr(engine, 'bot_fills', 0) > 0
-                                      or getattr(engine, '_pending', None))),
-            'day_v_avg': slot.get('day_v_avg'),
-            'reference_close': getattr(engine, 'reference_close', None),
-            'opening_price': getattr(engine, 'opening_price', None),
-            'gap_mode': getattr(engine, 'gap_mode', 'NONE'),
-            'base_inventory': getattr(engine, 'base_inventory', 0),
-            'unit_qty': getattr(engine, 'unit_qty', 0),
-            'buy_value': getattr(engine, 'buy_value', 0.0),
-            'sell_value': getattr(engine, 'sell_value', 0.0),
-            'fills': getattr(engine, 'fills', 0),
-            'events': list(engine.events) if engine else [],
+            'status': status or (engine.status if engine else 'arming…'),
+            'campaign': (engine.summary(shares, avg, (snap or {}).get('price'))
+                         if engine is not None else None),
+            'lines': {k: dict(v) for k, v in
+                      (getattr(engine, 'lines', {}) or {}).items()},
+            'crossed': dict(getattr(engine, 'crossed', {}) or {}),
+            'events': list(getattr(engine, 'events', []) or []),
             'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
+            'day_v_avg': slot.get('day_v_avg'),
             'mode': slot['mode'],
             'badge_key': badge_key,
             'phase': market_phase(ticker),
@@ -816,7 +685,7 @@ class AutopilotController:
         def apply():
             if ticker not in self._slots:
                 return
-            self._apply_row_badge(ticker, badge_key, strategy)
+            self._apply_row_badge(ticker, badge_key)
             row = self._find_row(ticker)
             if row is not None:
                 if ui['price']:
@@ -824,7 +693,7 @@ class AutopilotController:
                     row.compute()
                 # The card is the campaign's source of truth: read back the
                 # gear/tier it now shows so the next poll uses it.
-                if strategy == 'VCG' and hasattr(row, 'line_config'):
+                if hasattr(row, 'line_config'):
                     try:
                         self.set_card_config(ticker, row.line_config())
                     except Exception:

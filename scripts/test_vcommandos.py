@@ -10,7 +10,7 @@ Part 2 runs whole price paths through the real engine behind a FakeBroker
 that fills resting limit orders when the simulated price crosses them, so
 the campaign lifecycle is exercised exactly as the live watcher would see
 it: LOAD → CHASE → full EXIT → same-day reload, plus manual app trades,
-adopted positions, the campaign cap, gear overrides and KR tick trimming.
+adopted positions, the army wall, gear shifts and KR tick trimming.
 """
 
 import os
@@ -21,8 +21,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.calc import (CAMPAIGN_CAP_UNITS, GEARS, RELOAD_DROP_PCT, add_ratio,
-                       calc_chase_cascade, calc_chase_price, calc_chase_shares,
+from core.calc import (GEARS, RELOAD_DROP_PCT, add_ratio, calc_chase_cascade,
                        calc_exit, calc_exit_lines, calc_load_ladder,
                        calc_load_price, calc_load_shares, calc_reload_price,
                        chase_drop, effective_entry_gear, exit_pct, load_drop,
@@ -101,7 +100,8 @@ ok(normalize_gear('L1') == 1 and normalize_gear('L4') == 5,
    'the oldest L1-L7 keys still migrate')
 
 print('— normalized ladders (manual Part II, fractional sizing) —')
-# vantage 100, 1 unit at LOAD, no fees, fractional shares.
+# vantage 100, 1 unit at LOAD, no fees, fractional shares. The 32-unit figure
+# is the table's reference scale, NOT a cap the engine enforces.
 MANUAL_TABLE = {           # gear: (rows, final avg, capital used)
     1: (8, 84.43, 23.02),
     2: (7, 80.74, 31.01),
@@ -111,11 +111,7 @@ MANUAL_TABLE = {           # gear: (rows, final avg, capital used)
 }
 for g, (rows, final_avg, capital) in MANUAL_TABLE.items():
     price = calc_load_price(100.0, g)
-    qty, avg, spent = 1.0, price, price * 1.0
-    # 1 unit buys 1/price shares; normalize so the LOAD is exactly 1 unit.
-    qty = 1.0
-    spent = 1.0                      # one unit of cash
-    avg = price
+    qty, avg, spent = 1.0, price, 1.0
     for _ in range(rows):
         buy_p = avg * (1 - chase_drop(g) / 100.0)
         add = qty * add_ratio(g)
@@ -127,7 +123,7 @@ for g, (rows, final_avg, capital) in MANUAL_TABLE.items():
     ok(near(spent, capital, 0.02), f'G{g} capital used {capital}u',
        f'got {spent:.2f}u')
     ok(GEARS[g]['max_chase'] == rows,
-       f'G{g} funds {rows} chases under the {CAMPAIGN_CAP_UNITS:g}u cap')
+       f'G{g} reference table runs {rows} chases')
 
 print('— card lines —')
 ladder, load_p, load_q = calc_load_ladder(100.0, 3, UNIT, chases=2)
@@ -234,18 +230,22 @@ def settle(e, b, price, rounds=4, **kw):
     return placed
 
 
-def fresh(ticker=T, shares=0, avg=0.0, cash=None, gear=3, tier=2,
-          cap=CAMPAIGN_CAP_UNITS):
+def fresh(ticker=T, shares=0, avg=0.0, cash=None, gear=3, tier=2):
     b = FakeBroker(shares, avg, cash)
     e = CampaignEngine(ticker, trading_date=D1)
-    card = {'gear': gear, 'exit_tier': tier, 'cap_units': cap}
-    return e, b, card
+    return e, b, {'gear': gear, 'exit_tier': tier}
+
+
+def line(e, key):
+    """(price, qty) of a published line, or (None, None)."""
+    v = e.lines.get(key)
+    return (v['price'], v['qty']) if v else (None, None)
 
 
 print('— campaign lifecycle —')
 e, b, card = fresh(gear=3)
 settle(e, b, 95.0, card=card)
-ok(e.state == 'FLAT' and e.lines['load'][0] == 92.0,
+ok(e.state == 'FLAT' and near(line(e, 'load')[0], 92.0),
    'flat: one LOAD line at High5 -8%', str(e.lines))
 ok(b.shares == 0, 'above the LOAD nothing is bought')
 
@@ -254,31 +254,57 @@ ok(b.shares == 11 and e.campaign_id,
    'the LOAD fills one unit and opens a campaign', f'{b.shares} sh')
 ok(e.events and e.events[0]['kind'] == 'LOAD',
    'the campaign log opens with a LOAD row')
-ok(near(e.lines['exit'][0], 92.0 * 1.05, 0.02)
-   and e.lines['exit'][1] == b.shares,
+ok(e.events[0]['date'] == D1,
+   'every log row records the trading day, not only the clock')
+ok(near(line(e, 'exit')[0], 92.0 * 1.05, 0.02)
+   and line(e, 'exit')[1] == b.shares,
    'the EXIT is the whole position at T2 +5%', str(e.lines.get('exit')))
 
-chase_p = e.lines['chase'][0]
-ok(near(chase_p, 92.0 * 0.94, 0.01) and e.lines['chase'][1] == 8,
+chase_p, chase_q = line(e, 'chase')
+ok(near(chase_p, 92.0 * 0.94, 0.01) and chase_q == 8,
    'the CHASE hangs -6% below the broker average, ×3/4')
 settle(e, b, chase_p, card=card)
 ok(b.shares == 19 and e.chase_count == 1,
    'the chase fills and the average drops', f'{b.shares} sh @ {b.avg:.2f}')
-ok(near(e.lines['exit'][0], b.avg * 1.05, 0.02),
+ok(near(line(e, 'exit')[0], b.avg * 1.05, 0.02),
    'the EXIT re-aims off the NEW broker average')
 
-exit_p = e.lines['exit'][0]
+exit_p = line(e, 'exit')[0]
 settle(e, b, exit_p, card=card)
 ok(b.shares == 0, 'the EXIT sells every share in one order')
 ok(e.campaign_id is None and e.campaign_state == 'RELOAD_ARMED',
    'the campaign completes and arms the same-day reload')
 
+print('— the next lines, and the ones after —')
+e, b, card = fresh(gear=3)
+settle(e, b, 92.0, card=card)
+ok(e.lines['chase']['armed'] and not e.lines['chase2']['armed'],
+   'exactly one buy line is armed; the rest are projections')
+ok('chase2' in e.lines and 'chase3' in e.lines,
+   'two chases beyond the armed one are published', str(list(e.lines)))
+c1, c2, c3 = (line(e, k)[0] for k in ('chase', 'chase2', 'chase3'))
+ok(c1 > c2 > c3, 'the projected ladder descends', f'{c1} {c2} {c3}')
+q1, q2 = line(e, 'chase')[1], line(e, 'chase2')[1]
+ok(q2 > q1, 'each deeper chase adds more shares', f'{q1} then {q2}')
+proj = calc_chase_cascade(b.shares, b.avg, 3, 2)
+ok(near(c2, proj[1]['price'], 0.02),
+   'the projection folds each fill into the running average, as the '
+   'campaign would')
+flat_e, flat_b, flat_card = fresh(gear=3)
+settle(flat_e, flat_b, 95.0, card=flat_card)
+ok(flat_e.lines['load']['armed'] and not flat_e.lines['pexit']['armed'],
+   "a flat card arms the LOAD and marks its exit a projection")
+
 print('— same-day reload —')
+e, b, card = fresh(gear=3)
+settle(e, b, 92.0, card=card)
+exit_p = line(e, 'exit')[0]
+settle(e, b, exit_p, card=card)
 ok(near(e.vantage, exit_p) and e.vantage_src == 'reload',
    'the reload anchors on the ACTUAL final sell fill')
 settle(e, b, exit_p * 0.99, card=card)
 ok(b.shares == 0, 'a 1% dip does not trigger the -3% reload')
-reload_p = e.lines['load'][0]
+reload_p = line(e, 'load')[0]
 ok(near(reload_p, exit_p * 0.97, 0.02),
    f'the reload sits at the sell fill -{RELOAD_DROP_PCT}%', str(reload_p))
 settle(e, b, reload_p, card=card)
@@ -288,31 +314,36 @@ ok(b.shares > 0 and e.events[0]['kind'] == 'RELOAD',
 print('— the reload never crosses into a new day —')
 e, b, card = fresh(gear=3)
 settle(e, b, 92.0, card=card)
-settle(e, b, e.lines['exit'][0], card=card)
+settle(e, b, line(e, 'exit')[0], card=card)
 ok(e.vantage_src == 'reload', 'reload armed at the close of day 1')
 settle(e, b, 95.0, date=D2, high5=101.0, card=card)
 ok(e.vantage_src == 'high5' and near(e.vantage, 101.0),
    'day 2 discards the reload and returns to the rolling High5')
 
-print('— the campaign capital cap —')
-e, b, card = fresh(gear=5, cap=3.0)          # 3 units only
+print('— the army is the only wall —')
+e, b, card = fresh(gear=5, cash=None)        # unlimited cash
 settle(e, b, 90.0, card=card)
 ok(b.shares == 11, 'G5 loads at High5 -10%')
-for _ in range(4):
-    line = e.lines.get('chase')
-    if not line or e.buy_state == 'CAPPED':
+for _ in range(6):
+    p = line(e, 'chase')[0]
+    if p is None:
         break
-    settle(e, b, line[0], card=card)
-ok(e.buy_state == 'CAPPED',
-   'the chase stops at the campaign cap instead of borrowing')
-ok('exit' in e.lines,
-   'a capped campaign keeps watching its EXIT')
-before = b.shares
-settle(e, b, e.lines['chase'][0] * 0.9, card=card)
-ok(b.shares == before, 'a crossed CHASE line does not fire while capped')
+    settle(e, b, p, card=card)
+ok(b.shares > 350 and e.chase_count == 6,
+   'with cash on hand the ladder keeps going — no 32-unit cap stops it',
+   f'{b.shares} sh after {e.chase_count} chases')
+ok(e.buy_state == 'OK', 'and the buy side never reports a cap')
 
-print('— the army wall —')
-e, b, card = fresh(gear=3, cash=500.0)       # half a unit of cash
+e, b, card = fresh(gear=3, cash=1500.0)      # 1.5 units of cash
+settle(e, b, 92.0, card=card)
+ok(b.shares == 11, 'the LOAD fits in the army')
+settle(e, b, line(e, 'chase')[0], card=card)
+ok(e.buy_state == 'EXHAUSTED' and b.shares == 11,
+   'the next chase is refused when the cash is not there',
+   f'{b.shares} sh, {e.buy_state}')
+ok('exit' in e.lines, 'an exhausted campaign keeps watching its EXIT')
+
+e, b, card = fresh(gear=3, cash=500.0)       # half a unit
 settle(e, b, 92.0, card=card)
 ok(b.shares == 0 and e.buy_state == 'EXHAUSTED',
    'no army → the LOAD is not fired and the state says so')
@@ -323,55 +354,60 @@ b.external_buy(90.0, 20)                     # bought by hand in the app
 settle(e, b, 91.0, card=card)
 ok(e.state == 'DEPLOYED' and e.campaign_id,
    'ADOPT_POSITION: the bot takes over a hand-bought holding')
-ok(near(e.lines['exit'][0], 90.0 * 1.05, 0.02),
+ok(any(ev['kind'] == 'ADOPT' for ev in e.events),
+   'the adoption is the first row of the campaign log')
+ok(near(line(e, 'exit')[0], 90.0 * 1.05, 0.02),
    'the adopted campaign computes its EXIT from the broker average alone')
 
 b.external_buy(85.0, 10)                     # a second hand buy
 settle(e, b, 86.0, card=card)
-ok(any(ev['source'] == 'EXTERNAL' for ev in e.events),
-   'EXTERNAL_BUY is recorded as an external fill')
-ok(near(e.lines['exit'][0], b.avg * 1.05, 0.02)
-   and near(e.lines['chase'][0], b.avg * 0.94, 0.01),
+ok(any(ev['source'] == 'EXT' for ev in e.events),
+   'a hand buy is recorded as an external fill')
+ok(near(line(e, 'exit')[0], b.avg * 1.05, 0.02)
+   and near(line(e, 'chase')[0], b.avg * 0.94, 0.01),
    'both lines re-aim off the new broker average')
 
 b.external_sell(89.0, 5)                     # a hand partial sell
 settle(e, b, 89.0, card=card)                # still between the two lines
 ok(e.manually_modified,
    'an external PARTIAL sell flags the campaign MANUALLY_MODIFIED')
-ok(e.lines['exit'][1] == b.shares,
+ok(line(e, 'exit')[1] == b.shares,
    'the EXIT still covers the whole REMAINING position')
 
 b.external_sell(95.0, b.shares)              # closed by hand
 settle(e, b, 95.0, card=card)                # above the reload line
 ok(e.campaign_id is None and not e.manually_modified,
-   'EXTERNAL_FULL_EXIT completes the campaign and clears the flag')
+   'a hand full-sell completes the campaign and clears the flag')
 
-print('— gear and tier overrides are explicit and logged —')
+print('— the gear shifts freely, and is logged —')
 e, b, card = fresh(gear=3)
 settle(e, b, 92.0, card=card)
-card = {'gear': 5, 'exit_tier': 3, 'cap_units': CAMPAIGN_CAP_UNITS}
+before_shares, before_avg, cid = b.shares, b.avg, e.campaign_id
+card = {'gear': 5, 'exit_tier': 3}
 settle(e, b, 92.0, card=card)
-kinds = [o['kind'] for o in e.overrides]
-ok('GEAR_OVERRIDE' in kinds and 'EXIT_TIER_OVERRIDE' in kinds,
-   'changing the card mid-campaign logs both overrides', str(kinds))
-ok(near(e.lines['chase'][0], b.avg * 0.92, 0.01)
-   and near(e.lines['exit'][0], b.avg * 1.09, 0.02),
+kinds = [ev['kind'] for ev in e.events]
+ok('GEAR' in kinds and 'TIER' in kinds,
+   'shifting gear or tier mid-campaign writes a log row', str(kinds))
+ok(near(line(e, 'chase')[0], b.avg * 0.92, 0.01)
+   and near(line(e, 'exit')[0], b.avg * 1.09, 0.02),
    'the new gear replaces both lines immediately')
-ok(e.campaign_id is not None and b.shares > 0,
-   'the override keeps the holding, the average and the campaign id')
+ok(e.campaign_id == cid and b.shares == before_shares
+   and near(b.avg, before_avg, 1e-9),
+   'the shift keeps the holding, the average and the campaign id')
+ok(near(line(e, 'chase2')[0], calc_chase_cascade(b.shares, b.avg, 5, 2)[1]['price'],
+        0.02),
+   'and the projected ladder follows the new gear too')
 
-print('— WATCH mode places nothing —')
+print('— WATCH sends nothing; LIVE sends by itself —')
 e, b, card = fresh(gear=3)
 placed = settle(e, b, 92.0, card=card, can_trade=False)
 ok(not placed and b.shares == 0, 'WATCH never sends an order')
-ok(e.trigger['BUY'] and e.trigger['BUY']['qty'] == 11,
-   'the crossed line is exposed for the manual Buy button')
-e.note_manual_order('BUY', e.trigger['BUY']['price'],
-                    e.trigger['BUY']['qty'], kind='LOAD')
-b.external_buy(92.0, 11)
-settle(e, b, 92.0, card=card, can_trade=False)
-ok(e.events and e.events[0]['source'] == 'BOT',
-   'a hand-fired trigger is attributed like a bot fill')
+ok(e.crossed['BUY'] and e.crossed['BUY']['qty'] == 11,
+   'the crossed line is still reported so the window can show it')
+ok('not sent' in e.status, 'and the status says plainly why', e.status)
+placed = settle(e, b, 92.0, card=card)
+ok(placed and b.shares == 11,
+   'LIVE sends the offer the moment the curve touches the line')
 
 print('— one order at a time —')
 e, b, card = fresh(gear=3)
@@ -392,6 +428,8 @@ print('— persistence across a restart —')
 e, b, card = fresh(gear=4)
 settle(e, b, 91.0, card=card)
 saved = e.to_dict()
+ok(saved['strategy'] == 'V_COMMANDOS_GEARBOX',
+   'the saved record names its strategy so nothing else reads it')
 e2 = CampaignEngine(T, trading_date=D1, saved=saved)
 settle(e2, b, 91.0, card=card)
 ok(e2.campaign_id == e.campaign_id and e2.gear == 4,

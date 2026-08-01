@@ -1,7 +1,6 @@
 import tkinter as tk
 from core.calc import (
-    CAMPAIGN_CAP_UNITS, DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS,
-    RELOAD_DROP_PCT, calc_chase_cascade, calc_exit_lines, calc_gap_rate,
+    DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS, RELOAD_DROP_PCT, calc_chase_cascade, calc_exit_lines, calc_gap_rate,
     calc_load_ladder, calc_reload_price, chase_drop, clamp_gear, clamp_tier,
     display_name, effective_entry_gear, exit_pct, fmt_price, gap_color,
     gear_button_color, gear_button_fg, gear_detail, gear_for_chase_pct,
@@ -49,10 +48,10 @@ class StockRow:
     * FLAT — the ladder is the projected entry: Load (one unit) plus two
       projected chases, and the exit tiers are computed as if it had filled.
 
-    The gear is chosen before the campaign and does not adapt inside it: AUTO
-    picks it from the 5-day range while the card is FLAT and then pins it once
-    deployed. Changing it on a deployed card is an explicit manual override
-    (the bot logs GEAR_OVERRIDE).
+    The gear can be shifted at any time, deployed or not: only the average
+    cost is history, and both lines are recomputed from it on the spot. AUTO
+    tracks the 5-day range; MANUAL holds whatever the commander picked. A
+    shift on a live campaign is written to the campaign log.
 
     The parent grids ``self.frame``; the row does not place itself.
     """
@@ -289,8 +288,8 @@ class StockRow:
         self.gear_badge = tk.Canvas(
             badge_row, width=46, height=46, highlightthickness=0, bd=0)
         self.gear_badge.pack(side='left')
-        self.pin_lbl = tk.Label(badge_row, text='', font=_F_TINY, fg='#888')
-        self.pin_lbl.pack(side='left', padx=(4, 0))
+        self.mode_lbl = tk.Label(badge_row, text='', font=_F_TINY, fg='#888')
+        self.mode_lbl.pack(side='left', padx=(4, 0))
 
         # -- Exit tier (ONE tier, full position — no split) --------------------
         exit_box = tk.Frame(wrap)
@@ -306,23 +305,15 @@ class StockRow:
             btn.grid(row=disp + 1, column=0, sticky='w', pady=1)
             self._tier_btns[t] = btn
 
-        # -- Autopilot buttons: the campaign bot (big) + the v^ grid (small) --
+        # -- Autopilot button: opens the campaign cockpit and arms WATCH -------
         if self.on_autopilot:
-            ap = tk.Frame(wrap)
-            ap.pack(side='left', anchor='n', padx=(12, 0),
-                    pady=(_AP_BUTTON_TOP_GAP, 0))
             self.ap_btn = tk.Button(
-                ap, text='V-COMMANDOS', font=_F_SM_B, width=12,
+                wrap, text='V-COMMANDOS', font=_F_SM_B, width=12,
                 height=3, bd=2, takefocus=0,
-                command=lambda: self.on_autopilot(self.ticker, 'VCG'))
+                command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
-            self.ap_btn.pack(side='top')
-            self.grid_btn = tk.Button(
-                ap, text='v^ grid', font=_F_TINY, width=12,
-                height=1, bd=1, takefocus=0,
-                command=lambda: self.on_autopilot(self.ticker, 'GRID'))
-            self._grid_btn_default_bg = self.grid_btn.cget('bg')
-            self.grid_btn.pack(side='top', pady=(2, 0))
+            self.ap_btn.pack(side='left', anchor='n', padx=(12, 0),
+                             pady=(_AP_BUTTON_TOP_GAP, 0))
 
     # ── Formatting ────────────────────────────────────────────────────────────
 
@@ -363,11 +354,6 @@ class StockRow:
         finally:
             self._syncing_gear = False
 
-    def _gear_pinned(self) -> bool:
-        """A live campaign keeps its gear: AUTO only picks while FLAT
-        (manual §11 — no adaptive switching inside a campaign)."""
-        return self.deployed
-
     def _on_gear_select(self, gear):
         self._set_gear(gear)
         self._on_input_change()
@@ -388,9 +374,7 @@ class StockRow:
             self.vol_var.set('V --')
         elif not self.auto_var.get():
             self.vol_var.set(f'V {vol:.1f}%')
-        elif self._gear_pinned():
-            self.vol_var.set(f'V {vol:.1f}% · G{self._get_gear()} pinned')
-        elif self.vantage_src == 'reload':
+        elif self.vantage_src == 'reload' and not self.deployed:
             self.vol_var.set(f'V {vol:.1f}% → reload -3%')
         else:
             base = select_auto_gear(vol)
@@ -399,21 +383,23 @@ class StockRow:
             self.vol_var.set(f'V {vol:.1f}% → G{eff}{heavy}')
 
     def _apply_auto(self):
-        """AUTO picks the gear from the 5-day range while the card is FLAT,
-        with the heavy-unit minimum entry gear applied on top. A DEPLOYED card
-        keeps its campaign gear (a change there is a manual override), and
-        everything freezes while live orders rest."""
+        """AUTO tracks the 5-day range, deployed or not — the gear is not
+        pinned by a live campaign, because only the average cost is history
+        and both lines are recomputed from it. The heavy-unit floor applies
+        to a FLAT card only: it is an ENTRY rule about opening a position with
+        useful resolution, not about one that already exists. Everything
+        freezes while live orders rest."""
         if self._order_locked or not self.auto_var.get():
-            return
-        self._base_gear = select_auto_gear(self.volatility)
-        if self._gear_pinned():
-            self._eff_gear = self._get_gear()
             return
         if self.volatility is None:
             return
-        ref_price = self.current_price or self.vantage
-        gear = effective_entry_gear(self.volatility, ref_price,
-                                    self.get_unit_cash())
+        self._base_gear = select_auto_gear(self.volatility)
+        if self.deployed:
+            gear = self._base_gear
+        else:
+            ref_price = self.current_price or self.vantage
+            gear = effective_entry_gear(self.volatility, ref_price,
+                                        self.get_unit_cash())
         self._eff_gear = gear
         self._set_gear(gear)
 
@@ -460,25 +446,22 @@ class StockRow:
             self.gear_menu.config(state='disabled')
             for b in self._tier_btns.values():
                 b.config(state='disabled')
-            self.pin_lbl.config(text='locked', fg='#CC0000')
+            self.mode_lbl.config(text='locked', fg='#CC0000')
             return
 
         self.auto_btn.config(state='normal')
         for b in self._tier_btns.values():
             b.config(state='normal')
 
-        # AUTO only drives a FLAT card; a deployed campaign keeps its gear, so
-        # the picker stays live there even in AUTO (that IS the override path).
-        auto_locked = self.auto_var.get() and not self._gear_pinned()
-        self.gear_menu.config(state='disabled' if auto_locked else 'normal')
+        self.gear_menu.config(
+            state='disabled' if self.auto_var.get() else 'normal')
         self.gear_menu.config(
             fg=self._gear_menu_default_fg, bg=self._gear_menu_default_bg,
             activeforeground=self._gear_menu_default_fg,
             activebackground=self._gear_menu_default_bg,
             disabledforeground='#888888', font=_F_SM)
-        self.pin_lbl.config(
-            text='pinned' if self._gear_pinned() else '',
-            fg='#0033AA')
+        self.mode_lbl.config(text='live' if self.deployed else '',
+                             fg='#0033AA')
 
     def _style_tier_buttons(self):
         gear = self._get_gear()
@@ -661,35 +644,20 @@ class StockRow:
         'WATCH': ('V-COMMANDOS\nWATCH', '#3366CC', 'white'),
         'LIVE':  ('V-COMMANDOS\nLIVE',  '#CC0000', 'white'),
     }
-    _GRID_STYLES = {
-        None:    ('v^ grid',       None,      'black'),
-        'WATCH': ('v^ WATCH',      '#3366CC', 'white'),
-        'LIVE':  ('v^ LIVE',       '#CC0000', 'white'),
-    }
-
-    def set_autopilot(self, key, strategy='VCG'):
-        """Color an autopilot button to its status (None/'WATCH'/'LIVE')."""
-        if strategy == 'GRID':
-            btn = getattr(self, 'grid_btn', None)
-            styles, default = self._GRID_STYLES, self._grid_btn_default_bg
-        else:
-            btn = getattr(self, 'ap_btn', None)
-            styles, default = self._AP_STYLES, self._ap_btn_default_bg
+    def set_autopilot(self, key):
+        """Color the autopilot button to its status (None/'WATCH'/'LIVE')."""
+        btn = getattr(self, 'ap_btn', None)
         if btn is None:
             return
-        text, bg, fg = styles.get(key, styles[None])
-        bg = bg or default
+        text, bg, fg = self._AP_STYLES.get(key, self._AP_STYLES[None])
+        bg = bg or self._ap_btn_default_bg
         btn.config(text=text, bg=bg, fg=fg,
                    activebackground=bg, activeforeground=fg)
 
     def line_config(self) -> dict:
         """The campaign parameters the bot must follow — exactly what this card
         shows right now. One gearbox, one source."""
-        return {
-            'gear':      self._get_gear(),
-            'exit_tier': self._get_tier(),
-            'cap_units': CAMPAIGN_CAP_UNITS,
-        }
+        return {'gear': self._get_gear(), 'exit_tier': self._get_tier()}
 
     def current_shares(self) -> int:
         try:
