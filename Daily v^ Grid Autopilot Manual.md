@@ -1,16 +1,37 @@
 # Daily v^ Linear Weighted Grid — the Daily Adventure Autopilot
 
-**Version:** 0.2.0 (system edition)
+**Version:** 0.2.1 (system edition)
 **Adapted from:** strategy manual `DAILY_V_HAT_LINEAR_WEIGHTED_GRID_MANUAL` v0.1.0
 **Implemented in:** `core/autopilot.py` (`GridEngine`), `gui/autopilot_ctrl.py`, `gui/autopilot_window.py`
-**Status:** simulated offline (57 engine checks + fuzz); LIVE-ready pending a small real trial
+**Status:** simulated offline (86 engine checks + fuzz); LIVE-ready pending a small real trial
+**Role since 2026-08-01:** **secondary, selectable mode — no longer the only bot**
 
-This file replaces the old "Daily V-Commandos Autopilot Manual". The old
-average-cost V-only systems (443, adaptive gears, 타짜, the card-line
-follower) are retired as BOT strategies; their history lives in git. The
-**card gear system stays in the app unchanged** — it is the manual-trading
-aid (the same mechanics the commander can run by hand through the app/web).
-The autopilot no longer reads the cards: it runs THIS strategy.
+> ### Where this strategy now sits
+>
+> `V_COMMANDOS_GEARBOX` (see [`Gearbox V-Commandos Autopilot Manual.md`](Gearbox%20V-Commandos%20Autopilot%20Manual.md))
+> is the **default** autopilot: a campaign bot that follows exactly the lines the
+> stock card draws. This grid is kept as the **second selectable strategy**.
+>
+> ```text
+> card button  [ V-COMMANDOS ]  big    → the campaign bot (default)
+> card button  [   v^ grid   ]  small  → THIS strategy
+> ```
+>
+> One strategy runs per stock at a time; the app refuses to switch while that
+> stock is LIVE or holds shares, because a campaign and a grid must never share
+> a position. Each keeps its own saved state (`data/autopilot_state.json`,
+> keyed `ticker#strategy`).
+>
+> Everything below still describes this strategy accurately. Two statements in
+> the original text are now **out of date**:
+>
+> - *"The old card-line follower is retired as a BOT strategy"* — it was
+>   brought back, rebuilt as the Gearbox campaign bot, and is now the default.
+> - *"The autopilot no longer reads the cards"* — true of THIS strategy only.
+>   The campaign bot does read them, by design.
+>
+> The card gear system is no longer a manual-trading aid running beside the
+> bot: it is the campaign bot's source of truth for gear and exit tier.
 
 ---
 

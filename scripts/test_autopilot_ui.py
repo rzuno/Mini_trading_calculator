@@ -1,9 +1,11 @@
-"""Headless checks for Autopilot presentation helpers (Daily v^ grid).
+"""Headless checks for autopilot presentation helpers.
 
 Run:  python scripts/test_autopilot_ui.py
 
-No Tk window is created; these checks cover the render decisions that can be
-verified without a display.
+Covers both cockpits — the Daily v^ grid window and the V-Commandos campaign
+window — plus the controller's strategy-selection rules. The render checks
+create no Tk window; the last section uses a withdrawn root so the real
+controller can be exercised.
 """
 
 import os
@@ -16,7 +18,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gui.autopilot_window import (AutopilotWindow, fills_text, next_line,
                                   next_transitions, scale_style)
-from gui.autopilot_ctrl import avg_completed_day_v, merge_live_bar
+from gui.campaign_window import (campaign_age_line, campaign_line,
+                                 fills_text as campaign_fills,
+                                 next_line as campaign_next_line)
+import tkinter as tk
+
+from gui.autopilot_ctrl import (AutopilotController, avg_completed_day_v,
+                                merge_live_bar)
 from gui.candle_chart import (avg_bar_day_v, bounded_label_layout,
                               candle_color, required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
@@ -219,5 +227,138 @@ ok(scale_style(None) == scale_style(0.03),
 
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
+
+# ── Campaign window presentation (V-Commandos) ───────────────────────────────
+print('— campaign banner —')
+
+_CAMPAIGN_UI = {
+    'campaign': {'gear': 3, 'gear_name': 'Balanced', 'exit_tier': 2,
+                 'exit_pct': 5, 'load_pct': 8, 'chase_pct': 6,
+                 'add_frac': '3/4', 'vantage': 100.0, 'vantage_src': 'high5',
+                 'cap_units': 32.0, 'campaign_id': 'T-20260801-090000',
+                 'campaign_start': '2026-08-01 09:00', 'chase_count': 2,
+                 'campaign_low': 84.2, 'max_cost': 4210.0,
+                 'manually_modified': False},
+    'lines': {'chase': (86.5, 12), 'exit': (96.6, 31)},
+    'buy_state': 'OK',
+    'events': [{'ts': '08/01 09:31', 'kind': 'LOAD', 'qty': 11, 'price': 92.0,
+                'shares': 11, 'avg': 92.0, 'source': 'BOT'},
+               {'ts': '08/01 11:02', 'kind': 'CHASE', 'qty': 8, 'price': 86.5,
+                'shares': 19, 'avg': 89.7, 'source': 'EXTERNAL'}],
+}
+
+line = campaign_line(_CAMPAIGN_UI, 'USD')
+ok('G3 Balanced' in line and 'LOAD -8%' in line and 'CHASE -6% ×3/4' in line,
+   'the banner names the whole gear in one line', line)
+ok('EXIT T2 +5% (full)' in line,
+   'the banner says the exit is a FULL-position sell')
+ok('vantage 100.00 (High5)' in line, 'the vantage and its source are shown')
+
+nxt = campaign_next_line(_CAMPAIGN_UI, 'USD')
+ok('▼ CHASE 86.50 × 12' in nxt and '▲ EXIT 96.60 × 31' in nxt,
+   'the two watched lines read down-then-up', nxt)
+
+capped = dict(_CAMPAIGN_UI, buy_state='CAPPED')
+ok('[CAP]' in campaign_next_line(capped, 'USD'),
+   'a capped chase is flagged in the next-line row')
+broke = dict(_CAMPAIGN_UI, buy_state='EXHAUSTED')
+ok('[NO ARMY]' in campaign_next_line(broke, 'USD'),
+   'an unfundable chase is flagged in the next-line row')
+
+flat = {'campaign': dict(_CAMPAIGN_UI['campaign'], campaign_id=None),
+        'lines': {'load': (92.0, 11), 'pexit': (96.6, 11)}, 'events': []}
+ok('▼ LOAD 92.00 × 11' in campaign_next_line(flat, 'USD')
+   and 'projected' in campaign_next_line(flat, 'USD'),
+   'a flat card shows the LOAD and marks its exit as projected')
+ok(campaign_age_line(flat, 'USD') == '',
+   'no campaign line before the first LOAD fills')
+
+age = campaign_age_line(_CAMPAIGN_UI, 'USD')
+ok('T-20260801-090000' in age and 'chases 2' in age and 'low 84.20' in age,
+   'the campaign line carries id, chases and the campaign low', age)
+
+log = campaign_fills(_CAMPAIGN_UI, 'USD')
+ok('campaign fills (2)' in log and 'LOAD' in log and 'CHASE' in log,
+   'the fill log lists this campaign only')
+ok('EXT' in log and 'BOT' in log,
+   'each fill says whether the bot or the commander made it')
+ok(campaign_fills({'events': []}, 'USD') == '',
+   'no fill log before the first fill')
+
+# ── Strategy selection (controller, withdrawn root) ──────────────────────────
+print('— two strategies, one at a time —')
+
+
+class _StubRow:
+    def __init__(self, ticker, gear=3, tier=2):
+        self.ticker = ticker
+        self._cfg = {'gear': gear, 'exit_tier': tier, 'cap_units': 32.0}
+        self.badges = []
+
+    def line_config(self):
+        return dict(self._cfg)
+
+    def set_autopilot(self, key, strategy='VCG'):
+        self.badges.append((strategy, key))
+
+
+class _StubApp:
+    def __init__(self, root):
+        self.root = root
+        self._auto = True
+        self.deployed_rows = [_StubRow('NVDA')]
+        self.empty_rows = []
+
+    def _get_unit_cash(self, ccy):
+        return 1000.0
+
+
+_root = tk.Tk()
+_root.withdraw()
+ctrl = AutopilotController(_StubApp(_root))
+ctrl._log = lambda *a: None            # keep the test out of logs/
+
+ok(ctrl.watch('NVDA')[0] and ctrl.strategy_of('NVDA') == 'VCG',
+   'the default strategy is the V-Commandos campaign bot')
+ok(ctrl._slots['NVDA']['card'] == {'gear': 3, 'exit_tier': 2,
+                                   'cap_units': 32.0},
+   "watching pulls the card's gear config immediately")
+
+ctrl.set_card_config('NVDA', {'gear': 5, 'exit_tier': 1, 'cap_units': 32.0})
+ok(ctrl._slots['NVDA']['card']['gear'] == 5,
+   'the card pushes a gear change straight through to the engine snapshot')
+
+ok(ctrl.watch('NVDA', 'VCG') == (True, 'already watching'),
+   're-opening the same cockpit does not restart the watch')
+
+ctrl._slots['NVDA']['ui']['shares'] = 31
+okmsg = ctrl.watch('NVDA', 'GRID')
+ok(not okmsg[0] and 'close it' in okmsg[1],
+   'switching strategy is refused while the stock holds a position', okmsg[1])
+
+ctrl._slots['NVDA']['ui']['shares'] = 0
+ctrl._slots['NVDA']['mode'] = 'LIVE'
+okmsg = ctrl.watch('NVDA', 'GRID')
+ok(not okmsg[0] and 'LIVE' in okmsg[1],
+   'switching strategy is refused while LIVE', okmsg[1])
+
+ctrl._slots['NVDA']['mode'] = 'WATCH'
+ok(ctrl.watch('NVDA', 'GRID')[0] and ctrl.strategy_of('NVDA') == 'GRID',
+   'a flat, non-LIVE stock switches to the v^ grid')
+ok(ctrl.watch('NVDA', 'NOPE') == (False, 'unknown strategy NOPE'),
+   'an unknown strategy key is rejected')
+
+ok(ctrl._store_key('NVDA', 'VCG') != ctrl._store_key('NVDA', 'GRID'),
+   'each strategy saves its state under its own key')
+ctrl._store = {'NVDA': {'legacy': True},
+               'NVDA#VCG': {'campaign_id': 'x'}}
+ok(ctrl._saved_for('NVDA', 'GRID') == {'legacy': True},
+   'a pre-split state file still restores the grid')
+ok(ctrl._saved_for('NVDA', 'VCG') == {'campaign_id': 'x'},
+   'the campaign restores from its own key')
+
+ctrl.disable('NVDA')
+ok(ctrl.strategy_of('NVDA') is None, 'disable stops the watch')
+_root.destroy()
 
 print(f'\nALL {passed} UI CHECKS PASSED')

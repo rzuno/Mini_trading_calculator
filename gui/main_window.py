@@ -2,7 +2,8 @@ import tkinter as tk
 import threading
 from datetime import datetime
 
-from core.calc import stock_sort_key, calc_volatility, fx_dev_color
+from core.calc import (DEFAULT_EXIT_TIER, stock_sort_key, calc_volatility,
+                       fx_dev_color)
 from core.csv_io import load_config, save_config, load_positions, save_positions
 from providers import get_provider
 from gui.stock_row import StockRow
@@ -54,7 +55,8 @@ class App:
         self._catalogue = [p['ticker'] for p in self.positions]
         self._gear_prefs = {
             p['ticker']: {k: p.get(k) for k in (
-                'tier', 'load_gear', 'buy_pct', 't1_pct', 't2_pct', 't3_pct',
+                'tier', 'gear', 'exit_tier', 'load_gear', 'buy_pct',
+                't1_pct', 't2_pct', 't3_pct',
                 't1_active', 't2_active', 't3_active', 'auto_mode')}
             for p in self.positions}
         self._last_account = None
@@ -511,10 +513,13 @@ class App:
 
     # ── Autopilot window (big card button) ────────────────────────────────────
 
-    def _open_autopilot(self, ticker):
-        """The card's big Autopilot button: start watching the stock (bare
-        WATCH mode — polling only, no orders) and pop its live window.
-        Reuses an already-open window instead of stacking duplicates."""
+    def _open_autopilot(self, ticker, strategy='VCG'):
+        """A card's autopilot button: start watching the stock (bare WATCH
+        mode — polling only, no orders) and pop that strategy's live window.
+
+        The big V-COMMANDOS button opens the campaign cockpit; the small v^
+        button opens the daily-grid cockpit. Only one strategy runs on a stock
+        at a time, so switching closes the other window."""
         if not self._auto:
             self.status_var.set('Autopilot needs Toss (auto) mode.')
             return
@@ -524,18 +529,27 @@ class App:
         if win is not None:
             try:
                 if win.win.winfo_exists():
-                    win.win.lift()
-                    return
+                    if getattr(win, 'strategy', None) == strategy:
+                        win.win.lift()
+                        return
+                    win.win.destroy()
             except tk.TclError:
                 pass
-        ok, msg = self.autopilot.watch(ticker)
+            self._ap_windows.pop(ticker, None)
+        ok, msg = self.autopilot.watch(ticker, strategy)
         if not ok:
             self.status_var.set(f'Autopilot: {msg}')
             return
-        from gui.autopilot_window import AutopilotWindow
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
-        self._ap_windows[ticker] = AutopilotWindow(
-            self.root, ticker, ccy, self.autopilot.graph_context(ticker))
+        ctx = self.autopilot.graph_context(ticker)
+        if strategy == 'GRID':
+            from gui.autopilot_window import AutopilotWindow
+            win = AutopilotWindow(self.root, ticker, ccy, ctx)
+        else:
+            from gui.campaign_window import CampaignWindow
+            win = CampaignWindow(self.root, ticker, ccy, ctx)
+        win.strategy = strategy
+        self._ap_windows[ticker] = win
 
     def _account_seq(self, prov):
         if self._toss_acct_seq is None:
@@ -603,11 +617,15 @@ class App:
         return total
 
     def _on_row_compute(self):
-        """Called when any row recomputes (gear change, tier toggle, typed
-        input) — update army% across the cards. The cards are a manual
-        trading aid only; the autopilot runs its own grid strategy."""
+        """Called when any row recomputes (gear change, tier switch, typed
+        input) — update army% across the cards and push every card's gear
+        config to the autopilot. The card IS the campaign strategy, so a gear
+        the commander changes here reaches the bot on its next poll."""
         if self._fx_rate:
             self._update_army(self._fx_rate)
+        for row in self.deployed_rows + self.empty_rows:
+            if self.autopilot.is_enabled(row.ticker):
+                self.autopilot.set_card_config(row.ticker, row.line_config())
 
     # ── Save & Refresh (the single main button) ─────────────────────────────
 
@@ -629,9 +647,7 @@ class App:
                       and pos.get('avg_cost', 0) > 0):
                     pos['is_deployed'] = True
                     pos['cost_basis'] = pos['shares'] * pos['avg_cost']
-                    pos['t1_active'] = False
-                    pos['t2_active'] = True
-                    pos['t3_active'] = False
+                    pos['exit_tier'] = DEFAULT_EXIT_TIER
 
         self._rebuild_sections()
         self._reapply()
@@ -652,6 +668,7 @@ class App:
             s = states.get(pos['ticker'])
             if s:
                 for k in ('is_deployed', 'shares', 'avg_cost', 'cost_basis',
+                          'gear', 'exit_tier',
                           'buy_pct', 't1_pct', 't2_pct', 't3_pct',
                           't1_active', 't2_active', 't3_active', 'load_gear',
                           'auto_mode'):
@@ -716,9 +733,8 @@ class App:
                 pos['avg_cost'] = it.get('avg') or 0.0
                 pos['cost_basis'] = pos['shares'] * pos['avg_cost']
                 if not was_deployed:
-                    pos['t1_active'] = False
-                    pos['t2_active'] = True
-                    pos['t3_active'] = False
+                    # A fresh campaign starts on the standing default exit.
+                    pos['exit_tier'] = DEFAULT_EXIT_TIER
             else:
                 pos['is_deployed'] = False
                 pos['shares'] = 0
@@ -752,15 +768,18 @@ class App:
         if fx_rate:
             self._update_unit_usd()
 
-        # Update every row through the one unified signature. The vantage
-        # point (previous completed close) anchors the empty cards' load
-        # lines — the cards are the manual gear aid, independent of the bot.
+        # Update every row through the one unified signature. The VANTAGE is
+        # High5 — the highest completed-session high of the previous five
+        # trading days (Gearbox manual §9.1) — with the previous close as the
+        # fallback when the 5-day high is not known yet. The campaign bot
+        # watches exactly the lines these cards draw.
         for row in self.deployed_rows + self.empty_rows:
             d = data.get(row.ticker, {})
+            high5 = d.get('5d_high')
             row.update_live(
                 d.get('price'),
-                vantage=d.get('prev_close'),
-                vantage_src='close',
+                vantage=high5 or d.get('prev_close'),
+                vantage_src='high5' if high5 else 'close',
                 volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
 
         for row in self.deployed_rows + self.empty_rows:

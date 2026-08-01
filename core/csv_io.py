@@ -3,14 +3,20 @@ import json
 import os
 from datetime import date
 
-from core.calc import normalize_load_pct
+from core.calc import (DEFAULT_EXIT_TIER, DEFAULT_GEAR, LEGACY_LOAD_GEARS,
+                       chase_drop, clamp_tier, gear_for_chase_pct, gear_params,
+                       load_drop, normalize_gear, tier_for_exit_pct)
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH    = os.path.join(_HERE, 'config.json')
 POSITIONS_PATH = os.path.join(_HERE, 'data', 'positions.csv')
 
+# `gear` (1..5) and `exit_tier` (1..3) are the Gearbox V-Commandos columns.
+# The old load_gear / buy_pct / t*_pct / t*_active columns are still written
+# (derived from the gear) so older builds and scripts keep reading the file.
 FIELDNAMES = [
     'ticker', 'tier', 'is_deployed', 'shares', 'avg_cost', 'cost_basis',
+    'gear', 'exit_tier',
     'load_gear', 'buy_pct',
     't1_pct', 't2_pct', 't3_pct',
     't1_active', 't2_active', 't3_active',
@@ -52,48 +58,40 @@ _PORTFOLIO = [
 
 
 def _blank(ticker: str, tier: str) -> dict:
+    return dict(_derived(DEFAULT_GEAR, DEFAULT_EXIT_TIER),
+                ticker=ticker,
+                tier=tier,
+                is_deployed=False,
+                shares=0,
+                avg_cost=0.0,
+                cost_basis=0.0,
+                auto_mode=True,
+                last_updated=str(date.today()))
+
+
+def _derived(gear: int, exit_tier: int) -> dict:
+    """The gear + tier, plus the legacy columns they imply."""
+    tiers = gear_params(gear)['tiers']
     return {
-        'ticker':      ticker,
-        'tier':        tier,
-        'is_deployed': False,
-        'shares':      0,
-        'avg_cost':    0.0,
-        'cost_basis':  0.0,
-        'load_gear':   5,
-        'buy_pct':     5,
-        't1_pct':      4.0,
-        't2_pct':      6.0,
-        't3_pct':      8.0,
-        't1_active':   False,
-        't2_active':   True,
-        't3_active':   False,
-        'auto_mode':   True,
-        'last_updated': str(date.today()),
+        'gear':      gear,
+        'exit_tier': exit_tier,
+        'load_gear': load_drop(gear),
+        'buy_pct':   chase_drop(gear),
+        't1_pct':    float(tiers[0]),
+        't2_pct':    float(tiers[1]),
+        't3_pct':    float(tiers[2]),
+        't1_active': exit_tier == 1,
+        't2_active': exit_tier == 2,
+        't3_active': exit_tier == 3,
     }
 
 
 def _parse_row(row: dict) -> dict:
-    """Convert a CSV DictReader row (all strings) into typed position dict."""
-    # Handle legacy CSV that had buy_gear (A/B/C) and sell_gear (A-E)
-    buy_pct = 5
-    if 'buy_pct' in row and row['buy_pct']:
-        try:
-            buy_pct = int(row['buy_pct'])
-        except ValueError:
-            pass
-    elif 'buy_gear' in row:
-        buy_pct = {'A': 4, 'B': 5, 'C': 6}.get(row.get('buy_gear', 'B'), 5)
+    """Convert a CSV DictReader row (all strings) into a typed position dict.
 
-    # Legacy sell_gear → default tier pcts
-    legacy_sell = row.get('sell_gear', 'C')
-    SELL_DEFAULTS = {
-        'A': (2.0, 4.0, 6.0),
-        'B': (3.0, 5.0, 7.0),
-        'C': (4.0, 6.0, 8.0),
-        'D': (5.0, 7.0, 9.0),
-        'E': (6.0, 8.0, 10.0),
-    }
-    t1d, t2d, t3d = SELL_DEFAULTS.get(legacy_sell, (4.0, 6.0, 8.0))
+    Legacy files are migrated on read: a bait drop percent (or the older
+    'A'/'B'/'C' and 'L1'-'L7' keys) becomes a gear, and the lowest ACTIVE sell
+    tier becomes the single selected exit tier."""
 
     def f(key, default):
         v = row.get(key, '')
@@ -108,25 +106,41 @@ def _parse_row(row: dict) -> dict:
         if v in ('0', 'False', 'false'): return False
         return default
 
+    # -- Gear: explicit column wins, else migrate the legacy drop percent ----
+    # buy_pct/load_gear held a DROP PERCENT, so 4 means G1, not G4.
+    if row.get('gear'):
+        gear = normalize_gear(row['gear'])
+    elif row.get('buy_pct'):
+        gear = gear_for_chase_pct(row['buy_pct'])
+    elif row.get('load_gear'):
+        v = str(row['load_gear']).strip().upper()
+        gear = gear_for_chase_pct(LEGACY_LOAD_GEARS.get(v, v))
+    elif row.get('buy_gear'):
+        gear = gear_for_chase_pct(
+            {'A': 4, 'B': 5, 'C': 6}.get(row['buy_gear'], 5))
+    else:
+        gear = DEFAULT_GEAR
+
+    # -- Exit tier: explicit column wins, else the lowest active legacy tier -
+    if row.get('exit_tier'):
+        exit_tier = clamp_tier(row['exit_tier'])
+    else:
+        live = sorted(f(f't{i}_pct', 0.0) for i in (1, 2, 3)
+                      if b(f't{i}_active', False))
+        exit_tier = next(
+            (t for t in (tier_for_exit_pct(gear, p) for p in live if p) if t),
+            DEFAULT_EXIT_TIER)
+
     shares = int(f('shares', 0))
-    return {
-        'ticker':      row['ticker'],
-        'tier':        row['tier'],
-        'is_deployed': b('is_deployed', shares > 0),
-        'shares':      shares,
-        'avg_cost':    f('avg_cost', 0.0),
-        'cost_basis':  f('cost_basis', 0.0),
-        'load_gear':   normalize_load_pct(row.get('load_gear', 5)),
-        'buy_pct':     buy_pct,
-        't1_pct':      f('t1_pct', t1d),
-        't2_pct':      f('t2_pct', t2d),
-        't3_pct':      f('t3_pct', t3d),
-        't1_active':   b('t1_active', False),
-        't2_active':   b('t2_active', True),
-        't3_active':   b('t3_active', False),
-        'auto_mode':   b('auto_mode', True),
-        'last_updated': row.get('last_updated', ''),
-    }
+    return dict(_derived(gear, exit_tier),
+                ticker=row['ticker'],
+                tier=row.get('tier', 'Major'),
+                is_deployed=b('is_deployed', shares > 0),
+                shares=shares,
+                avg_cost=f('avg_cost', 0.0),
+                cost_basis=f('cost_basis', 0.0),
+                auto_mode=b('auto_mode', True),
+                last_updated=row.get('last_updated', ''))
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -165,6 +179,9 @@ def save_positions(positions: list) -> None:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         for pos in positions:
+            gear = normalize_gear(pos.get('gear', DEFAULT_GEAR))
+            exit_tier = clamp_tier(pos.get('exit_tier', DEFAULT_EXIT_TIER))
+            d = _derived(gear, exit_tier)
             writer.writerow({
                 'ticker':       pos['ticker'],
                 'tier':         pos['tier'],
@@ -172,14 +189,16 @@ def save_positions(positions: list) -> None:
                 'shares':       pos.get('shares', 0),
                 'avg_cost':     pos.get('avg_cost', 0.0),
                 'cost_basis':   pos.get('cost_basis', 0.0),
-                'load_gear':    pos.get('load_gear', 5),
-                'buy_pct':      pos.get('buy_pct', 5),
-                't1_pct':       pos.get('t1_pct', 4.0),
-                't2_pct':       pos.get('t2_pct', 6.0),
-                't3_pct':       pos.get('t3_pct', 8.0),
-                't1_active':    int(bool(pos.get('t1_active', False))),
-                't2_active':    int(bool(pos.get('t2_active', True))),
-                't3_active':    int(bool(pos.get('t3_active', False))),
+                'gear':         gear,
+                'exit_tier':    exit_tier,
+                'load_gear':    d['load_gear'],
+                'buy_pct':      d['buy_pct'],
+                't1_pct':       d['t1_pct'],
+                't2_pct':       d['t2_pct'],
+                't3_pct':       d['t3_pct'],
+                't1_active':    int(d['t1_active']),
+                't2_active':    int(d['t2_active']),
+                't3_active':    int(d['t3_active']),
                 'auto_mode':    int(bool(pos.get('auto_mode', True))),
                 'last_updated': today,
             })
