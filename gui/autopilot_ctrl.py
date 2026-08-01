@@ -1717,6 +1717,14 @@ class AutopilotController:
                 # Reserved for explicit one-time engine warnings. Reserve
                 # exhaustion itself is visual-only in the campaign window.
                 self._popup(ticker, act[1])
+            elif kind == 'stand_down':
+                # The position closed. A campaign is a deliberate act, so the
+                # bot does not start another one on its own: LIVE goes off and
+                # the commander arms it again when they mean to.
+                if slot['mode'] == 'LIVE':
+                    slot['mode'] = 'WATCH'
+                    self._log(ticker, f'LIVE → WATCH: {act[1]}')
+                self._alert(ticker, slot, act[1])
             elif kind == 'cancel':
                 _, oid, label = act
                 order = open_by_id.get(oid)
