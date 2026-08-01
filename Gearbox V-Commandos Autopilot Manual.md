@@ -1,13 +1,14 @@
 # Gearbox V-Commandos Autopilot Manual
 
-**Version:** 0.4.0 — *as built*
+**Version:** 0.5.0 — *as built*
 **Strategy ID:** `V_COMMANDOS_GEARBOX` — the only strategy in the app
 **Subtitle:** Fixed-Gear V-Campaign Trading System
-**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Verified offline by `scripts/test_vcommandos.py` (106 checks) and `scripts/test_autopilot_ui.py` (70). Not yet run live.
+**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Verified offline by `scripts/test_vcommandos.py` (146 checks) and `scripts/test_autopilot_ui.py` (79). Not yet run live.
 
-> **v0.4.0 changes are listed in §22.** The gear ladder is now **10/15/20/25** — G5 arms above a 25% range (§6). V is **one number, everywhere**: 100×(High5−Low5)/High5, the same figure the card, the cockpit and the candle panel all show (§17). Gear and exit tier are choosable **in the cockpit** as well as on the card (§15). A FLAT stock now publishes chase 1 as well as chase 2 — it was silently dropped (§10).
+> **v0.5.0 changes are listed in §22.** The exit is a **multi-select again** — arm one tier for a clean full-position sell, or two or three to leave in portions, with the campaign over only when the holding is zero (§7). The bot **re-prices its own resting orders** instead of stranding them, which is what the 443 engine always did (§10.1). The **vantage** now rolls from the day a campaign ended, tracks the live high, and can be pinned by clicking a day on the 5-day chart (§9). The campaign log holds **trades only** (§14).
 >
-> v0.3.0 before it: no capital cap, the army is the only wall (§8); the gear is not pinned by a live campaign (§11); the daily v^ grid removed (§3); manual Buy/Sell removed (§19).
+> v0.4.0: gear ladder 10/15/20/25 (§6); V is one number everywhere (§17.1); gear/tier choosable in the cockpit (§15.1); a FLAT stock publishes chase 1 (§10).
+> v0.3.0: no capital cap (§8); the gear is not pinned by a live campaign (§11); the daily v^ grid removed (§3); manual Buy/Sell removed (§19).
 
 ---
 
@@ -89,20 +90,15 @@ FLAT
 → FLAT
 ```
 
-### 4.2 One Clean Exit
+### 4.2 The Exit: one clean shot, or a ladder
 
-The campaign uses one selected Exit Tier and sells the entire position.
+**One armed tier is the default, and it is the cleanest campaign**: the whole position leaves at one line, the holding is zero, the campaign is unambiguously over, and the reload arms. That remains the recommended way to run it — v0.1.0 of this manual argued for it, and the argument still holds: partial exits leave residual positions, and residual positions make the average, the accounting, and "is this finished?" harder to read.
 
-No automatic 33% / 33% / 34% sequential exit is used.
+**But the choice belongs to the commander, and it is a multi-select.** Arm two tiers and the holding halves; arm three and it thirds (the split rule is §7.3). A tier that fills is spent; the ones still armed stay armed; **the campaign is over only when the broker says the holding is zero.**
 
-Reasons:
+The reason to want this is not tidiness — it is that the buy side stays live the whole time. Sell a third into a bounce, watch the price fall back, and the CHASE line is still there to buy into. That flexibility is why the three-tier ladder was in the card system for years, and it is back.
 
-- partial exits create residual positions;
-- the remaining average and profit accounting become harder to interpret;
-- campaign completion becomes ambiguous;
-- reloading and automated state transitions become more complex.
-
-**As built:** the card *displays* all three tiers of the current gear so the trade-off is visible, but exactly one is armed (marked `▶`) and it carries the whole share count. The other two are shown greyed, without a quantity.
+The trade-off, stated plainly: a laddered exit *is* the residual-position problem the single exit was designed to avoid. Both are supported because both are sometimes right; neither is hidden from you.
 
 ### 4.3 Long-Term Quality Still Matters
 
@@ -251,16 +247,45 @@ Tier 3:
     or when a higher volatility premium is deliberately required.
 ```
 
-### 7.2 One Tier Only
+### 7.2 Arming tiers
 
-The active campaign has one selected Tier.
+Any combination of the three may be armed; at least one always is (disarming the last one is refused — a campaign with no way out is not a state worth allowing).
 
 ```text
-exit_price = actual_average_cost × (1 + selected_exit_rate)
-sell_qty   = all actual shares
+one tier armed     exit_price = avg × (1 + rate)
+                   sell_qty   = every share held
+
+two or three       the holding is split across them (§7.3); each line is
+                   its own order at its own price
 ```
 
-Changing Tier during a campaign is allowed only as an explicit manual override, and the change is recorded as `EXIT_TIER_OVERRIDE` in the campaign event log.
+Changing the selection is confirmed by a dialog on the card and in the cockpit, because it decides where real money leaves. The change itself is routine — it is written to the app log, not to the campaign's trade record (§14).
+
+### 7.3 The split rule
+
+The holding divides across the ARMED tiers as evenly as possible, and any remainder goes to the **middle** tier first, then the low, then the high — so the centre is never smaller than the outsides:
+
+```text
+all three armed:   9 → 3 / 3 / 3      5 → 2 / 2 / 1      4 → 1 / 2 / 1
+                   1 → 0 / 1 / 0      (a lone share goes to the middle)
+two armed:        10 → 5 /  ·  / 5
+one armed:        11 → the whole position
+```
+
+### 7.4 What happens as tiers fill
+
+```text
+a tier fills      it is spent. The remaining shares re-split across the tiers
+                  still armed, so the ladder always describes what is held.
+all armed tiers
+spent, shares
+remain            the ladder restarts on the remainder (a partial fill, a
+                  hand trade — the lines must never describe a fiction).
+a CHASE fills     EVERY armed tier is re-armed on the new, larger holding.
+holding hits 0    only then is the campaign over.
+```
+
+The CHASE line stays live through all of it. Selling a third and then buying into a further fall is the point of arming more than one tier.
 
 ---
 
@@ -299,25 +324,44 @@ Deep gears can consume many units quickly and should not depend on capital trapp
 
 ## 9. Vantage Point and LOAD
 
-### 9.1 Standard Flat-State Vantage
+### 9.1 The Dynamic High5 vantage
 
-Default:
-
-```text
-High5 = highest completed-session high from the previous five trading days
-watch_vantage = High5
-```
-
-While flat, the bot updates the rolling High5 on every trading day. If High5 is not available yet, the previous completed close is used as the fallback and the card says so.
-
-At LOAD fill:
+The LOAD hangs under the **vantage**, and it is a live number:
 
 ```text
-campaign_vantage = the Vantage that generated the LOAD
-campaign_vantage becomes frozen
+watch_vantage = max(the previous FOUR completed-session highs,
+                    today's high so far)
 ```
 
-The campaign does not reset its Vantage each day.
+A five-session window whose fifth session is the one in progress. `today's high so far` is the session high the provider reports, stretched to the live price on every poll.
+
+**Why the live session is in the window.** A peak made this morning is a real left endpoint. Without it the bot could only enter on a pullback from a high that was already history yesterday — it would miss the whole shape of a day that runs up and then sells off. With it, the LOAD line rises the moment the peak does:
+
+```text
+vantage 100, gear 3  →  LOAD 92.00
+price runs to 110    →  vantage 110, LOAD 101.20   (immediately)
+price falls to 101.20 →  the LOAD condition is met
+```
+
+This is a trailing-drawdown entry, not a picture of a V.
+
+Two things override it:
+
+```text
+same session after
+a full EXIT        the actual final sell fill, LOAD a flat -3% under it
+                   (§9.3). Never active at the same time as the normal
+                   LOAD — one entry system at a time.
+
+pinned by hand     a day the commander clicked on the 5-day chart; its HIGH
+                   becomes the vantage until released.
+```
+
+**What the bot deliberately does NOT do:** it never tries to date the end of an old campaign. With no shares and no full sell today, it resets to FLAT and uses the Dynamic High5 window — it does not care whether the last campaign closed two days ago or five. (A campaign closed by hand while the bot was off leaves no trace it could use anyway; that is what the manual pin is for.)
+
+`last_exit_date` is recorded and displayed, but nothing in the entry logic depends on it.
+
+At LOAD fill the vantage that generated it is frozen as `campaign_vantage`. The campaign does not reset its vantage each day.
 
 ### 9.2 Standard LOAD
 
@@ -392,6 +436,23 @@ A FLAT stock has no chase armed — the LOAD is its live line — so **chase 1 i
 **Order priority:** when both lines are crossed in the same poll, the **EXIT wins** — the campaign always prefers to finish. Any resting buy of ours is cancelled first.
 
 **Price trimming:** a BUY line is floored to the tick grid (never bids above the strategy line) and a SELL line is ceiled (never asks below it). KR names snap to the KRX band tick; US names to the cent.
+
+### 10.1 Nothing rests in advance — and nothing is stranded
+
+The engine is a **watcher**: it sends no order until the price actually crosses a line. There is no order sitting at the LOAD waiting all day.
+
+When a line *is* crossed it sends one LIMIT order at that line, and that order can rest unfilled — the price ticked through it, or away from it. While it rests, it blocks its side.
+
+So on every poll the engine checks its own resting order against the line it is supposed to be at. If the price or quantity no longer matches — the gear shifted, a chase moved the average, a tier was re-armed — it **cancels its own order** and re-arms the current line on the next poll:
+
+```text
+resting order == the current line   →  leave it, it is doing its job
+resting order != the current line   →  cancel 'stale …', re-arm next poll
+partially filled                    →  never touched
+not ours                            →  never cancelled; it blocks the side
+```
+
+This is the 443 engine's `stale LOAD` / `stale SELL` rule, and it is not optional: without it a gear shift leaves an order at the old price that the new line can never get past. The commander does not have to clear the way by hand. The cockpit's **Cancel resting** button is the manual override for the same thing, and it is disabled whenever nothing rests.
 
 ---
 
@@ -548,33 +609,27 @@ campaign_start
 campaign_state
 ```
 
-### 14.2 Log Record
+### 14.2 Log Record — trades only
 
-One list holds the whole campaign, trades and decisions together, so the log
-reads as a narrative rather than two files to cross-reference:
+**The campaign log records what was bought and sold. Nothing else.**
 
 ```text
 date            market-local trading date — the log groups by day
 ts              MM/DD HH:MM
 source          BOT / EXT   (EXT = traded by hand in the broker app)
-kind            LOAD / RELOAD / CHASE / EXIT / PARTIAL   (trades)
-                ADOPT / GEAR / TIER                      (decisions)
-price, qty      signed quantity; blank on a decision row
-shares, avg     the position AFTER the row
-note            chase number, gross result, or the gear/tier change
+kind            LOAD / RELOAD / CHASE / T1 / T2 / T1/T2 / SELL / EXIT
+price, qty      signed quantity
+shares, avg     the position AFTER the trade
+note            chase number, or the gross result of a sale
 ```
 
-The cockpit renders it as `RECORDED FILLS` with a header row whenever the trading date changes, so a campaign that runs for days is read day by day.
+The cockpit renders it as `RECORDED FILLS`, with a header row whenever the trading date changes, so a campaign that runs for days is read day by day.
 
-### 14.3 Decision rows
+### 14.3 What is deliberately NOT in it
 
-```text
-ADOPT   the bot took over a position it did not open
-GEAR    G3 → G5 (chase -8% ×1.0)
-TIER    T2 → T3 (+7%)
-```
+Configuration is not a trade. Changing gear, arming a tier, adopting a position, pinning the vantage — none of it writes a row. A log where a gear fiddle sits next to a fill is a log you stop reading.
 
-A gear or tier change on a live campaign always writes a row: the reason a chase line moved is on the record even though the shift itself is routine.
+Those events go to `logs/autopilot443.log` with a timestamp, where they can be reconstructed if a campaign ever needs auditing, without diluting the record of what actually traded.
 
 ### 14.4 Completion Metrics
 
@@ -621,16 +676,15 @@ Both controls **write to the CARD**, which stays the single source of truth; the
 
 ### 15.2 What "Cancel N resting" is for
 
-The bot **never re-prices an order it has already sent.** One order per side at a time, and while it rests, that side is blocked. So:
+Nothing rests in advance — the bot sends an order only when a line is actually crossed (§10.1). What *can* rest is an order it already sent that did not fill.
 
-```text
-gear shifts while a chase rests  →  the resting order is still at the OLD
-                                    price, and the new line cannot arm
-```
+The engine now re-prices those itself, so this button is the **manual override**, not the mechanism: use it to pull a line before the market reaches it, or when something looks wrong. It touches resting (unfilled) orders only, it names the count, it lists them before acting, and it is disabled when nothing rests.
 
-Cancelling clears it, and the next poll re-arms at the current line. It is also how a line is pulled before the market reaches it.
+### 15.3 The vantage strip
 
-It touches **resting (unfilled) orders only** — a trade that has already filled cannot be cancelled, and is not what this button is about. The button names the count and is disabled when nothing rests, so it never invites a click that would do nothing.
+Shows the current vantage, where it came from (`High5`, `high since the exit`, `sell fill -3%`, `pinned by hand`) and the last exit date the bot knows about.
+
+**Click a day on the 5-day chart** to pin the vantage to that session's high — the manual override for a campaign that ended outside the bot (§9.1). `use the rolling high` releases it.
 
 The sell line reads first because it sits at the top of the chart; the next buy and **its size** read below it, then where the ladder goes after that. Both charts draw the same rows: the armed buy, the broker average, and the EXIT bold; the projected chases and the vantage soft. An unfundable buy line is drawn grey and relabelled `✕ … (no army)`.
 
@@ -787,7 +841,10 @@ Higher Gears can tolerate a lower right-side endpoint because they lower average
 | §11 free gear shift, logged | **built** |
 | §12 adopt / external buy / partial / full exit | **built** |
 | §13 state machine | **built** |
-| §14 campaign log — trades and decisions, grouped by day | **built** |
+| §7.3 the tier split, §7.4 the ladder lifecycle | **built** |
+| §9.1 rolling-from-exit vantage + manual pin | **built** |
+| §10.1 stale-order self-healing | **built** |
+| §14 campaign log — trades only, grouped by day | **built** |
 | §15 cockpit: curve, both charts, day-grouped log | **built** |
 | §17 / §17.1 one V number, on the card, the cockpit and the panel | **built** |
 | §15.1 gear + tier choosable in the cockpit | **built** |
@@ -797,6 +854,15 @@ Higher Gears can tolerate a lower right-side endpoint because they lower average
 | §15 campaign-spanning chart | **NOT built** — 5-day panel + day-grouped log instead |
 | §16 accounting views | **NOT built** |
 | Portfolio orchestrator (candidate ranking, army split) | **NOT built** |
+
+### v0.5.0 amendment log
+
+1. **The exit is a multi-select again** (§4.2, §7). One armed tier is still the clean full-position shot and the default; two or three split the holding by the old distribution law (remainder to the middle tier). A tier that fills is spent, the rest stay armed, a chase re-arms all of them, and **the campaign ends only when the holding is zero**. Changing the selection is confirmed.
+2. **The bot re-prices its own resting orders** (§10.1) — the 443 engine's `stale LOAD` / `stale SELL` rule, restored. A gear shift no longer strands an order at the old price. Partially-filled orders and other people's orders are still never touched.
+3. **The vantage is the Dynamic High5 window** of manual Appendix A.4/A.5 (§9.1): `max(previous four completed highs, today's high so far)`, recomputed live so a fresh intraday peak lifts the LOAD line at once. It can also be **pinned by clicking a day on the 5-day chart**, for a campaign that ended outside the bot. An earlier build of this rule tried to roll the window from the campaign's exit date — that was an invention, and Appendix A.2 Case 3 rules it out explicitly.
+4. **The campaign log holds trades only** (§14.2). Gear shifts, tier changes and adoptions go to the app log instead.
+5. **Cockpit**: AUTO/MANUAL toggles the mode without forcing a gear pick (the card's behaviour); tiers are a multi-select with a spent-tier marker; a vantage strip; the log is shorter and the charts are taller; day labels on the 5-day chart are guaranteed distinct and thinned rather than overlapped.
+6. **Cards are ordered by gap**, flat and deployed alike — the top of the screen is what is about to happen.
 
 ### v0.4.0 amendment log
 

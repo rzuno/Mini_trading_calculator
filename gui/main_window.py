@@ -504,11 +504,15 @@ class App:
                 stock_sort_key(row.ticker))
 
     def _reorder_cards(self):
-        """Re-sort + re-grid all cards on fresh data: deployed by gap; empty
-        by 5-day volatility (§30.8 — volatility picks the 443 battlefront)."""
+        """Re-sort + re-grid all cards on fresh data — **everything by gap**,
+        deployed and flat alike, highest first.
+
+        For a deployed card the gap is price vs the average cost, so the ones
+        closest to their exit rise. For a flat card it is price vs the vantage,
+        so the ones closest to their LOAD rise. Either way the top of the
+        screen is what is about to happen."""
         self.deployed_rows.sort(key=self._gap_order_key)
-        self.empty_rows.sort(key=lambda r: self._vol_order_key(
-            r.ticker, self._volatility.get(r.ticker)))
+        self.empty_rows.sort(key=self._gap_order_key)
         self._grid_all_cards()
 
     # ── Autopilot window (big card button) ────────────────────────────────────

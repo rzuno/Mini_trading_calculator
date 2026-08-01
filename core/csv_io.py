@@ -5,15 +5,22 @@ from datetime import date
 
 from core.calc import (DEFAULT_EXIT_TIER, DEFAULT_GEAR, LEGACY_LOAD_GEARS,
                        chase_drop, clamp_tier, gear_for_chase_pct, gear_params,
-                       load_drop, normalize_gear, tier_for_exit_pct)
+                       load_drop, normalize_gear)
+
+
+def _tier_flags(tier) -> list:
+    """A single tier number as three armed/disarmed flags."""
+    t = clamp_tier(tier)
+    return [i == t for i in (1, 2, 3)]
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH    = os.path.join(_HERE, 'config.json')
 POSITIONS_PATH = os.path.join(_HERE, 'data', 'positions.csv')
 
-# `gear` (1..5) and `exit_tier` (1..3) are the Gearbox V-Commandos columns.
-# The old load_gear / buy_pct / t*_pct / t*_active columns are still written
-# (derived from the gear) so older builds and scripts keep reading the file.
+# `gear` (1..5) picks the ladder; `t1_active`..`t3_active` are the ARMED exit
+# tiers (a multi-select — one for a clean full exit, two or three to leave in
+# portions). `exit_tier` records the lowest armed tier for older readers, and
+# load_gear / buy_pct / t*_pct stay derived from the gear for the same reason.
 FIELDNAMES = [
     'ticker', 'tier', 'is_deployed', 'shares', 'avg_cost', 'cost_basis',
     'gear', 'exit_tier',
@@ -58,7 +65,7 @@ _PORTFOLIO = [
 
 
 def _blank(ticker: str, tier: str) -> dict:
-    return dict(_derived(DEFAULT_GEAR, DEFAULT_EXIT_TIER),
+    return dict(_derived(DEFAULT_GEAR, _tier_flags(DEFAULT_EXIT_TIER)),
                 ticker=ticker,
                 tier=tier,
                 is_deployed=False,
@@ -69,20 +76,24 @@ def _blank(ticker: str, tier: str) -> dict:
                 last_updated=str(date.today()))
 
 
-def _derived(gear: int, exit_tier: int) -> dict:
-    """The gear + tier, plus the legacy columns they imply."""
-    tiers = gear_params(gear)['tiers']
+def _derived(gear: int, actives) -> dict:
+    """The gear and the armed tiers, plus the columns they imply."""
+    pcts = gear_params(gear)['tiers']
+    actives = list(actives)
+    if not any(actives):
+        actives = [i == DEFAULT_EXIT_TIER - 1 for i in range(3)]
     return {
         'gear':      gear,
-        'exit_tier': exit_tier,
+        'exit_tier': next((i + 1 for i, a in enumerate(actives) if a),
+                          DEFAULT_EXIT_TIER),
         'load_gear': load_drop(gear),
         'buy_pct':   chase_drop(gear),
-        't1_pct':    float(tiers[0]),
-        't2_pct':    float(tiers[1]),
-        't3_pct':    float(tiers[2]),
-        't1_active': exit_tier == 1,
-        't2_active': exit_tier == 2,
-        't3_active': exit_tier == 3,
+        't1_pct':    float(pcts[0]),
+        't2_pct':    float(pcts[1]),
+        't3_pct':    float(pcts[2]),
+        't1_active': actives[0],
+        't2_active': actives[1],
+        't3_active': actives[2],
     }
 
 
@@ -121,18 +132,14 @@ def _parse_row(row: dict) -> dict:
     else:
         gear = DEFAULT_GEAR
 
-    # -- Exit tier: explicit column wins, else the lowest active legacy tier -
-    if row.get('exit_tier'):
-        exit_tier = clamp_tier(row['exit_tier'])
-    else:
-        live = sorted(f(f't{i}_pct', 0.0) for i in (1, 2, 3)
-                      if b(f't{i}_active', False))
-        exit_tier = next(
-            (t for t in (tier_for_exit_pct(gear, p) for p in live if p) if t),
-            DEFAULT_EXIT_TIER)
+    # -- Armed exit tiers: the three flags are the selection. A file with no
+    # flags at all falls back to the single `exit_tier` column.
+    actives = [b(f't{i}_active', False) for i in (1, 2, 3)]
+    if not any(actives):
+        actives = _tier_flags(row.get('exit_tier') or DEFAULT_EXIT_TIER)
 
     shares = int(f('shares', 0))
-    return dict(_derived(gear, exit_tier),
+    return dict(_derived(gear, actives),
                 ticker=row['ticker'],
                 tier=row.get('tier', 'Major'),
                 is_deployed=b('is_deployed', shares > 0),
@@ -180,8 +187,11 @@ def save_positions(positions: list) -> None:
         writer.writeheader()
         for pos in positions:
             gear = normalize_gear(pos.get('gear', DEFAULT_GEAR))
-            exit_tier = clamp_tier(pos.get('exit_tier', DEFAULT_EXIT_TIER))
-            d = _derived(gear, exit_tier)
+            actives = [bool(pos.get(f't{i}_active')) for i in (1, 2, 3)]
+            if not any(actives):
+                actives = _tier_flags(pos.get('exit_tier')
+                                      or DEFAULT_EXIT_TIER)
+            d = _derived(gear, actives)
             writer.writerow({
                 'ticker':       pos['ticker'],
                 'tier':         pos['tier'],
@@ -190,7 +200,7 @@ def save_positions(positions: list) -> None:
                 'avg_cost':     pos.get('avg_cost', 0.0),
                 'cost_basis':   pos.get('cost_basis', 0.0),
                 'gear':         gear,
-                'exit_tier':    exit_tier,
+                'exit_tier':    d['exit_tier'],
                 'load_gear':    d['load_gear'],
                 'buy_pct':      d['buy_pct'],
                 't1_pct':       d['t1_pct'],

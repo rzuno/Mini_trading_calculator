@@ -1,11 +1,14 @@
 import tkinter as tk
+from tkinter import messagebox
+
 from core.calc import (
-    DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS, RELOAD_DROP_PCT, calc_chase_cascade, calc_exit_lines, calc_gap_rate,
-    calc_load_ladder, calc_reload_price, chase_drop, clamp_gear, clamp_tier,
-    display_name, effective_entry_gear, exit_pct, fmt_price, gap_color,
-    gear_button_color, gear_button_fg, gear_detail, gear_for_chase_pct,
-    gear_label, gear_menu_label, gear_params, load_drop, load_gap_color,
-    select_auto_gear, sell_pct_color, tier_for_exit_pct,
+    DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS, RELOAD_DROP_PCT,
+    calc_chase_cascade, calc_exit_lines, calc_gap_rate, calc_load_ladder,
+    calc_reload_price, chase_drop, clamp_gear, display_name,
+    effective_entry_gear, exit_pct, fmt_price, gap_color, gear_button_color,
+    gear_button_fg, gear_detail, gear_for_chase_pct, gear_label,
+    gear_menu_label, gear_params, load_drop, load_gap_color, select_auto_gear,
+    sell_pct_color, tier_pcts,
 )
 
 # Readable blue for buy-trigger values (matches the chart's chase lines)
@@ -35,23 +38,28 @@ _AP_BUTTON_TOP_GAP = 18       # one heading-line below the gear-box titles
 class StockRow:
     """One Gearbox V-Commandos campaign card (both FLAT and DEPLOYED).
 
-    ONE gearbox drives the card AND the campaign bot. A gear fixes three
-    things for the whole campaign:
+    ONE gearbox drives the card AND the campaign bot:
 
-        LOAD    vantage (High5) × (1 - gear.load%)     ≈ 1 unit of cash
+        LOAD    vantage        × (1 - gear.load%)      ≈ 1 unit of cash
         CHASE   actual avg     × (1 - gear.chase%)     shares × gear.ratio
-        EXIT    actual avg     × (1 + tier%)           the WHOLE position
+        EXIT    actual avg     × (1 + tier%)           split across the tiers
+                                                       that are armed
 
     * DEPLOYED — the buy ladder is the real chase cascade off the broker's
-      average cost (Chase 1/2/3); the exit row shows all three tiers of the
-      gear with the SELECTED one armed for the full position.
-    * FLAT — the ladder is the projected entry: Load (one unit) plus two
-      projected chases, and the exit tiers are computed as if it had filled.
+      average cost (Chase 1/2/3); the exit row is the real ladder, the holding
+      split across the armed tiers.
+    * FLAT — both are projections off the LOAD: Load / Chase 1 / Chase 2, and
+      the exits computed as if the load had filled.
+
+    **Exit tiers are a multi-select.** Arm one and the whole position leaves
+    there. Arm two or three and it leaves in portions — a tier that fills is
+    spent, the rest stay armed, and the campaign ends only when the holding is
+    actually zero. A chase re-arms every tier on the larger holding. Changing
+    the selection asks for confirmation, because it moves real money.
 
     The gear can be shifted at any time, deployed or not: only the average
-    cost is history, and both lines are recomputed from it on the spot. AUTO
-    tracks the 5-day range; MANUAL holds whatever the commander picked. A
-    shift on a live campaign is written to the campaign log.
+    cost is history, and every line is recomputed from it on the spot. AUTO
+    tracks the 5-day range V; MANUAL holds whatever the commander picked.
 
     The parent grids ``self.frame``; the row does not place itself.
     """
@@ -89,7 +97,10 @@ class StockRow:
         self.avg_cost_var = tk.StringVar(value=self._fmt_init(pos.get('avg_cost', 0)))
 
         self.gear_var = tk.IntVar(value=self._initial_gear(pos))
-        self.tier_var = tk.IntVar(value=self._initial_tier(pos, self.gear_var.get()))
+        # One BooleanVar per exit tier: arm one for a clean full-position exit,
+        # or two/three to leave in portions (the split lives in calc.py).
+        self.tier_vars = [tk.BooleanVar(value=v)
+                          for v in self._initial_tiers(pos)]
         self.auto_var = tk.BooleanVar(value=bool(pos.get('auto_mode', True)))
 
         # -- Output variables --------------------------------------------------
@@ -111,7 +122,8 @@ class StockRow:
         self.shares_var.trace_add('write', lambda *_: self._on_input_change())
         self.avg_cost_var.trace_add('write', lambda *_: self._on_input_change())
         self.gear_var.trace_add('write', lambda *_: self._on_input_change())
-        self.tier_var.trace_add('write', lambda *_: self._on_input_change())
+        for v in self.tier_vars:
+            v.trace_add('write', lambda *_: self._on_input_change())
         self.auto_var.trace_add('write', lambda *_: self._on_input_change())
 
         # Initial styling pass (rows are computed on the first price fetch).
@@ -130,18 +142,16 @@ class StockRow:
         return gear_for_chase_pct(legacy) if legacy else DEFAULT_GEAR
 
     @staticmethod
-    def _initial_tier(pos, gear):
-        if pos.get('exit_tier'):
-            return clamp_tier(pos['exit_tier'])
-        # Legacy files stored three tier percents plus on/off flags: the
-        # lowest ACTIVE one becomes the selected tier.
-        live = [pos.get(f't{i}_pct') for i in EXIT_TIERS
-                if pos.get(f't{i}_active')]
-        for pct in sorted(p for p in live if p):
-            t = tier_for_exit_pct(gear, pct)
-            if t:
-                return t
-        return DEFAULT_EXIT_TIER
+    def _initial_tiers(pos):
+        """Three on/off flags. `t1_active`..`t3_active` have carried them
+        since the first CSV; `exit_tier` (the single-tier era) is read as a
+        one-tier selection when the flags are absent."""
+        if any(f't{i}_active' in pos for i in EXIT_TIERS):
+            flags = [bool(pos.get(f't{i}_active')) for i in EXIT_TIERS]
+            if any(flags):
+                return flags
+        t = pos.get('exit_tier') or DEFAULT_EXIT_TIER
+        return [i == int(t) for i in EXIT_TIERS]
 
     # ── Build: title row ──────────────────────────────────────────────────────
 
@@ -299,9 +309,10 @@ class StockRow:
         self._gear_title['exit'].grid(row=0, column=0, columnspan=2, sticky='w')
         self._tier_btns = {}
         for disp, t in enumerate(reversed(EXIT_TIERS)):    # T3 on top
-            btn = tk.Radiobutton(
-                exit_box, variable=self.tier_var, value=t, indicatoron=False,
-                width=8, font=_F_SM, bd=1, takefocus=0)
+            btn = tk.Checkbutton(
+                exit_box, variable=self.tier_vars[t - 1], indicatoron=False,
+                width=8, font=_F_SM_B, bd=1, takefocus=0,
+                command=lambda t=t: self._on_tier_click(t))
             btn.grid(row=disp + 1, column=0, sticky='w', pady=1)
             self._tier_btns[t] = btn
 
@@ -338,11 +349,49 @@ class StockRow:
         except (tk.TclError, ValueError):
             return 3
 
-    def _get_tier(self) -> int:
+    def _get_tiers(self) -> list:
+        """The armed exit tiers as three booleans; never all-off."""
         try:
-            return clamp_tier(self.tier_var.get())
+            flags = [bool(v.get()) for v in self.tier_vars]
         except (tk.TclError, ValueError):
-            return DEFAULT_EXIT_TIER
+            flags = []
+        if not any(flags):
+            flags = [i == DEFAULT_EXIT_TIER for i in EXIT_TIERS]
+        return flags
+
+    def _on_tier_click(self, tier):
+        """Arming or disarming a tier changes where real money leaves, so it
+        is confirmed. Turning the last one off is refused — a campaign with no
+        way out is not a state worth allowing."""
+        flags = [bool(v.get()) for v in self.tier_vars]
+        if not any(flags):
+            self.tier_vars[tier - 1].set(True)
+            messagebox.showinfo(
+                'Exit tiers',
+                'At least one exit tier stays armed — otherwise the campaign '
+                'has no way out.', parent=self.frame)
+            return
+        gear = self._get_gear()
+        armed = [i for i in EXIT_TIERS if flags[i - 1]]
+        pcts = tier_pcts(gear)
+        if len(armed) == 1:
+            plan = (f'the WHOLE position leaves at T{armed[0]} '
+                    f'+{pcts[armed[0] - 1]}%')
+        else:
+            share = {2: 'half', 3: 'a third'}[len(armed)]
+            lines = ', '.join(f'T{i} +{pcts[i - 1]}%' for i in armed)
+            plan = (f'about {share} of the holding leaves at each of {lines}.'
+                    '\n\nA tier that fills is spent; the rest stay armed, and '
+                    'the campaign is over only when the holding is zero. A '
+                    'chase re-arms every tier on the bigger holding.')
+        if messagebox.askyesno('Exit tiers', f'Arm {self._tier_text()}?\n\n'
+                                             f'{plan}', parent=self.frame):
+            return
+        self.tier_vars[tier - 1].set(not flags[tier - 1])   # rolled back
+
+    def _tier_text(self) -> str:
+        on = [f'T{i}' for i in EXIT_TIERS if self._get_tiers()[i - 1]]
+        return '+'.join(on) if on else '—'
 
     def _set_gear(self, gear: int):
         gear = clamp_gear(gear)
@@ -408,9 +457,7 @@ class StockRow:
         g = gear_params(gear)
         self._gear_title['gear'].config(
             text=f"Gear ({gear_label(gear)} {g['name']})")
-        self._gear_title['exit'].config(
-            text=f"Exit (T{self._get_tier()} "
-                 f"+{exit_pct(gear, self._get_tier())}%)")
+        self._gear_title['exit'].config(text=f"Exit ({self._tier_text()})")
         self.gear_txt_var.set(gear_detail(gear))
 
     # ── Gear styling (enabled + state muting) ─────────────────────────────────
@@ -465,10 +512,10 @@ class StockRow:
 
     def _style_tier_buttons(self):
         gear = self._get_gear()
-        sel = self._get_tier()
+        armed = self._get_tiers()
         for t, btn in self._tier_btns.items():
             pct = exit_pct(gear, t)
-            if t == sel:
+            if armed[t - 1]:
                 bg = sell_pct_color(float(pct))
                 fg = 'white' if pct >= 7 else 'black'
             else:
@@ -514,7 +561,7 @@ class StockRow:
 
         ccy  = self.currency
         gear = self._get_gear()
-        tier = self._get_tier()
+        armed = self._get_tiers()
 
         try:
             shares = int(self.shares_var.get().replace(',', '') or 0)
@@ -531,7 +578,7 @@ class StockRow:
             if shares > 0 and avg_cost > 0:
                 self.cost_var.set(fmt_price(shares * avg_cost, ccy))
                 buy_lines  = calc_chase_cascade(shares, avg_cost, gear, 3)
-                exit_lines = calc_exit_lines(shares, avg_cost, gear)
+                exit_lines = calc_exit_lines(shares, avg_cost, gear, armed)
             else:
                 self.cost_var.set('--')
                 buy_lines  = [{'price': None, 'qty': None} for _ in range(3)]
@@ -554,7 +601,8 @@ class StockRow:
                     buy_lines, load_price, load_shares = calc_load_ladder(
                         self.vantage, gear, self.get_unit_cash(), chases=2)
                 anchor_price = load_price if load_price > 0 else None
-                exit_lines = calc_exit_lines(load_shares, load_price, gear)
+                exit_lines = calc_exit_lines(load_shares, load_price, gear,
+                                             armed)
                 tag = ' (reload)' if reload_mode else ''
                 self.cost_var.set(fmt_price(self.vantage, ccy) + tag)
             else:
@@ -613,25 +661,27 @@ class StockRow:
                 self.buy_info_var[i].set('--')
                 self.buy_info_lbl[i].config(fg='#CCC')
 
+            # An armed tier shows its price AND the shares it would take.
+            # A disarmed one still shows its price, faded but the same size —
+            # it is a real number the commander compares against.
             s = exit_lines[i]
-            armed = (i + 1) == tier
+            on = armed[i]
             self.t_head_lbl[i].config(
-                text=f'▶ T{i+1}:' if armed else f'T{i+1}:',
-                fg='#000' if armed else '#BBB',
-                font=_F_SM_B if armed else _F_SM)
+                text=f'▶ T{i+1}:' if on else f'T{i+1}:',
+                fg='#000' if on else _MUTE_FG,
+                font=_F_SM_B if on else _F_SM)
             if s['price'] is not None:
-                qty = s['qty'] if armed else ''
                 self.t_info_var[i].set(
-                    f"{fmt_price(s['price'], ccy)} × {qty}" if armed
-                    else fmt_price(s['price'], ccy))
-                hit = (armed and self.deployed and cur is not None
+                    f"{fmt_price(s['price'], ccy)} × {s['qty']}")
+                hit = (self.deployed and cur is not None
                        and cur >= s['price'])
-                self.t_info_lbl[i].config(
-                    fg=(_SELL_FG if hit else ('black' if armed else '#AAA')),
-                    font=_F_OUT if armed else _F_SM)
+                self.t_info_lbl[i].config(fg=(_SELL_FG if hit else 'black'),
+                                          font=_F_OUT)
             else:
-                self.t_info_var[i].set('--')
-                self.t_info_lbl[i].config(fg='#CCC', font=_F_SM)
+                ref = calc_exit_lines(1, anchor_price or 0, gear)[i]
+                self.t_info_var[i].set(
+                    fmt_price(ref['price'], ccy) if ref['price'] else '--')
+                self.t_info_lbl[i].config(fg=_MUTE_FG, font=_F_VAL)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -658,7 +708,7 @@ class StockRow:
         """The campaign parameters the bot must follow — exactly what this card
         shows right now. One gearbox, one source. `auto` rides along so the
         cockpit's controls can mirror the card's AUTO/MANUAL state."""
-        return {'gear': self._get_gear(), 'exit_tier': self._get_tier(),
+        return {'gear': self._get_gear(), 'exit_tiers': self._get_tiers(),
                 'auto': self.auto_var.get()}
 
     def current_shares(self) -> int:
@@ -693,8 +743,8 @@ class StockRow:
         except ValueError:
             avg_cost = 0.0
         gear = self._get_gear()
-        tier = self._get_tier()
-        tiers = gear_params(gear)['tiers']
+        armed = self._get_tiers()
+        pcts = tier_pcts(gear)
         return {
             'ticker':     self.ticker,
             'tier':       self.tier,
@@ -703,15 +753,17 @@ class StockRow:
             'avg_cost':   avg_cost,
             'cost_basis': shares * avg_cost,
             'gear':       gear,
-            'exit_tier':  tier,
-            # Legacy columns kept readable by older builds / scripts.
+            # The lowest armed tier is what the single-tier `exit_tier` column
+            # can express; the three flags carry the real selection.
+            'exit_tier':  next((i for i in EXIT_TIERS if armed[i - 1]),
+                               DEFAULT_EXIT_TIER),
             'load_gear':  load_drop(gear),
             'buy_pct':    chase_drop(gear),
-            't1_pct':     tiers[0],
-            't2_pct':     tiers[1],
-            't3_pct':     tiers[2],
-            't1_active':  tier == 1,
-            't2_active':  tier == 2,
-            't3_active':  tier == 3,
+            't1_pct':     pcts[0],
+            't2_pct':     pcts[1],
+            't3_pct':     pcts[2],
+            't1_active':  armed[0],
+            't2_active':  armed[1],
+            't3_active':  armed[2],
             'auto_mode':  self.auto_var.get(),
         }

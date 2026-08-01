@@ -22,10 +22,12 @@ import tkinter as tk
 
 from core.calc import calc_volatility, fmt_price, select_auto_gear
 from gui.campaign_window import (CampaignWindow, buy_lines, campaign_age_line,
-                                 campaign_line, fill_log_rows, next_line)
+                                 campaign_line, fill_log_rows, next_line,
+                                 sell_lines)
 from gui.autopilot_ctrl import AutopilotController, merge_live_bar
-from gui.candle_chart import (bar_range_v, bounded_label_layout,
-                              candle_color, required_label_pad)
+from gui.candle_chart import (bar_day_labels, bar_range_v,
+                              bounded_label_layout, candle_color,
+                              required_label_pad)
 from gui.stock_row import _AP_BUTTON_TOP_GAP
 
 passed = 0
@@ -55,8 +57,10 @@ def deployed_ui(**over):
                      'campaign_id': 'NVDA-20260801-090000',
                      'campaign_start': '2026-08-01 09:00', 'chase_count': 1,
                      'campaign_low': 86.0, 'max_qty': 31, 'max_cost': 2852.0,
-                     'manually_modified': False, 'exit_price': 96.6,
-                     'gross_target': 142.6},
+                     'manually_modified': False, 'gross_target': 142.6,
+                     'exit_tiers': [True, True, True],
+                     'tier_done': [True, False, False],
+                     'tier_pcts': (3, 5, 7), 'tier_text': 'T1+T2+T3'},
         'lines': {
             'chase':  {'price': 86.48, 'qty': 23, 'kind': 'chase',
                        'label': 'CHASE -6% ×3/4', 'armed': True},
@@ -64,8 +68,10 @@ def deployed_ui(**over):
                        'label': 'chase 2', 'armed': False},
             'chase3': {'price': 82.09, 'qty': 71, 'kind': 'chase3',
                        'label': 'chase 3', 'armed': False},
-            'exit':   {'price': 96.60, 'qty': 31, 'kind': 'exit',
-                       'label': 'EXIT T2 +5%', 'armed': True},
+            'exit2':  {'price': 96.60, 'qty': 16, 'kind': 'exit2',
+                       'tier': 1, 'label': 'EXIT T2 +5%', 'armed': True},
+            'exit3':  {'price': 98.44, 'qty': 15, 'kind': 'exit3',
+                       'tier': 2, 'label': 'EXIT T3 +7%', 'armed': True},
         },
         'crossed': {'BUY': None, 'SELL': None},
         'events': [
@@ -96,7 +102,10 @@ def flat_ui(**over):
                      'vantage_src': 'high5', 'campaign_id': None,
                      'campaign_start': None, 'chase_count': 0,
                      'campaign_low': None, 'max_cost': 0.0,
-                     'manually_modified': False, 'gross_target': None},
+                     'manually_modified': False, 'gross_target': None,
+                     'exit_tiers': [False, True, False],
+                     'tier_done': [False, False, False],
+                     'tier_pcts': (3, 5, 7), 'tier_text': 'T2'},
         'lines': {
             'load':   {'price': 92.0, 'qty': 11, 'kind': 'load',
                        'label': 'LOAD -8%', 'armed': True},
@@ -104,8 +113,9 @@ def flat_ui(**over):
                        'label': 'chase 1', 'armed': False},
             'chase2': {'price': 84.26, 'qty': 14, 'kind': 'chase2',
                        'label': 'chase 2', 'armed': False},
-            'pexit':  {'price': 96.60, 'qty': 11, 'kind': 'pexit',
-                       'label': 'exit if loaded T2 +5%', 'armed': False},
+            'pexit2': {'price': 96.60, 'qty': 11, 'kind': 'pexit2',
+                       'tier': 1, 'label': 'exit if loaded T2 +5%',
+                       'armed': False},
         },
         'crossed': {'BUY': None, 'SELL': None}, 'events': [],
         'price': 95.0, 'shares': 0, 'avg_cost': 0.0,
@@ -120,9 +130,12 @@ print('— campaign banner —')
 line = campaign_line(deployed_ui(), 'USD')
 ok('G3 Balanced' in line and 'LOAD -8%' in line and 'CHASE -6% ×3/4' in line,
    'the banner names the whole gear in one line', line)
-ok('EXIT T2 +5% (full)' in line,
-   'the banner says the exit is a FULL-position sell')
-ok('vantage 100.00 (High5)' in line, 'the vantage and its source are shown')
+ok('EXIT T1 +3% / T2 +5% / T3 +7% (split)' in line,
+   'the banner names every armed tier and says the exit is split', line)
+ok('(full)' in campaign_line(flat_ui(), 'USD'),
+   'and says (full) when only one tier is armed')
+ok('vantage 100.00 (Dynamic High5)' in line,
+   'the vantage and its source are shown', line)
 ok('cap' not in line, 'no capital cap is advertised — the army is the wall')
 ok(campaign_line({}, 'USD') == 'arming…', 'an empty ui reads as arming')
 
@@ -134,8 +147,14 @@ ok(campaign_age_line(flat_ui(), 'USD') == '',
 
 print('— the next lines, and the ones after —')
 nxt = next_line(deployed_ui(), 'USD')
-ok(nxt.index('▲ EXIT 96.60 × 31') < nxt.index('▼ CHASE'),
-   'the EXIT is named first (top of the chart), then the next buy', nxt)
+ok(nxt.index('▲ EXIT') < nxt.index('▼ CHASE'),
+   'the exits are named first (top of the chart), then the next buy', nxt)
+ok('T2 96.60 × 16  ·  T3 98.44 × 15' in nxt,
+   'every armed tier is listed with its own price and portion', nxt)
+ok([e['kind'] for e in sell_lines(deployed_ui())] == ['exit2', 'exit3'],
+   'the exit ladder comes back low tier first')
+ok([e['kind'] for e in sell_lines(flat_ui())] == ['pexit2'],
+   'a flat card falls back to the projected exits')
 ok('▼ CHASE -6% ×3/4 86.48 × 23' in nxt,
    'the armed buy carries its price AND its size', nxt)
 ok('then 84.26 × 41  ·  82.09 × 71' in nxt,
@@ -144,7 +163,8 @@ ok('[NO ARMY]' in next_line(deployed_ui(buy_state='EXHAUSTED'), 'USD'),
    'an unfundable buy line is flagged in the next-line row')
 
 fnxt = next_line(flat_ui(), 'USD')
-ok('▲ exit if loaded 96.60 × 11' in fnxt and '▼ LOAD -8% 92.00 × 11' in fnxt,
+ok('▲ exit if loaded T2 96.60 × 11' in fnxt
+   and '▼ LOAD -8% 92.00 × 11' in fnxt,
    'a flat card shows the LOAD and marks its exit as projected', fnxt)
 ok('then 86.48 × 8  ·  84.26 × 14' in fnxt,
    'a FLAT stock shows chase 1 as well as chase 2 — chase 1 is a projection '
@@ -187,17 +207,19 @@ window = CampaignWindow.__new__(CampaignWindow)
 window.ccy = 'USD'
 rows = window._line_rows(deployed_ui())
 by_text = {r[2]: r for r in rows}
-ok(len(rows) == 6,
-   '3 buys + avg + exit + vantage each get a row', str(list(by_text)))
+ok(len(rows) == 7,
+   '3 buys + avg + 2 exits + vantage each get a row', str(list(by_text)))
 bold = [r for r in rows if r[3]]
-ok(len(bold) == 3,
-   'only the armed buy, the average and the exit are bold',
+ok(len(bold) == 4,
+   'the armed buy, the average and both armed exits are bold',
    str([r[2] for r in bold]))
 ok(any(t.startswith('CHASE -6% ×3/4 86.48 × 23') for t in by_text),
    'the armed chase row carries its size')
 ok(any('chase 2 84.26 × 41' in t for t in by_text),
    'the projected chase rows are drawn too')
-ok(any(t.startswith('EXIT T2 +5%') for t in by_text), 'the exit row is drawn')
+ok(any(t.startswith('EXIT T2 +5%') for t in by_text)
+   and any(t.startswith('EXIT T3 +7%') for t in by_text),
+   'every armed exit tier gets its own chart row')
 ok(any(t.startswith('avg 92.00') for t in by_text), 'the average is drawn')
 
 muted = window._line_rows(deployed_ui(buy_state='EXHAUSTED'))
@@ -260,18 +282,38 @@ ok(merge_live_bar([], 107.0, '2026-07-19') == [], 'empty bars stay empty')
 
 print('— cockpit gearbox strip —')
 picked = []
-_gearbox_ap = {
+window.ap = {
     'set_gear': lambda g: picked.append(('gear', g)),
-    'set_tier': lambda t: picked.append(('tier', t)),
-    'set_auto': lambda: picked.append(('auto', True)),
+    'set_tiers': lambda t: picked.append(('tiers', list(t))),
+    'set_auto': lambda a: picked.append(('auto', a)),
 }
-window.ap = _gearbox_ap
+window.ui = deployed_ui()
 window._on_gear(5)
-window._on_tier(3)
 window._on_auto()
-ok(picked == [('gear', 5), ('tier', 3), ('auto', True)],
-   'the cockpit gear/tier/AUTO buttons call straight through to the card',
-   str(picked))
+ok(picked == [('gear', 5), ('auto', False)],
+   'the gear button writes through, and AUTO toggles the MODE without '
+   'needing a gear pick — the asymmetry with the card is gone', str(picked))
+picked.clear()
+window.ui = deployed_ui(card_auto=False)
+window._on_auto()
+ok(picked == [('auto', True)], 'and toggles back the other way')
+
+print('— day labels are distinct —')
+same = [{'date': '07/28', 'ts': '2026-07-28T00:00:00'},
+        {'date': '07/28', 'ts': '2026-07-29T00:00:00'},
+        {'date': '07/30', 'ts': '2026-07-30T00:00:00'}]
+labs = bar_day_labels(same)
+ok(len(set(labs)) == 3,
+   'duplicate MM/DD labels fall back to the full date, so no two candles '
+   'carry the same name', str(labs))
+ok(bar_day_labels([{'date': '07/28', 'ts': '2026-07-28T00:00:00'},
+                   {'date': '07/29', 'ts': '2026-07-29T00:00:00'}])
+   == ['07/28', '07/29'],
+   'and stay short when they are already unique')
+dup = [{'date': 'x', 'ts': ''}, {'date': 'x', 'ts': ''}]
+ok(len(set(bar_day_labels(dup))) == 2,
+   'even nameless bars are numbered apart', str(bar_day_labels(dup)))
+ok(bar_day_labels([]) == [], 'no bars, no labels')
 
 print('— card spacing —')
 ok(_AP_BUTTON_TOP_GAP == 18, 'Autopilot card button has one line of top gap')
@@ -288,17 +330,19 @@ class _StubRow:
     def __init__(self, ticker, gear=3, tier=2):
         self.ticker = ticker
         self.gear_var = tk.IntVar(value=gear)
-        self.tier_var = tk.IntVar(value=tier)
+        self.tier_vars = [tk.BooleanVar(value=(i == tier))
+                          for i in (1, 2, 3)]
         self.auto_var = tk.BooleanVar(value=True)
         self.badges = []
         self.live_price = None
 
     gear = property(lambda self: self.gear_var.get())
-    tier = property(lambda self: self.tier_var.get())
+    tiers = property(lambda self: [v.get() for v in self.tier_vars])
     auto = property(lambda self: self.auto_var.get())
 
     def line_config(self):
-        return {'gear': self.gear_var.get(), 'exit_tier': self.tier_var.get(),
+        return {'gear': self.gear_var.get(),
+                'exit_tiers': [v.get() for v in self.tier_vars],
                 'auto': self.auto_var.get()}
 
     def set_autopilot(self, key):
@@ -371,7 +415,8 @@ ctrl._store = {}
 ctrl._save_state = lambda *a: True     # never touch data/
 
 ok(ctrl.watch('NVDA')[0], 'watching arms the campaign engine')
-ok(ctrl._slots['NVDA']['card'] == {'gear': 3, 'exit_tier': 2,
+ok(ctrl._slots['NVDA']['card'] == {'gear': 3,
+                                   'exit_tiers': [False, True, False],
                                    'auto': True},
    "watching pulls the card's gear config immediately")
 
@@ -382,13 +427,13 @@ ui = ctrl.ui_state('NVDA')
 ok(ui is not None and ui.get('status'), 'one poll produces a ui payload')
 ok(ui['state'] == 'DEPLOYED' and ui['shares'] == 31,
    'the poll reconciled the broker position', str(ui['state']))
-ok(ui['lines'].get('chase') and ui['lines'].get('exit'),
+ok(ui['lines'].get('chase') and ui['lines'].get('exit2'),
    'the ui carries both watched lines', str(list(ui['lines'])))
-ok(near(ui['lines']['exit']['price'], 96.6, 0.011),
+ok(near(ui['lines']['exit2']['price'], 96.6, 0.011),
    'the EXIT line is the broker average +5%',
-   str(ui['lines']['exit']['price']))
-ok(ui['lines']['exit']['qty'] == 31,
-   'the EXIT covers the whole position')
+   str(ui['lines']['exit2']['price']))
+ok(ui['lines']['exit2']['qty'] == 31,
+   'one armed tier covers the whole position')
 ok(ui['campaign'] and ui['campaign']['gear'] == 3,
    'the campaign summary rides along')
 ok('anchor' not in ui and 'grid' not in ui,
@@ -417,9 +462,11 @@ _root.update()
 ok(_card.gear == 5 and _card.auto is False,
    'picking a gear in the cockpit writes to the card and drops AUTO',
    f'gear={_card.gear} auto={_card.auto}')
-ctrl.set_card_gear('NVDA', tier=3)
+ctrl.set_card_gear('NVDA', tiers=[True, False, True])
 _root.update()
-ok(_card.tier == 3, 'picking a tier in the cockpit writes to the card')
+ok(_card.tiers == [True, False, True],
+   'arming two tiers in the cockpit writes both flags to the card',
+   str(_card.tiers))
 ctrl.set_card_gear('NVDA', auto=True)
 _root.update()
 ok(_card.auto is True, 'AUTO hands the gear back to volatility')
@@ -427,9 +474,10 @@ ok(_card.auto is True, 'AUTO hands the gear back to volatility')
 ctrl._cycle('NVDA', slot)
 _root.update()
 ui = ctrl.ui_state('NVDA')
-ok(ui['campaign']['gear'] == 5 and ui['campaign']['exit_tier'] == 3,
+ok(ui['campaign']['gear'] == 5
+   and ui['campaign']['exit_tiers'] == [True, False, True],
    'and the engine picks the change up on the very next poll',
-   str((ui['campaign']['gear'], ui['campaign']['exit_tier'])))
+   str((ui['campaign']['gear'], ui['campaign']['exit_tiers'])))
 ok(near(ui['vol5'], calc_volatility(104.0, 86.0), 0.01),
    "the payload carries the strategy's V, from the 5-day high and low",
    str(ui['vol5']))

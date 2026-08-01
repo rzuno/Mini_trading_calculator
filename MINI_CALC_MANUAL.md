@@ -1,5 +1,5 @@
 # AI Seesaw Mini-Calculator
-## Project Manual v0.6
+## Project Manual v0.7
 
 **Sister project of:** AI Seesaw Trading (main program)
 **Goal:** Single-window, reactive calculator, bookkeeper, and autopilot cockpit for an AI-sector portfolio.
@@ -138,11 +138,11 @@ The card writes `▲heavy` next to the gear when this, not volatility, chose it.
 ## 4. LOAD (FLAT stocks)
 
 ```
-vantage     = High5 — the highest completed-session high of the previous
-              5 trading days (previous close is the fallback)
 load_price  = vantage × (1 − gear.load%)
 load_shares = max(1, round_half_up(unit_cash / load_price))
 ```
+
+**The vantage** is the **Dynamic High5** window: `max(the previous four completed-session highs, today's high so far)`. The live session is inside the window, so a peak made this morning lifts the LOAD line the moment it happens. After a full exit the same session, it is instead the actual sell fill with the LOAD a flat −3% under it. A day can also be **pinned by hand** — click it on the cockpit's 5-day chart — for a campaign that ended outside the bot.
 
 **Every stock loads one full unit of cash.** If a single share already costs more than a unit, the minimum of 1 share applies. The quantity is sized off the *trimmed* (actually orderable) price, so the card number is the order number.
 
@@ -167,18 +167,28 @@ The card shows three chase lines. They **cascade**: each level's shares are fold
 
 ---
 
-## 6. EXIT (one clean full-position sell)
+## 6. EXIT (one tier, or a ladder)
+
+The three tiers are a **multi-select**. Click them on the card or in the cockpit; the change is confirmed before it takes effect.
 
 ```
-exit_price = actual_avg_cost × (1 + tier%)
-exit_qty   = ALL shares
+one armed     exit_price = avg × (1 + tier%)      qty = ALL shares
+two armed     the holding halves across them
+three armed   the holding thirds across them
 ```
 
-The card shows all three tiers of the current gear so the trade-off is visible, but exactly **one is armed** (marked `▶`) and it carries the whole position. The other two are greyed and show no quantity.
+The split gives any remainder to the **middle** tier first, then the low, then the high — so the centre is never smaller than the outsides (9 → 3/3/3, 5 → 2/2/1, 4 → 1/2/1, 1 → 0/1/0).
 
-There is no 33/33/34 split. Partial exits leave residual positions, make the remaining average hard to read, and make "is this campaign finished?" ambiguous. One tier, one sell, campaign over.
+**One armed tier is the cleanest campaign** and stays the default: everything leaves at one line, the holding is zero, the campaign is unambiguously finished. But a ladder is supported because the buy side stays live throughout — sell a third into a bounce, watch it fall back, and the CHASE line is still there to buy into.
 
-Switching tier mid-campaign is allowed and logged as `EXIT_TIER_OVERRIDE`.
+As tiers fill:
+
+- a filled tier is **spent**; the remaining shares re-split across the tiers still armed
+- if every armed tier is spent but shares remain, the ladder **restarts** on the remainder
+- a **CHASE re-arms every tier** on the new, larger holding
+- **the campaign is over only when the holding is zero**
+
+Every tier shows its price whether armed or not — a disarmed one is faded, not shrunk, because it is a real number you compare against. An armed tier additionally shows the shares it would take, and is marked `▶`.
 
 ---
 
@@ -196,7 +206,7 @@ There are no manual Buy/Sell buttons: the reason to run a bot is that the offer 
 
 The cockpit also carries a **gearbox strip** — AUTO, G1–G5, T1/T2/T3 — so the gear and the exit tier can be changed where the campaign is being watched. It writes to the card, which stays the source of truth, and the engine picks it up on the next poll.
 
-**Cancel N resting** is the one order-level control. The bot never re-prices an order it has already sent, and a resting order blocks its side — so after a gear shift the old order has to go before the new line can arm. It cancels unfilled orders only, names the count, and is disabled when nothing rests.
+Nothing rests in advance — an order goes out only when a line is actually crossed. An order that then rests unfilled is **re-priced by the bot itself** every poll, so a gear shift never strands one. **Cancel N resting** is the manual override for that: unfilled orders only, count named, disabled when nothing rests.
 
 The daily v^ grid was removed on 2026-08-01 so this bot could be stabilised alone; its specification and a restore recipe are in [`Daily v^ Grid Autopilot Manual.md`](Daily%20v^%20Grid%20Autopilot%20Manual.md).
 
@@ -255,8 +265,7 @@ This is a manual tracker: you can always trade off-schedule when a position dema
 
 ## 8. Ordering of Cards
 
-- **DEPLOYED — by gap, highest first.** A campaign closest to its exit floats to the top.
-- **FLAT — by 5-day range, widest first.** The most volatile candidate — the next likely battlefield — floats to the top. Stocks whose range is not yet known fall back to the catalogue order.
+**Everything by gap, highest first** — deployed and flat alike. For a deployed card the gap is price vs the average cost, so campaigns closest to their exit rise; for a flat card it is price vs the vantage, so candidates closest to their LOAD rise. Either way the top of the screen is what is about to happen.
 
 Both orderings re-grid live after each price fetch (no full rebuild), so cards re-sort without disturbing fields you are editing.
 
@@ -283,7 +292,8 @@ Both orderings re-grid live after each price fetch (no full rebuild), so cards r
 
 - **Live tick curve** with the campaign's own lines — the armed LOAD/CHASE and the broker average and the full EXIT drawn bold, the next two projected chases and the vantage drawn soft. An unfundable buy line goes grey, relabelled `✕ … (no army)`.
 - **5-day candle panel** beside it, carrying the same lines.
-- **Banner** naming the gear, the campaign, the position, and then `▲ EXIT …` over `▼ next buy … then …`. A DEPLOYED campaign projects chases 2 and 3 beyond its armed chase; a FLAT one projects chases 1 and 2 beyond its armed LOAD — the same ladder its card prints.
+- **Banner** naming the gear, the campaign, the position, and then `▲ EXIT …` (every armed tier with its own price and portion) over `▼ next buy … then …`. A DEPLOYED campaign projects chases 2 and 3 beyond its armed chase; a FLAT one projects chases 1 and 2 beyond its armed LOAD — the same ladder its card prints.
+- **Gearbox strip** — AUTO/MANUAL, G1–G5, the three tiers, V, and the vantage with its source. Clicking a day on the candle panel pins the vantage to that session's high.
 - **RECORDED FILLS** at the bottom: one row per trade with the resulting position and average, plus `ADOPT` / `GEAR` / `TIER` decision rows, grouped under a header per trading day.
 
 ---
@@ -345,9 +355,9 @@ Mini_trading_calculator/
 │   ├── stepper.py              — +/- stepper widget
 │   └── candle_chart.py         — the candle panel
 └── scripts/
-    ├── test_vcommandos.py      — gearbox calculator + campaign engine (106)
+    ├── test_vcommandos.py      — gearbox calculator + campaign engine (146)
     └── test_autopilot_ui.py    — cockpit presentation + a real controller
-                                  poll cycle (70)
+                                  poll cycle (79)
 ```
 
 ---
@@ -364,6 +374,8 @@ Mini_trading_calculator/
 | 0.5 | 2026-08-01 | **No capital cap** — the army is the only wall on a chase. The gear is no longer pinned by a live campaign: AUTO tracks volatility throughout, and a shift is logged rather than blocked. The daily v^ grid was removed (recoverable from `e148da6`) so the campaign bot could be stabilised alone — one button per card. Manual Buy/Sell removed: the bot sends the order when the curve touches the line. Cockpit rebuilt around the price curve, showing the EXIT, the next buy with its size, and the two chases after it; the `RECORDED FILLS` log returned, grouped by trading day. Fixed the v0.4 defect where a leftover grid-only field made every poll throw before anything reached the screen. |
 
 | 0.6 | 2026-08-01 | Gear ladder **10/15/20/25** (G5 above 25%). **V unified**: one figure — 100×(High5−Low5)/High5 — on the card, in the cockpit and on the candle panel; the panel's grid-era per-day average and `/3` hint removed. A FLAT stock now publishes **chase 1** as well as chase 2 (it was silently dropped from the chart). Gear and exit tier **choosable in the cockpit**, writing through to the card. `Cancel all` → `Cancel N resting`: disabled when nothing rests, and documented — the bot never re-prices a resting order, so a shifted gear needs the old one cleared. |
+
+| 0.7 | 2026-08-01 | **Exit tiers are a multi-select again** — one for a clean full exit, two or three to leave in portions by the old distribution law; a filled tier is spent, a chase re-arms them all, and the campaign ends only at zero shares. The bot **re-prices its own resting orders** (the 443 `stale LOAD`/`stale SELL` rule), so a gear shift never strands one. The **vantage** is the Dynamic High5 window (four completed highs + today's live high, per the strategy manual's Appendix A), and can be pinned by clicking a day on the 5-day chart. The campaign log holds **trades only**. Cockpit: AUTO/MANUAL without forcing a gear pick, a vantage strip, taller charts, distinct day labels. **All cards ordered by gap.** |
 
 ---
 

@@ -41,7 +41,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from core.vcommandos import CampaignEngine, POLL_SECONDS, STRATEGY_ID
-from core.calc import calc_volatility, clamp_gear, clamp_tier, fmt_order_price
+from core.calc import calc_volatility, clamp_gear, fmt_order_price
 
 _TZ_KR = timezone(timedelta(hours=9))
 _LOG_PATH = os.path.join('logs', 'autopilot443.log')
@@ -189,7 +189,7 @@ class AutopilotController:
                 'engine': None, 'mode': 'WATCH', 'card': None,
                 'backoff_until': 0.0,
                 'prev_close': None, 'high5': None, 'vol5': None,
-                'daily_date': None,
+                'bars': [], 'daily_date': None,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
                 'ticks': [], 'my_ids': set(),
                 'fail_n': 0, 'fail_warned': False, 'insuff_warned': False,
@@ -232,12 +232,14 @@ class AutopilotController:
             except Exception:
                 pass
 
-    def set_card_gear(self, ticker, gear=None, tier=None, auto=None):
-        """The cockpit's gear/tier buttons write to the CARD — the single
-        source of truth — and the card's own trace pushes the new config
-        straight back through set_card_config. Picking a gear is a manual
-        choice, so it also flips the card off AUTO; the AUTO button hands
-        the choice back to volatility."""
+    def set_card_gear(self, ticker, gear=None, tiers=None, auto=None):
+        """The cockpit's gear/tier controls write to the CARD — the single
+        source of truth — and the change is read straight back so the very
+        next poll uses it.
+
+        Picking a gear is a manual choice, so it also drops AUTO. `auto` on
+        its own toggles the mode without touching the gear, which is what the
+        card's own AUTO/MANUAL button does."""
         def apply():
             row = self._find_row(ticker)
             if row is None:
@@ -248,18 +250,34 @@ class AutopilotController:
                 if gear is not None:
                     row.auto_var.set(False)
                     row.gear_var.set(clamp_gear(gear))
-                if tier is not None:
-                    row.tier_var.set(clamp_tier(tier))
-            except tk.TclError:
+                if tiers is not None:
+                    for var, on in zip(row.tier_vars, tiers):
+                        var.set(bool(on))
+            except (tk.TclError, AttributeError):
                 return
-            # Read it straight back so the very next poll uses it, instead of
-            # waiting for the card's own compute to push on the poll after.
             self._pull_card_config(ticker)
             self._wake.set()          # let the engine trade on it this second
         try:
             self.root.after(0, apply)
         except (RuntimeError, tk.TclError):
             pass
+
+    # ── Vantage (UI thread, from the campaign window) ────────────────────────
+
+    def set_vantage(self, ticker, price=None, label=''):
+        """Pin the LOAD's vantage to a price the commander picked off the
+        5-day chart, or (price=None) hand it back to the rolling high."""
+        slot = self._slots.get(ticker)
+        engine = slot and slot.get('engine')
+        if engine is None:
+            return False, 'still arming — try again in a moment'
+        ok = (engine.set_manual_vantage(price, label) if price
+              else engine.clear_manual_vantage())
+        if ok and getattr(engine, 'dirty', False):
+            if self._save_state(ticker, engine):
+                engine.dirty = False
+        self._wake.set()
+        return ok, ('vantage pinned' if price else 'vantage released')
 
     def set_mode(self, ticker, mode):
         """WATCH ↔ LIVE. LIVE only during regular market hours."""
@@ -344,8 +362,9 @@ class AutopilotController:
             'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
             'set_gear': lambda g: self.set_card_gear(ticker, gear=g),
-            'set_tier': lambda t: self.set_card_gear(ticker, tier=t),
-            'set_auto': lambda: self.set_card_gear(ticker, auto=True),
+            'set_tiers': lambda t: self.set_card_gear(ticker, tiers=t),
+            'set_auto': lambda a: self.set_card_gear(ticker, auto=a),
+            'set_vantage': lambda p, l='': self.set_vantage(ticker, p, l),
         }
 
     def _ohlc_for(self, ticker):
@@ -446,19 +465,22 @@ class AutopilotController:
         return datetime.now(tz).strftime('%Y-%m-%d')
 
     def _daily_vantage(self, prov, ticker, slot):
-        """(prev_close, High5) from the last five COMPLETED sessions, fetched
-        once per trading day. High5 is the campaign's standard flat-state
-        vantage (Gearbox manual §9.1); prev_close is the fallback. The same
-        bars give the strategy's V — 100×(High5−Low5)/High5, the number the
-        automatic gear is chosen from — for the cockpit read-out."""
+        """The last five COMPLETED sessions, fetched once per trading day:
+        prev_close, High5, and the strategy's V — 100×(High5−Low5)/High5, the
+        number the automatic gear is chosen from.
+
+        The bars themselves are kept, because the vantage is not always High5:
+        after an exit it is the highest high from the exit day onward, so the
+        engine needs the per-day highs, not one pre-reduced number."""
         today = self._trading_date(ticker)
         if slot['daily_date'] != today:
             try:
                 bars = prov.get_completed_daily_bars(ticker, 5)
                 if bars:
                     slot['prev_close'] = bars[-1]['close']
-                    highs = [b['high'] for b in bars[-5:] if b.get('high')]
-                    lows = [b['low'] for b in bars[-5:] if b.get('low')]
+                    slot['bars'] = [dict(b) for b in bars[-5:]]
+                    highs = [b['high'] for b in slot['bars'] if b.get('high')]
+                    lows = [b['low'] for b in slot['bars'] if b.get('low')]
                     slot['high5'] = max(highs) if highs else None
                     slot['vol5'] = calc_volatility(
                         slot['high5'], min(lows) if lows else None)
@@ -466,6 +488,30 @@ class AutopilotController:
             except Exception:
                 pass
         return slot['prev_close'], slot['high5']
+
+    @staticmethod
+    def _bar_date(bar):
+        ts = str(bar.get('ts') or '')
+        return ts[:10] if len(ts) >= 10 else (bar.get('date') or '')
+
+    def _session_highs(self, slot, snap):
+        """[(iso_date, high)] for the recent sessions INCLUDING today, with
+        today's high stretched to the live price. A fresh peak therefore lifts
+        the vantage — and the LOAD line under it — on the very next poll."""
+        out = [(self._bar_date(b), b.get('high'))
+               for b in (slot.get('bars') or []) if b.get('high')]
+        today = snap.get('trading_date')
+        price = snap.get('price')
+        live = slot.get('ohlc_view') or []
+        today_high = next((b.get('high') for b in reversed(live)
+                           if self._bar_date(b) == today and b.get('high')),
+                          None)
+        if price:
+            today_high = max(today_high or price, price)
+        if today_high and today:
+            out = [(d, h) for d, h in out if d != today]
+            out.append((today, today_high))
+        return out
 
     def _refresh_ohlc(self, prov, ticker, slot, snap):
         """Keep the window's 5-day candles honest: refetch them every
@@ -560,6 +606,7 @@ class AutopilotController:
         snap['phase'] = market_phase(ticker)
         snap['card'] = dict(slot['card']) if slot['card'] else None
         self._refresh_ohlc(prov, ticker, slot, snap)
+        snap['highs'] = self._session_highs(slot, snap)
 
         if slot['engine'] is None:
             saved = self._saved_for(ticker)
@@ -686,6 +733,7 @@ class AutopilotController:
             'events': list(getattr(engine, 'events', []) or []),
             'buy_state': getattr(engine, 'buy_state', 'OK') or 'OK',
             'vol5': slot.get('vol5'),
+            'bars': list(slot.get('ohlc_view') or slot.get('bars') or []),
             'card_auto': bool((slot.get('card') or {}).get('auto', True)),
             'mode': slot['mode'],
             'badge_key': badge_key,

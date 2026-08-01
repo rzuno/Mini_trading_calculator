@@ -12,23 +12,20 @@ follows exactly the lines the CARD draws — same gear, same exit tier.
 There are no manual Buy/Sell buttons: the point of the bot is that the offer
 goes out when the curve touches the line.
 
-**Cancel resting** is the one order-level intervention, and it exists for a
-specific reason: the bot never re-prices an order it has already sent. One
-order per side at a time, and while it rests that side is blocked. So if the
-gear shifts (or the tier changes) while a chase is resting, the resting order
-sits at the OLD price and the new line cannot arm until it is gone. Cancelling
-it lets the next poll re-arm at the current line. It is also the way to pull a
-line you no longer want before the market reaches it. It touches only resting
-(unfilled) orders — a filled trade cannot be cancelled.
+Nothing is placed in advance: the bot sends an order only when the price
+actually crosses a line. A limit order it sent can still rest unfilled, and
+the engine re-prices its own resting orders every poll — so a shifted gear or
+a re-armed tier heals itself. **Cancel resting** is only the manual override
+for that, and it is disabled whenever nothing rests.
 
-The gear and exit tier are chosen here as well as on the card. Both write to
-the CARD, which is the single source of truth; the card's own trace pushes the
-change straight back to the engine, so the lines move on the next poll.
+The gear and the exit tiers are chosen here as well as on the card. Both write
+to the CARD, which is the single source of truth; the change is read straight
+back, so the lines move on the very next poll.
 
 Layout is ONE information banner over TWO charts, plus the campaign log:
 
     header   name · campaign state · market phase · Cancel resting · LIVE
-    gearbox  AUTO · G1..G5 · T1/T2/T3 · V and the gear it recommends
+    gearbox  AUTO/MANUAL · G1..G5 · T1/T2/T3 (multi-select) · V · vantage
     banner   gear line (G/tier · load% / chase% ×frac · vantage)
              position · reserve · campaign age / chases / low
              ▲ the EXIT   ▼ the next buy and its size, then the ones after
@@ -49,7 +46,7 @@ from tkinter import messagebox
 
 from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, exit_pct, fmt_price,
                        gear_button_color, gear_button_fg, gear_params,
-                       select_auto_gear)
+                       select_auto_gear, tier_pcts)
 from gui.candle_chart import (CandlePanel, bounded_label_layout,
                               required_label_pad)
 
@@ -92,13 +89,17 @@ _KIND_CLR = {'LOAD': '#0033AA', 'RELOAD': '#E08000', 'CHASE': '#3366CC',
              'EXIT': '#CC3333', 'PARTIAL': '#B8860B',
              'ADOPT': '#7E3FBF', 'GEAR': '#666666', 'TIER': '#666666'}
 
-_VANTAGE_SRC = {'high5': 'High5', 'close': 'prev close',
-                'reload': 'sell fill'}
+_VANTAGE_SRC = {'high5': 'Dynamic High5', 'close': 'prev close',
+                'reload': 'sell fill -3%', 'manual': 'pinned by hand'}
 
 # Buy lines in the order they would fire, armed first. A DEPLOYED campaign
 # arms 'chase' and projects chase2/chase3; a FLAT one arms 'load' and projects
 # the whole ladder from chase1 — the same two chases its card prints.
 _BUY_KEYS = ('load', 'chase', 'chase1', 'chase2', 'chase3')
+# Exit lines, low tier first. A deployed campaign publishes exit1..3 (armed);
+# a flat one publishes pexit1..3 (what the tiers would be if the LOAD filled).
+_SELL_KEYS = ('exit1', 'exit2', 'exit3')
+_PSELL_KEYS = ('pexit1', 'pexit2', 'pexit3')
 
 
 def campaign_line(ui, currency):
@@ -106,12 +107,17 @@ def campaign_line(ui, currency):
     c = ui.get('campaign') or {}
     if not c:
         return 'arming…'
+    pcts = c.get('tier_pcts') or (0, 0, 0)
+    armed = c.get('exit_tiers') or [False, True, False]
+    tiers = ' / '.join(f"T{i + 1} +{pcts[i]}%"
+                       for i in range(3) if armed[i])
+    how = 'full' if sum(1 for a in armed if a) == 1 else 'split'
     parts = [f"G{c['gear']} {c['gear_name']}",
              f"LOAD -{c['load_pct']}%",
              f"CHASE -{c['chase_pct']}% ×{c['add_frac']}",
-             f"EXIT T{c['exit_tier']} +{c['exit_pct']}% (full)"]
+             f"EXIT {tiers} ({how})"]
     if c.get('vantage'):
-        src = _VANTAGE_SRC.get(c.get('vantage_src'), '')
+        src = _VANTAGE_SRC.get(c.get('vantage_src'), c.get('vantage_src') or '')
         parts.append(f"vantage {fmt_price(c['vantage'], currency)} ({src})")
     return '  ·  '.join(parts)
 
@@ -140,16 +146,26 @@ def buy_lines(ui):
     return [lines[k] for k in _BUY_KEYS if lines.get(k)]
 
 
-def next_line(ui, currency):
-    """'▲ EXIT …   ▼ next buy …   then …' — the sell line on top, the next
-    buy and its size below it, and where the ladder goes after that."""
+def sell_lines(ui):
+    """The exit ladder, low tier first. Armed lines when deployed, projected
+    ones when flat."""
     lines = ui.get('lines') or {}
+    armed = [lines[k] for k in _SELL_KEYS if lines.get(k)]
+    return armed or [lines[k] for k in _PSELL_KEYS if lines.get(k)]
+
+
+def next_line(ui, currency):
+    """'▲ exits …   ▼ next buy …   then …' — the sell ladder on top (every
+    armed tier, low first), the next buy and its size below it, and where the
+    buy ladder goes after that."""
     parts = []
-    sell = lines.get('exit') or lines.get('pexit')
-    if sell:
-        tag = 'EXIT' if lines.get('exit') else 'exit if loaded'
-        parts.append(f"▲ {tag} {fmt_price(sell['price'], currency)} × "
-                     f"{sell['qty']}")
+    sells = sell_lines(ui)
+    if sells:
+        armed = bool(sells[0].get('armed'))
+        head = '▲ ' + ('EXIT ' if armed else 'exit if loaded ')
+        parts.append(head + '  ·  '.join(
+            f"T{e['tier'] + 1} {fmt_price(e['price'], currency)} × {e['qty']}"
+            for e in sells))
     else:
         parts.append('▲ no exit line')
 
@@ -209,8 +225,8 @@ class CampaignWindow:
         self.win = tk.Toplevel(parent)
         name = STOCK_NAMES.get(ticker, ticker)
         self.win.title(f'{name} — V-Commandos campaign')
-        self.win.geometry('1260x900')
-        self.win.minsize(980, 640)
+        self.win.geometry('1420x980')
+        self.win.minsize(1100, 760)
         self._ref_font = tkfont.Font(root=self.win, font=_F_REF)
 
         # ── Header ────────────────────────────────────────────────────────────
@@ -237,7 +253,9 @@ class CampaignWindow:
         # ── Gearbox strip: the same choice as the card, at the cockpit ────────
         box = tk.Frame(self.win, padx=12, pady=3)
         box.pack(fill='x')
-        self._auto_btn = tk.Button(box, text='AUTO', font=_F_SM_B, width=7,
+        # AUTO/MANUAL is its own toggle — switching mode must not force a gear
+        # choice, exactly as on the card.
+        self._auto_btn = tk.Button(box, text='AUTO', font=_F_SM_B, width=8,
                                    command=self._on_auto)
         self._auto_btn.pack(side='left', padx=(0, 10))
         tk.Label(box, text='gear', font=_F_SM, fg='#888').pack(side='left')
@@ -253,12 +271,25 @@ class CampaignWindow:
         tk.Label(box, text='exit', font=_F_SM, fg='#888').pack(side='left')
         self._tier_btns = {}
         for t in EXIT_TIERS:
-            b = tk.Button(box, text=f'T{t}', font=_F_SM_B, width=6, bd=1,
+            b = tk.Button(box, text=f'T{t}', font=_F_SM_B, width=7, bd=1,
                           takefocus=0, command=lambda t=t: self._on_tier(t))
             b.pack(side='left', padx=1)
             self._tier_btns[t] = b
         self._vol_lbl = tk.Label(box, text='', font=_F_SM, fg='#666')
         self._vol_lbl.pack(side='left', padx=(16, 0))
+
+        # ── Vantage strip: where the LOAD hangs from, and how to move it ──────
+        vbox = tk.Frame(self.win, padx=12, pady=(0))
+        vbox.pack(fill='x')
+        tk.Label(vbox, text='vantage', font=_F_SM, fg='#888').pack(side='left')
+        self._vantage_lbl = tk.Label(vbox, text='', font=_F_SM_B, fg='#E08000')
+        self._vantage_lbl.pack(side='left', padx=(4, 10))
+        self._vantage_free_btn = tk.Button(
+            vbox, text='use the rolling high', font=_F_SM, bd=1, takefocus=0,
+            command=self._on_free_vantage)
+        self._vantage_free_btn.pack(side='left')
+        tk.Label(vbox, text='  — or click a day on the 5-day chart to pin its '
+                            'high', font=_F_SM, fg='#888').pack(side='left')
 
         # ── Banner ────────────────────────────────────────────────────────────
         self._gear_lbl = tk.Label(self.win, text='', font=_F_BTN,
@@ -280,7 +311,7 @@ class CampaignWindow:
         # ── Campaign log (bottom strip, grows with the campaign) ─────────────
         log_box = tk.Frame(self.win)
         log_box.pack(fill='x', side='bottom', padx=12, pady=(0, 10))
-        self._log_txt = tk.Text(log_box, height=7, font=_F_LOG, bd=1,
+        self._log_txt = tk.Text(log_box, height=5, font=_F_LOG, bd=1,
                                 relief='sunken', wrap='none',
                                 background='#FBFBFB')
         bar = tk.Scrollbar(log_box, command=self._log_txt.yview)
@@ -303,7 +334,8 @@ class CampaignWindow:
         self.canvas.pack(side='left', fill='both', expand=True)
         self.canvas.bind('<Configure>', lambda e: self._draw())
 
-        self.candle_panel = CandlePanel(self._body, currency, width=470)
+        self.candle_panel = CandlePanel(self._body, currency, width=560,
+                                        on_pick_day=self._on_pick_day)
         self.candle_panel.pack(side='left', fill='both', padx=(10, 0))
 
         self._cb = self._on_update
@@ -381,21 +413,75 @@ class CampaignWindow:
     # ── Gearbox strip ─────────────────────────────────────────────────────────
 
     def _on_auto(self):
-        """Hand the gear back to volatility."""
-        self.ap['set_auto']()
+        """Toggle AUTO/MANUAL without touching the gear — the same thing the
+        card's own button does."""
+        self.ap['set_auto'](not bool((self.ui or {}).get('card_auto', True)))
 
     def _on_gear(self, gear):
-        """Picking a gear is a manual choice — the controller flips the card
-        off AUTO so volatility does not overwrite it on the next fetch."""
+        """Picking a gear is a manual choice — the controller drops AUTO so
+        volatility does not overwrite it on the next fetch."""
         self.ap['set_gear'](gear)
 
     def _on_tier(self, tier):
-        self.ap['set_tier'](tier)
+        """Arm or disarm one exit tier. This decides where real money leaves,
+        so it is confirmed; the last armed tier cannot be turned off."""
+        c = (self.ui or {}).get('campaign') or {}
+        armed = list(c.get('exit_tiers') or [False, True, False])
+        pcts = c.get('tier_pcts') or (0, 0, 0)
+        want = list(armed)
+        want[tier - 1] = not want[tier - 1]
+        if not any(want):
+            messagebox.showinfo(
+                'Exit tiers',
+                'At least one exit tier stays armed — otherwise the campaign '
+                'has no way out.', parent=self.win)
+            return
+        on = [i + 1 for i, a in enumerate(want) if a]
+        if len(on) == 1:
+            plan = (f'the WHOLE position leaves at T{on[0]} '
+                    f'+{pcts[on[0] - 1]}%.')
+        else:
+            share = {2: 'half', 3: 'a third'}[len(on)]
+            lines = ', '.join(f'T{i} +{pcts[i - 1]}%' for i in on)
+            plan = (f'about {share} of the holding leaves at each of {lines}.'
+                    '\n\nA tier that fills is spent; the rest stay armed, and '
+                    'the campaign is over only when the holding reaches zero. '
+                    'A chase re-arms every tier on the bigger holding.')
+        label = '+'.join(f'T{i}' for i in on)
+        if messagebox.askyesno('Exit tiers', f'Arm {label}?\n\n{plan}',
+                               parent=self.win):
+            self.ap['set_tiers'](want)
+
+    # ── Vantage ───────────────────────────────────────────────────────────────
+
+    def _on_free_vantage(self):
+        ok, msg = self.ap['set_vantage'](None)
+        if not ok:
+            messagebox.showwarning('Vantage', msg, parent=self.win)
+
+    def _on_pick_day(self, bar):
+        """A day was clicked on the 5-day chart: pin its HIGH as the vantage.
+        This is the manual override for the day a campaign really ended — the
+        rolling high cannot know about a trade made outside the bot."""
+        high = bar.get('high')
+        if not high:
+            return
+        day = bar.get('date') or ''
+        text = (f"Pin the vantage to {day}'s high, "
+                f'{fmt_price(high, self.ccy)}?\n\n'
+                'The LOAD hangs under this price until you release it, so it '
+                'stops following the rolling high.')
+        if not messagebox.askyesno('Vantage', text, parent=self.win):
+            return
+        ok, msg = self.ap['set_vantage'](high, f'({day} high)')
+        if not ok:
+            messagebox.showwarning('Vantage', msg, parent=self.win)
 
     def _update_gearbox(self, ui):
         c = ui.get('campaign') or {}
         gear = c.get('gear')
-        tier = c.get('exit_tier')
+        armed = c.get('exit_tiers') or [False, True, False]
+        done = c.get('tier_done') or [False, False, False]
         auto = bool(ui.get('card_auto', True))
 
         self._auto_btn.config(
@@ -414,11 +500,14 @@ class CampaignWindow:
                 text=f"{g['name']}  -{g['load']}% / -{g['chase']}% ×{g['frac']}"
                      + ('' if auto else '  (manual)'))
             for t, b in self._tier_btns.items():
-                picked = (t == tier)
-                b.config(text=f'T{t} +{exit_pct(gear, t)}%',
-                         bg=(_CLR['exit'] if picked else self._default_bg),
-                         fg=('white' if picked else '#666'),
-                         relief=('sunken' if picked else 'raised'))
+                on, spent = armed[t - 1], done[t - 1]
+                label = f'T{t} +{exit_pct(gear, t)}%' + (' ✓' if spent else '')
+                b.config(text=label,
+                         bg=(self._default_bg if not on else
+                             ('#E4A9A9' if spent else _CLR['exit'])),
+                         fg=('#666' if not on else
+                             ('#552222' if spent else 'white')),
+                         relief=('sunken' if on else 'raised'))
 
         v = ui.get('vol5')
         if v is None:
@@ -427,6 +516,17 @@ class CampaignWindow:
             rec = select_auto_gear(v)
             tail = '' if (auto or rec == gear) else f' (AUTO would pick G{rec})'
             self._vol_lbl.config(text=f'V {v:.1f}% → G{rec}{tail}')
+
+        src = c.get('vantage_src') or ''
+        pinned = bool(c.get('vantage_manual'))
+        txt = (fmt_price(c['vantage'], self.ccy) if c.get('vantage') else '--')
+        detail = _VANTAGE_SRC.get(src, src)
+        if c.get('last_exit_date'):
+            detail += f" · last exit {c['last_exit_date']}"
+        self._vantage_lbl.config(text=f'{txt}  ({detail})',
+                                 fg=('#CC0000' if pinned else '#E08000'))
+        self._vantage_free_btn.config(
+            state=('normal' if pinned else 'disabled'))
 
     # ── Controller callback (tk thread) ───────────────────────────────────────
 
@@ -546,14 +646,12 @@ class CampaignWindow:
             rows.append((avg, _CLR['avg'],
                          f'avg {fmt_price(avg, self.ccy)}', True))
 
-        sell = lines.get('exit') or lines.get('pexit')
-        if sell:
-            armed = bool(sell.get('armed'))
-            rows.append((sell['price'],
+        for e in sell_lines(ui):
+            armed = bool(e.get('armed'))
+            rows.append((e['price'],
                          _CLR['exit'] if armed else _CLR['exit_soft'],
-                         f"{sell['label']} "
-                         f"{fmt_price(sell['price'], self.ccy)} × {sell['qty']}"
-                         + ('' if armed else ' (projected)'),
+                         f"{e['label']} {fmt_price(e['price'], self.ccy)} "
+                         f"× {e['qty']}" + ('' if armed else ' (projected)'),
                          armed))
 
         if c.get('vantage'):
@@ -639,10 +737,9 @@ class CampaignWindow:
             return top + ch * (1 - (p - p_min) / p_rng)
 
         # Shade the corridor the campaign lives in: armed buy → exit.
-        lines = ui.get('lines') or {}
+        sells = sell_lines(ui)
         lo = ladder[0]['price'] if ladder else None
-        sell = lines.get('exit') or lines.get('pexit')
-        hi = sell['price'] if sell else None
+        hi = max((e['price'] for e in sells), default=None)
         if lo and hi and hi > lo:
             c.create_rectangle(left, y_of(min(hi, p_max)),
                                left + cw, y_of(max(lo, p_min)),

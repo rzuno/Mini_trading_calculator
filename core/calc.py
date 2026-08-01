@@ -138,6 +138,11 @@ def exit_pct(gear, tier) -> int:
     return gear_params(gear)['tiers'][clamp_tier(tier) - 1]
 
 
+def tier_pcts(gear) -> tuple:
+    """The three exit percents of this gear, low to high."""
+    return gear_params(gear)['tiers']
+
+
 def gear_label(gear) -> str:
     return f"G{clamp_gear(gear)}" if gear else "G?"
 
@@ -446,23 +451,61 @@ def calc_load_ladder(vantage: float, gear, unit_cash: float,
     return ladder, load_price, load_shares
 
 
-# ── EXIT (one clean full-position sell) ──────────────────────────────────────
+# ── EXIT tiers ───────────────────────────────────────────────────────────────
 def calc_exit_price(avg_cost: float, gear, tier) -> float:
     return avg_cost * (1.0 + exit_pct(gear, tier) / 100.0)
 
 
 def calc_exit(shares: int, avg_cost: float, gear, tier) -> dict:
-    """The campaign's single EXIT: the WHOLE position at the selected tier."""
+    """One tier carrying the WHOLE position — the single-tier exit."""
     if shares <= 0 or avg_cost <= 0:
         return {'price': None, 'qty': None, 'pct': exit_pct(gear, tier)}
     return {'price': calc_exit_price(avg_cost, gear, tier),
             'qty': shares, 'pct': exit_pct(gear, tier)}
 
 
-def calc_exit_lines(shares: int, avg_cost: float, gear) -> list:
-    """All three tiers of this gear (for display). Each carries the whole
-    position — only the SELECTED one is armed."""
-    return [calc_exit(shares, avg_cost, gear, t) for t in EXIT_TIERS]
+def calc_sell_tiers(shares: int, avg_cost: float, pcts, actives) -> list:
+    """Split the held shares across the ARMED sell tiers as evenly as possible,
+    giving any remainder to the MID tier first, then LOW, then HIGH — so the
+    centre tier is never smaller than the outer ones.
+
+    Arm one tier and it carries everything; arm two and the holding halves;
+    arm three and it thirds. Examples with all three armed: 5 → 2/2/1,
+    4 → 1/2/1, 1 → 0/1/0.
+
+    Returns three dicts {'price', 'qty'}; a tier that is off, or that rounds
+    to nothing, comes back {None, None}."""
+    active_idx = [i for i, on in enumerate(actives) if on]
+    n = len(active_idx)
+
+    result = [{'price': None, 'qty': None} for _ in range(3)]
+    if n == 0 or avg_cost <= 0 or shares <= 0:
+        return result
+
+    base, rem = divmod(shares, n)
+    qty_by_tier = {i: base for i in active_idx}
+    for i in (1, 0, 2):
+        if rem <= 0:
+            break
+        if i in qty_by_tier:
+            qty_by_tier[i] += 1
+            rem -= 1
+
+    for i in active_idx:
+        q = qty_by_tier[i]
+        if q > 0:
+            result[i] = {'price': avg_cost * (1.0 + pcts[i] / 100.0),
+                         'qty': q}
+    return result
+
+
+def calc_exit_lines(shares: int, avg_cost: float, gear, actives=None) -> list:
+    """The three tiers of this gear for display. With `actives` the shares are
+    split across the armed ones (the real ladder); without it every tier shows
+    the whole position (the price-only reference)."""
+    if actives is None:
+        return [calc_exit(shares, avg_cost, gear, t) for t in EXIT_TIERS]
+    return calc_sell_tiers(shares, avg_cost, tier_pcts(gear), actives)
 
 
 # ── Gap rate ─────────────────────────────────────────────────────────────────

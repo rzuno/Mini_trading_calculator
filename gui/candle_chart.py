@@ -1,10 +1,15 @@
 """Embeddable 5-day candle panel — the informational half of the campaign
 cockpit.
 
-Shows the 5-day candles with **V, the strategy's own volatility number** —
+Shows the five sessions with **V, the strategy's own volatility number** —
 100×(High5−Low5)/High5, the very figure the automatic gear is chosen from —
 plus whatever reference lines the caller passes (the campaign's lines, the
-current price). Purely informational: no order buttons live here.
+current price).
+
+No order buttons live here, but a day CAN be clicked: `on_pick_day` receives
+that session's bar, which the cockpit uses to pin the vantage to its high.
+The bot's rolling high cannot know about a sale made outside it, so the
+commander needs a way to say "the campaign ended on this day".
 """
 
 import tkinter as tk
@@ -39,6 +44,28 @@ def candle_color(day):
     return _UP_CLR if day['close'] >= day['open'] else _DOWN_CLR
 
 
+def bar_day_labels(bars):
+    """One label per bar for the x-axis, guaranteed distinct.
+
+    `date` is MM/DD, which repeats the moment two bars share a day — and a
+    row of identical labels tells the reader nothing about which candle is
+    which. Whenever MM/DD is not unique the full ISO date is used instead,
+    and anything still colliding is numbered, so every candle is nameable."""
+    out = []
+    for b in (bars or []):
+        ts = str(b.get('ts') or '')
+        out.append((b.get('date') or ts[5:10].replace('-', '/') or '?', ts))
+    labels = [d for d, _ts in out]
+    if len(set(labels)) == len(labels):
+        return labels
+    labels = [(ts[:10] if len(ts) >= 10 else d) for d, ts in out]
+    seen, final = {}, []
+    for lab in labels:
+        seen[lab] = seen.get(lab, 0) + 1
+        final.append(lab if seen[lab] == 1 else f'{lab}#{seen[lab]}')
+    return final
+
+
 def required_label_pad(labels, measure, minimum, padding=12):
     """Right-side canvas space needed to show every label without clipping.
 
@@ -68,13 +95,15 @@ class CandlePanel(tk.Frame):
     """5-day candles + reference lines. Call update() with fresh data; the
     panel redraws itself (also on resize)."""
 
-    def __init__(self, parent, currency, width=460):
+    def __init__(self, parent, currency, width=560, on_pick_day=None):
         super().__init__(parent)
         self.ccy = currency
         self.ohlc = []
         self.ref_lines = []     # [{'label','price','color','dash','width'}]
         self.current = None
         self.vol5 = None        # 5-day range V from the watcher
+        self.on_pick_day = on_pick_day
+        self._day_bands = []    # [(x0, x1, bar)] for the click test
         self._ref_font = tkfont.Font(root=self, font=_F_REF)
         self._row_wrap = max(100, width - 10)
 
@@ -87,7 +116,17 @@ class CandlePanel(tk.Frame):
                                 width=width)
         self.canvas.pack(fill='both', expand=True, pady=(4, 0))
         self.canvas.bind('<Configure>', lambda e: self._draw())
+        self.canvas.bind('<Button-1>', self._on_click)
         self.bind('<Configure>', self._resize_day_rows)
+
+    def _on_click(self, event):
+        """Clicking a candle hands its bar to the cockpit."""
+        if not self.on_pick_day:
+            return
+        for x0, x1, bar in self._day_bands:
+            if x0 <= event.x <= x1:
+                self.on_pick_day(dict(bar))
+                return
 
     def _resize_day_rows(self, event):
         """Keep every colored OHLC row inside the panel as it is resized."""
@@ -128,9 +167,9 @@ class CandlePanel(tk.Frame):
                  f'Low {fmt_price(lo, self.ccy)}   {v_txt}')
         for child in self._days.winfo_children():
             child.destroy()
-        for d in self.ohlc:
+        for d, lab in zip(self.ohlc, bar_day_labels(self.ohlc)):
             rng = (d['high'] - d['low']) / d['low'] * 100 if d['low'] else 0
-            row = (f"{d['date']}  O {fmt_price(d['open'], self.ccy)}"
+            row = (f"{lab}  O {fmt_price(d['open'], self.ccy)}"
                    f"  H {fmt_price(d['high'], self.ccy)}"
                    f"  L {fmt_price(d['low'], self.ccy)}"
                    f"  C {fmt_price(d['close'], self.ccy)}"
@@ -155,7 +194,7 @@ class CandlePanel(tk.Frame):
             return
         n = len(ohlc)
 
-        left_pad, top_pad, bottom_pad = 62, 14, 26
+        left_pad, top_pad, bottom_pad = 62, 14, 30
         label_texts = [r['label'] for r in self.ref_lines]
         if self.current and self.current > 0:
             label_texts.append(f'Now {fmt_price(self.current, self.ccy)}')
@@ -230,9 +269,16 @@ class CandlePanel(tk.Frame):
                 options['width'] = wrap_width
             c.create_text(text_x, y, **options)
 
-        # Candles
+        # Candles. Every label is distinct (bar_day_labels); when they still
+        # cannot all fit side by side, every other one is dropped rather than
+        # letting them overlap into an unreadable smear.
+        labels = bar_day_labels(ohlc)
+        widest = max((self._ref_font.measure(t) for t in labels), default=0)
+        step = 1 if widest + 6 <= candle_w else 2
+        self._day_bands = []
         for i, d in enumerate(ohlc):
             x = left_pad + candle_w * (i + 0.5)
+            self._day_bands.append((x - candle_w / 2, x + candle_w / 2, d))
             c.create_line(x, y_of(d['high']), x, y_of(d['low']),
                           fill='#555', width=1)
             color = candle_color(d)
@@ -242,5 +288,8 @@ class CandlePanel(tk.Frame):
                 y_bot = y_top + 2
             c.create_rectangle(x - body_w / 2, y_top, x + body_w / 2, y_bot,
                                fill=color, outline='#444')
-            c.create_text(x, h - 4, text=d['date'],
-                          font=_F_AXIS, fill='#555', anchor='s')
+            if i % step == 0 or i == len(ohlc) - 1:
+                c.create_text(x, h - 6, text=labels[i],
+                              font=_F_AXIS, fill='#555', anchor='s')
+        if self.on_pick_day:
+            c.config(cursor='hand2')
