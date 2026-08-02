@@ -4,10 +4,10 @@ from core.calc import (
     DEFAULT_EXIT_TIER, DEFAULT_GEAR, EXIT_TIERS, GEARS,
     calc_chase_cascade, calc_exit_lines, calc_gap_rate, calc_load_gap_rate,
     calc_load_ladder, calc_reload_price, chase_drop, clamp_gear, display_name,
-    effective_entry_gear, exit_pct, fmt_price, gap_color, gear_detail,
-    gear_for_chase_pct, gear_label, gear_menu_label, gear_params, load_drop,
-    load_gap_color, select_auto_gear, sell_pct_color, sell_pct_foreground,
-    tier_pcts,
+    effective_entry_gear, exit_pct, fmt_price, gap_color, gear_button_color,
+    gear_button_fg, gear_detail, gear_for_chase_pct, gear_label,
+    gear_menu_label, gear_params, load_drop, load_gap_color, select_auto_gear,
+    sell_pct_color, sell_pct_foreground, tier_pcts,
 )
 
 # Readable blue for buy-trigger values (matches the chart's chase lines)
@@ -23,7 +23,19 @@ _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
 _F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
+_F_TINY = ('Segoe UI', 9)
 _F_STATUS = ('Segoe UI', 12, 'bold')
+_F_GEAR_BADGE = ('Segoe UI', 18, 'bold')
+
+# A ticked tier is written in its own exit colour. sell_pct_color is a
+# BACKGROUND ramp that starts near white, which is unreadable as text, so the
+# low tiers get a darkened equivalent here.
+_TIER_TEXT = {1: '#B8860B', 2: '#C07000', 3: '#CC5500',
+              4: '#CC3333', 5: '#CC0000', 6: '#B00000', 7: '#A00000'}
+
+
+def tier_text_color(pct):
+    return _TIER_TEXT.get(int(pct), '#880000')
 
 # Greys for a "muted" (state-inactive but informational) control
 _MUTE_TITLE = '#C0C0C0'
@@ -63,7 +75,7 @@ class StockRow:
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
                  get_unit_cash, on_compute=None, editable=True,
-                 on_autopilot=None):
+                 on_autopilot=None, on_sync=None):
         self.deployed       = deployed
         self.editable       = editable
         self.ticker         = pos['ticker']
@@ -71,6 +83,7 @@ class StockRow:
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.get_unit_cash  = get_unit_cash
         self.on_autopilot   = on_autopilot
+        self.on_sync        = on_sync
         self._on_compute_cb = on_compute
         self.current_price  = None
         self.vantage        = None    # High5 / prev close / same-day sell fill
@@ -270,6 +283,7 @@ class StockRow:
         self._gear_title = {}
 
         # -- Gear picker (one gear = load %, chase %, add size, tier table) ----
+        self._card_bg = self.frame.cget('bg')
         gear_box = tk.Frame(wrap)
         gear_box.pack(side='left', anchor='n', padx=(0, 12))
         self._gear_title['gear'] = tk.Label(gear_box, text='Gear',
@@ -288,7 +302,21 @@ class StockRow:
                              command=lambda g=gear: self._on_gear_select(g))
         self.gear_menu.config(menu=menu)
         self.gear_menu.pack(side='left')
-        # -- Exit tiers (one full exit, or a two/three-tier split) --------------
+
+        # The big gear number. Across a grid of sixteen cards this is the one
+        # mark readable at a glance, which is the whole point of it.
+        badge_row = tk.Frame(gear_box)
+        badge_row.grid(row=2, column=0, sticky='w', pady=(3, 0))
+        tk.Label(badge_row, text='gear:', font=_F_SM, fg='#888'
+                 ).pack(side='left', padx=(0, 3))
+        self.gear_badge = tk.Canvas(badge_row, width=46, height=46,
+                                    highlightthickness=0, bd=0)
+        self.gear_badge.pack(side='left')
+
+        # -- Exit tiers: plain checkboxes ---------------------------------------
+        # Ticked boxes, not lit buttons. The card is a worksheet, and a tick is
+        # what a worksheet uses; it also reads differently from the cockpit's
+        # coloured tier buttons, which is the point — those trade, these do not.
         exit_box = tk.Frame(wrap)
         exit_box.pack(side='left', anchor='n')
         self._gear_title['exit'] = tk.Label(exit_box, text='Exit',
@@ -297,21 +325,32 @@ class StockRow:
         self._tier_btns = {}
         for disp, t in enumerate(reversed(EXIT_TIERS)):    # T3 on top
             btn = tk.Checkbutton(
-                exit_box, variable=self.tier_vars[t - 1], indicatoron=False,
-                width=8, font=_F_SM_B, bd=1, takefocus=0,
+                exit_box, variable=self.tier_vars[t - 1], anchor='w',
+                width=9, font=_F_SM, bd=0, takefocus=0, padx=0, pady=0,
                 command=lambda t=t: self._on_tier_click(t))
-            btn.grid(row=disp + 1, column=0, sticky='w', pady=1)
+            btn.grid(row=disp + 1, column=0, sticky='w')
             self._tier_btns[t] = btn
 
         # -- Autopilot button: opens the campaign cockpit and arms WATCH -------
         if self.on_autopilot:
+            ap = tk.Frame(wrap)
+            ap.pack(side='left', anchor='n', padx=(12, 0),
+                    pady=(_AP_BUTTON_TOP_GAP, 0))
             self.ap_btn = tk.Button(
-                wrap, text='AUTOPILOT', font=_F_SM_B, width=12,
+                ap, text='AUTOPILOT', font=_F_SM_B, width=14,
                 height=3, bd=2, takefocus=0,
                 command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
-            self.ap_btn.pack(side='left', anchor='n', padx=(12, 0),
-                             pady=(_AP_BUTTON_TOP_GAP, 0))
+            self.ap_btn.pack(side='top')
+            # The one bridge between this sheet and the bot, and it only ever
+            # runs when it is pressed. Nothing here leaks into a live campaign
+            # by itself.
+            if self.on_sync:
+                self.sync_btn = tk.Button(
+                    ap, text='sync to autopilot', font=_F_TINY, width=17,
+                    height=1, bd=1, takefocus=0,
+                    command=self._on_sync_click)
+                self.sync_btn.pack(side='top', pady=(2, 0))
 
     # ── Formatting ────────────────────────────────────────────────────────────
 
@@ -365,6 +404,17 @@ class StockRow:
             self.gear_var.set(gear)
         finally:
             self._syncing_gear = False
+
+    def _on_sync_click(self):
+        """Hand this card's gear and exit tiers to the autopilot."""
+        if not self.on_sync:
+            return
+        ok, msg = self.on_sync(self.ticker, self.line_config())
+        self.sync_btn.config(
+            text=('synced ✓' if ok else 'not watching'),
+            fg=('#007700' if ok else '#CC0000'))
+        self.sync_btn.after(2500, lambda: self.sync_btn.config(
+            text='sync to autopilot', fg='black'))
 
     def _on_gear_select(self, gear):
         self._set_gear(gear)
@@ -442,6 +492,7 @@ class StockRow:
 
     def _refresh_gear_styles(self):
         self._refresh_gear_title_text()
+        self._draw_gear_badge(self._get_gear())
         self._style_tier_buttons()
 
         self.auto_btn.config(state='normal')
@@ -456,19 +507,35 @@ class StockRow:
             activebackground=self._gear_menu_default_bg,
             disabledforeground='#888888', font=_F_SM)
 
+    def _draw_gear_badge(self, gear):
+        """The big number, in that gear's own colour."""
+        if not hasattr(self, 'gear_badge'):
+            return
+        gear = clamp_gear(gear)
+        self.gear_badge.delete('all')
+        self.gear_badge.create_oval(3, 3, 43, 43,
+                                    fill=gear_button_color(gear),
+                                    outline='#555555', width=1)
+        self.gear_badge.create_text(23, 23, text=str(gear),
+                                    fill=gear_button_fg(gear),
+                                    font=_F_GEAR_BADGE)
+
     def _style_tier_buttons(self):
+        """A ticked tier is written in its own exit colour; an unticked one is
+        grey. The box itself carries the state, so the text stays plain and
+        full-size either way — a faded number is still a number to read."""
         gear = self._get_gear()
         armed = self._get_tiers()
         for t, btn in self._tier_btns.items():
             pct = exit_pct(gear, t)
-            if armed[t - 1]:
-                bg = sell_pct_color(float(pct))
-                fg = sell_pct_foreground(pct)
-            else:
-                bg, fg = _MUTE_BG, _MUTE_FG
-            btn.config(text=f'T{t} +{pct}%', bg=bg, fg=fg,
-                       selectcolor=bg, activebackground=bg,
-                       activeforeground=fg)
+            on = armed[t - 1]
+            btn.config(text=f'T{t} +{pct}%',
+                       fg=(tier_text_color(pct) if on else _MUTE_FG),
+                       font=(_F_SM_B if on else _F_SM),
+                       bg=self._card_bg, activebackground=self._card_bg,
+                       selectcolor='white',
+                       activeforeground=(tier_text_color(pct) if on
+                                         else _MUTE_FG))
 
     # ── Compute ───────────────────────────────────────────────────────────────
 

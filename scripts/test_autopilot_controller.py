@@ -165,10 +165,8 @@ ok(not is_bot_owned_order({}, ()), 'and nothing at all is not ours either')
 print('— one poll, end to end —')
 root, prov, app, ctrl = fresh()
 ok(ctrl.watch('NVDA')[0], 'watching arms a slot')
-ok(ctrl._slots['NVDA']['card'] == {'gear': 3,
-                                   'exit_tiers': [False, True, False],
-                                   'auto': True},
-   "and reads the card's gear config straight away")
+ok(ctrl._slots['NVDA']['engine'].gear == 3,
+   'on the gear the bot itself remembers — the card is not consulted')
 
 slot = ctrl._slots['NVDA']
 ctrl._cycle('NVDA', slot)
@@ -181,6 +179,9 @@ ok(ui['lines'].get('chase') and ui['lines'].get('exit2'),
 ok(ui['vol5'] is not None and ui['campaign']['gear'] == 3,
    'plus V and the campaign summary')
 ok(not prov.placed, 'WATCH sent nothing')
+_row = app.deployed_rows[0]
+ok(_row.volatility is None,
+   'and the poll left the card alone — no live price, no recompute')
 
 # ── LIVE actually sends, and stamps ownership ───────────────────────────────
 # LIVE is refused, and self-disarms, outside regular hours — correct, but it

@@ -102,7 +102,7 @@ def deployed_ui(**over):
         'price': 91.2, 'shares': 31, 'avg_cost': 92.0,
         'buying_power': 4200.0, 'unit_cash': 1000.0, 'orders': [],
         'ticks': [(1.0, 92.0), (2.0, 91.5), (3.0, 91.2)], 'vol5': 18.0,
-        'card_auto': True,
+        'auto': True,
     }
     ui.update(over)
     return ui
@@ -137,7 +137,7 @@ def flat_ui(**over):
         'crossed': {'BUY': None, 'SELL': None}, 'events': [],
         'price': 95.0, 'shares': 0, 'avg_cost': 0.0,
         'buying_power': 4200.0, 'unit_cash': 1000.0, 'orders': [],
-        'ticks': [], 'vol5': 18.0, 'card_auto': True,
+        'ticks': [], 'vol5': 18.0, 'auto': True,
     }
     ui.update(over)
     return ui
@@ -331,7 +331,7 @@ ok(picked == [('gear', 5), ('auto', False)],
    'the gear button writes through, and AUTO toggles the MODE without '
    'needing a gear pick — the asymmetry with the card is gone', str(picked))
 picked.clear()
-window.ui = deployed_ui(card_auto=False)
+window.ui = deployed_ui(auto=False)
 window._on_auto()
 ok(picked == [('auto', True)], 'and toggles back the other way')
 
@@ -485,6 +485,7 @@ class _StubRow:
         self.live_price = None
         self.volatility = None
         self.deployed = False
+        self.computed = 0
 
     gear = property(lambda self: self.gear_var.get())
     tiers = property(lambda self: [v.get() for v in self.tier_vars])
@@ -504,11 +505,7 @@ class _StubRow:
             self.volatility = volatility
 
     def compute(self):
-        # The real card reselects its gear from V while AUTO is on; the stub
-        # models just that much, because it is the card's rule, not the
-        # controller's.
-        if self.auto_var.get() and self.volatility is not None:
-            self.gear_var.set(select_auto_gear(self.volatility))
+        self.computed += 1
 
 
 class _FakeProvider:
@@ -641,10 +638,12 @@ ctrl._store = {}
 ctrl._save_state = lambda *a: True     # never touch data/
 
 ok(ctrl.watch('NVDA')[0], 'watching arms the campaign engine')
-ok(ctrl._slots['NVDA']['card'] == {'gear': 3,
-                                   'exit_tiers': [False, True, False],
-                                   'auto': True},
-   "watching pulls the card's gear config immediately")
+_engine = ctrl._slots['NVDA']['engine']
+ok(_engine.gear == 3 and _engine.exit_tiers == [False, True, False]
+   and _engine.auto is True,
+   'the bot arms on its own remembered gear, not on whatever the card shows')
+ok('card' not in ctrl._slots['NVDA'],
+   'and the slot holds no card config at all')
 
 slot = ctrl._slots['NVDA']
 ctrl._cycle('NVDA', slot)              # the path that used to throw
@@ -681,31 +680,56 @@ ok(ui['crossed']['SELL'] and not ui['crossed']['BUY'],
 ok('not sent' in ui['status'], 'WATCH says plainly that it did not send',
    ui['status'])
 
-# The cockpit's gear buttons write to the CARD, which is the source.
-row = ctrl.app.deployed_rows[0] if hasattr(ctrl, 'app') else None
-ctrl.set_card_gear('NVDA', gear=5)
-_root.update()
-ok(_card.gear == 5 and _card.auto is False,
-   'picking a gear in the cockpit writes to the card and drops AUTO',
-   f'gear={_card.gear} auto={_card.auto}')
-ctrl.set_card_gear('NVDA', tiers=[True, False, True])
-_root.update()
-ok(_card.tiers == [True, False, True],
-   'arming two tiers in the cockpit writes both flags to the card',
-   str(_card.tiers))
-ctrl.set_card_gear('NVDA', auto=True)
-_root.update()
-ok(_card.auto is True, 'AUTO hands the gear back to volatility')
+# ── The cockpit drives the bot; the card is not touched ─────────────────────
+print('— the card and the cockpit are detached —')
+ok(_card.gear == 3 and _card.auto is True and _card.live_price is None
+   and _card.computed == 0,
+   'two polls went by and the card was never written to or recomputed',
+   f'gear={_card.gear} price={_card.live_price} computed={_card.computed}')
 
-ctrl._cycle('NVDA', slot)      # the card recomputes its AUTO gear here …
+ctrl.set_gear('NVDA', gear=5)
 _root.update()
-ctrl._cycle('NVDA', slot)      # … and the engine reads it on the next poll
+ok(_engine.gear == 5 and _engine.auto is False,
+   'picking a gear in the cockpit moves the ENGINE and drops AUTO',
+   f'gear={_engine.gear} auto={_engine.auto}')
+ok(_card.gear == 3 and _card.auto is True,
+   'and the card keeps the commander\'s own gear, undisturbed',
+   f'gear={_card.gear} auto={_card.auto}')
+
+ctrl.set_gear('NVDA', tiers=[True, False, True])
+_root.update()
+ok(_engine.exit_tiers == [True, False, True],
+   'arming two tiers in the cockpit writes both flags to the engine',
+   str(_engine.exit_tiers))
+ok(_card.tiers == [False, True, False], 'the card still shows only T2',
+   str(_card.tiers))
+
+ctrl.set_gear('NVDA', auto=True)
+_root.update()
+ok(_engine.auto is True, 'AUTO hands the gear back to volatility')
+
+ctrl._cycle('NVDA', slot)      # AUTO reads V inside the engine now
 _root.update()
 ui = ctrl.ui_state('NVDA')
 ok(ui['campaign']['gear'] == select_auto_gear(calc_volatility(104.0, 86.0))
    and ui['campaign']['exit_tiers'] == [True, False, True],
    'AUTO reselects the live-volatility gear and preserves the tier change',
    str((ui['campaign']['gear'], ui['campaign']['exit_tiers'])))
+ok(ui['auto'] is True, "the payload reports the bot's own AUTO flag")
+
+# ── The one bridge: the card's sync button ──────────────────────────────────
+_card.gear_var.set(1)
+_card.auto_var.set(False)
+for _v, _on in zip(_card.tier_vars, (True, True, False)):
+    _v.set(_on)
+_synced, _msg = ctrl.sync_from_card('NVDA', _card.line_config())
+ok(_synced and _engine.gear == 1 and _engine.auto is False
+   and _engine.exit_tiers == [True, True, False],
+   'pressing sync — and only pressing sync — hands the card settings over',
+   f'{_msg} gear={_engine.gear} tiers={_engine.exit_tiers}')
+ok(ctrl.sync_from_card('AAPL', _card.line_config())[0] is False,
+   'syncing a stock the bot is not watching is refused, not guessed at')
+ctrl.set_gear('NVDA', auto=True)
 ok(near(ui['vol5'], calc_volatility(104.0, 86.0), 0.01),
    "the payload carries the strategy's V, from the 5-day high and low",
    str(ui['vol5']))

@@ -1,8 +1,13 @@
 """Campaign window — the Gearbox autopilot cockpit for one watched stock.
 
 Opened by the card's AUTOPILOT button. Opening it arms WATCH mode: the
-stock is polled every few seconds and this window follows every tick. The bot
-follows exactly the lines the CARD draws — same gear and armed exit tiers.
+stock is polled every few seconds and this window follows every tick.
+
+This window is the whole truth about the bot. The bot keeps its OWN gear and
+exit tiers, remembered across restarts, and the card grid behind it is only
+the commander's worksheet for trading by hand — it is not read here, and
+changing a card cannot move a line. The one crossing is the card's
+`sync to autopilot` button, and it only ever runs when it is pressed.
 
     WATCH  polling, lines and fill detection only; nothing is placed.
     LIVE   the bot sends the LOAD / CHASE / armed EXIT by ITSELF the moment
@@ -17,9 +22,8 @@ actually crosses a line. A limit order it sent can still rest unfilled, and
 the engine re-prices its own resting orders every poll — so a shifted gear or
 a re-armed tier heals itself.
 
-The gear and the exit tiers are chosen here as well as on the card. Both write
-to the CARD, which is the single source of truth; the change is read straight
-back, so the lines move on the very next poll.
+The gear and the exit tiers are chosen here, and the change reaches the
+engine at once, so the lines move on the very next poll.
 
 Layout is ONE information banner over TWO charts, plus the campaign log:
 
@@ -375,11 +379,11 @@ class CampaignWindow:
         tk.Button(confirm_actions, text='Keep WATCH', font=_F_SM,
                   command=self._hide_live_confirmation).pack(fill='x')
 
-        # ── Gearbox strip: the same choice as the card, at the cockpit ────────
+        # ── Gearbox strip: the bot's own gear, changed while it trades ───────
         box = tk.Frame(self.win, padx=12, pady=3)
         box.pack(fill='x')
         # AUTO/MANUAL is its own toggle — switching mode must not force a gear
-        # choice, exactly as on the card.
+        # choice.
         self._auto_btn = tk.Button(box, text='AUTO', font=_F_SM_B, width=8,
                                    command=self._on_auto)
         self._auto_btn.pack(side='left', padx=(0, 10))
@@ -546,7 +550,7 @@ class CampaignWindow:
     def _on_auto(self):
         """Toggle AUTO/MANUAL without touching the gear — the same thing the
         card's own button does."""
-        self.ap['set_auto'](not bool((self.ui or {}).get('card_auto', True)))
+        self.ap['set_auto'](not bool((self.ui or {}).get('auto', True)))
 
     def _on_gear(self, gear):
         """Picking a gear is a manual choice — the controller drops AUTO so
@@ -591,7 +595,7 @@ class CampaignWindow:
         gear = c.get('gear')
         armed = c.get('exit_tiers') or [False, True, False]
         done = c.get('tier_done') or [False, False, False]
-        auto = bool(ui.get('card_auto', True))
+        auto = bool(ui.get('auto', True))
 
         self._auto_btn.config(
             text='AUTO' if auto else 'MANUAL',

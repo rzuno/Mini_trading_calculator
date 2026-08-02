@@ -503,7 +503,8 @@ class App:
             get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
             on_compute=self._on_row_compute,
             editable=not self._auto,
-            on_autopilot=self._open_autopilot)
+            on_autopilot=self._open_autopilot,
+            on_sync=self._sync_card_to_autopilot)
 
     def _grid_all_cards(self, rows=None):
         """Place and renumber the supplied global card sequence."""
@@ -532,6 +533,13 @@ class App:
         self._grid_all_cards(rows)
 
     # ── Autopilot window (big card button) ────────────────────────────────────
+
+    def _sync_card_to_autopilot(self, ticker, cfg):
+        """The card's `sync to autopilot` button: copy this card's gear and
+        exit tiers into the bot. The only crossing between the two."""
+        ok, msg = self.autopilot.sync_from_card(ticker, cfg)
+        self.status_var.set(f'{ticker}: {msg}')
+        return ok, msg
 
     def _open_autopilot(self, ticker):
         """The card's AUTOPILOT button: start watching the stock (bare WATCH
@@ -627,16 +635,16 @@ class App:
 
     def _on_row_compute(self):
         """Called when any row recomputes (gear change, tier switch, typed
-        input) — refresh card order/army, persist changed strategy preferences,
-        and push the config to the autopilot. The card IS the campaign
-        strategy, so the next poll sees the same choice."""
+        input) — refresh card order and army %, and persist the choice.
+
+        Nothing here reaches the autopilot. The cards are the commander's own
+        worksheet: a gear tried on one is a question, not an instruction, and
+        it must not disturb a campaign that is trading. The `sync to autopilot`
+        button on the card is the only way across."""
         self._reorder_cards()
         if self._fx_rate:
             self._update_army(self._fx_rate)
         self._persist_strategy_preferences()
-        for row in self.deployed_rows + self.empty_rows:
-            if self.autopilot.is_enabled(row.ticker):
-                self.autopilot.set_card_config(row.ticker, row.line_config())
 
     def _persist_strategy_preferences(self):
         """Save gear/tier/AUTO choices promptly, without writing for price or

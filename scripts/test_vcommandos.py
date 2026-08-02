@@ -274,7 +274,7 @@ class FakeBroker:
 
 
 def snap(b, price, date=D1, high5=100.0, prev_close=None, unit=UNIT,
-         card=None, can_trade=True, highs=None, recent_fills=None):
+         can_trade=True, highs=None, recent_fills=None, vol5=None):
     if highs is None:
         # One flat window of sessions at `high5`, dated up to `date`.
         highs = [(date, high5)]
@@ -282,7 +282,7 @@ def snap(b, price, date=D1, high5=100.0, prev_close=None, unit=UNIT,
             'orders': b.open_orders(), 'buying_power': b.cash,
             'unit_cash': unit, 'trading_date': date, 'highs': highs,
             'prev_close': prev_close or high5,
-            'can_trade': can_trade, 'card': card,
+            'can_trade': can_trade, 'vol5': vol5,
             'recent_fills': (list(b.fills) if recent_fills is None
                              else list(recent_fills))}
 
@@ -310,9 +310,15 @@ def settle(e, b, price, rounds=4, **kw):
 
 def fresh(ticker=T, shares=0, avg=0.0, cash=AMPLE_CASH, gear=3,
           tiers=(0, 1, 0)):
+    """A broker and an engine already set to a gear.
+
+    The engine keeps its own gear and exit tiers — nothing about a card
+    reaches it here, because nothing about a card reaches it live either."""
     b = FakeBroker(shares, avg, cash)
     e = CampaignEngine(ticker, trading_date=D1)
-    return e, b, {'gear': gear, 'exit_tiers': [bool(t) for t in tiers]}
+    e.set_gear(gear)
+    e.set_tiers([bool(t) for t in tiers])
+    return e, b
 
 
 def line(e, key):
@@ -328,13 +334,13 @@ def exits(e):
 
 
 print('— the loop: LOAD, CHASE, EXIT —')
-e, b, card = fresh(gear=3)
-settle(e, b, 95.0, card=card)
+e, b = fresh(gear=3)
+settle(e, b, 95.0)
 ok(e.state == 'FLAT' and near(line(e, 'load')[0], 92.0),
    'empty: one LOAD line at the vantage -8%', str(e.lines))
 ok(b.shares == 0, 'above the LOAD nothing is bought')
 
-settle(e, b, 92.0, card=card)
+settle(e, b, 92.0)
 ok(b.shares == 11, 'the LOAD fills one unit', f'{b.shares} sh')
 ok([ev['kind'] for ev in e.events] == ['LOAD'],
    'and writes one row to the log', str(e.events))
@@ -346,14 +352,14 @@ ok(near(chase_p, 92.0 * 0.94, 0.02) and chase_q == 8,
 ok(near(exits(e)[0][0], 92.0 * 1.05, 0.02) and exits(e)[0][1] == 11,
    'and the EXIT is +5% above it, carrying the whole holding')
 
-settle(e, b, chase_p, card=card)
+settle(e, b, chase_p)
 ok(b.shares == 19, 'the chase fills', f'{b.shares} sh @ {b.avg:.2f}')
 ok(near(line(e, 'chase')[0], b.avg * 0.94, 0.02)
    and near(exits(e)[0][0], b.avg * 1.05, 0.02),
    'the average moved, so BOTH lines moved with it — that is the whole '
    'mechanic')
 
-settle(e, b, exits(e)[0][0], card=card)
+settle(e, b, exits(e)[0][0])
 ok(b.shares == 0, 'the EXIT empties the position')
 ok(e.state == 'FLAT' and e.events == [],
    'the log is cleared and the stock is empty again, exactly as the v^ '
@@ -362,12 +368,12 @@ ok(line(e, 'load')[0] is not None,
    'and it is back on the LOAD rule, not the chase rule')
 
 print('— selling out stands the bot down —')
-e, b, card = fresh(gear=3)
-settle(e, b, 92.0, card=card)
+e, b = fresh(gear=3)
+settle(e, b, 92.0)
 target = exits(e)[0][0]
 acts = []
 for _ in range(4):                      # settle(), but keeping every action
-    out = list(e.poll(snap(b, target, card=card)))
+    out = list(e.poll(snap(b, target)))
     acts += out
     for a in out:
         if a[0] == 'place':
@@ -381,76 +387,76 @@ ok(any(a[0] == 'stand_down' for a in acts),
    str([a[0] for a in acts]))
 
 print('— the other side cancels the pending order —')
-e, b, card = fresh(gear=3)
-settle(e, b, 92.0, card=card)
+e, b = fresh(gear=3)
+settle(e, b, 92.0)
 chase_p = line(e, 'chase')[0]
 exit_p = exits(e)[0][0]
-e.poll(snap(b, chase_p, card=card))
+e.poll(snap(b, chase_p))
 b.place('BUY', chase_p, 8)
-acts = e.poll(snap(b, exit_p, card=card))
+acts = e.poll(snap(b, exit_p))
 ok(any(a[0] == 'cancel' for a in acts),
    'the resting BUY is cancelled when the price reaches the sell side',
    str(acts))
 for a in acts:
     if a[0] == 'cancel':
         b.cancel(a[1])
-acts = e.poll(snap(b, exit_p, card=card))
+acts = e.poll(snap(b, exit_p))
 ok(any(a[0] == 'place' and a[1] == 'SELL' for a in acts),
    'and the SELL goes out on the next poll', str(acts))
 
 print('— a resting order is left alone, or re-priced —')
-e, b, card = fresh(gear=3)
-e.poll(snap(b, 92.0, card=card))
+e, b = fresh(gear=3)
+e.poll(snap(b, 92.0))
 b.place('BUY', 92.0, 11)
-acts = e.poll(snap(b, 92.0, card=card))
+acts = e.poll(snap(b, 92.0))
 ok(not [a for a in acts if a[0] == 'place'],
    'an order already resting on the right line is left to work')
-card5 = {'gear': 5, 'exit_tiers': [False, True, False]}
-acts = e.poll(snap(b, 90.0, card=card5))
+e.set_gear(5)                    # G5 drops the LOAD from -8% to -10%
+acts = e.poll(snap(b, 90.0))
 ok(any(a[0] == 'cancel' for a in acts),
    'a gear change moves the line, so the stale order is pulled', str(acts))
 
 print('— external trading needs no special case —')
-e, b, card = fresh(gear=3)
+e, b = fresh(gear=3)
 b.external_buy(90.0, 20)
-settle(e, b, 91.0, card=card)
+settle(e, b, 91.0)
 ok(e.state == 'DEPLOYED',
    'a hand buy makes the stock deployed — the broker is the authority')
 ok(near(line(e, 'chase')[0], 90.0 * 0.94, 0.02),
    'and the lines are simply drawn from the new average')
 
 b.external_buy(80.0, 10)
-settle(e, b, 86.0, card=card)
+settle(e, b, 86.0)
 ok(near(line(e, 'chase')[0], b.avg * 0.94, 0.02)
    and near(exits(e)[0][0], b.avg * 1.05, 0.02),
    'a second hand buy moves the average again, and the lines follow')
 
 b.external_sell(95.0, b.shares)
-settle(e, b, 99.0, card=card)
+settle(e, b, 99.0)
 ok(e.state == 'FLAT' and e.events == [],
    'a hand sell-out empties the stock and clears the log')
 ok(line(e, 'load')[0] is not None,
    'and it goes straight back to the LOAD rule')
 
 print('— a stale saved log is dropped on arming —')
-e, b, card = fresh(gear=3)
-settle(e, b, 92.0, card=card)
+e, b = fresh(gear=3)
+settle(e, b, 92.0)
 saved = e.to_dict()
 ok(saved['events'], 'the log is saved while the position is held')
 b2 = FakeBroker(0, 0.0, AMPLE_CASH)
 e2 = CampaignEngine(T, trading_date=D1, saved=saved)
-settle(e2, b2, 99.0, card=card)
+settle(e2, b2, 99.0)
 ok(e2.events == [] and e2.state == 'FLAT',
    'a saved log the broker no longer backs is dropped, not carried forward',
    str(e2.events))
 
 print('— the tiered exit —')
-e, b, card = fresh(gear=3, tiers=(1, 1, 1))
-settle(e, b, 92.0, card=card)
+e, b = fresh(gear=3, tiers=(1, 1, 1))
+settle(e, b, 92.0)
 ok([q for _p, q in exits(e)] == [4, 4, 3],
    '11 shares split across three tiers, the middle taking the remainder',
    str(exits(e)))
-settle(e, b, exits(e)[0][0], card=card)
+settle(e, b, exits(e)[0][0])
 ok(b.shares == 7, 'T1 takes its portion and the rest is still held',
    f'{b.shares} sh')
 ok(e.state == 'DEPLOYED', 'the campaign is not over — only a portion left')
@@ -459,27 +465,27 @@ ok(len(exits(e)) == 2 and [q for _p, q in exits(e)] == [4, 3],
 ok(line(e, 'chase')[0] is not None,
    'and the CHASE is still live, so a dip after a partial exit can be bought')
 
-settle(e, b, line(e, 'chase')[0], card=card)
+settle(e, b, line(e, 'chase')[0])
 ok(b.shares > 7 and len(exits(e)) == 3,
    'buying more re-arms every tier on the bigger holding', str(exits(e)))
 
 print('— the army is the only wall —')
-e, b, card = fresh(gear=3, cash=500.0)
-settle(e, b, 92.0, card=card)
+e, b = fresh(gear=3, cash=500.0)
+settle(e, b, 92.0)
 ok(b.shares == 0 and e.buy_state == 'EXHAUSTED',
    'no cash, no order — and the state says why')
 
 print('— WATCH draws but never sends —')
-e, b, card = fresh(gear=3)
-placed = settle(e, b, 92.0, card=card, can_trade=False)
+e, b = fresh(gear=3)
+placed = settle(e, b, 92.0, can_trade=False)
 ok(not placed and b.shares == 0, 'WATCH sends nothing')
 ok(e.crossed['BUY'] and 'not sent' in e.status,
    'but the crossed line is reported, and the status says plainly why',
    e.status)
 
 print('— KR tick trimming —')
-e, b, card = fresh(ticker=KR, gear=3)
-placed = settle(e, b, 64_400.0, high5=70_000.0, unit=1_000_000.0, card=card)
+e, b = fresh(ticker=KR, gear=3)
+placed = settle(e, b, 64_400.0, high5=70_000.0, unit=1_000_000.0)
 ok(placed and all(p % 100 == 0 for _s, p, _q in placed),
    'KR limit prices snap to the tick grid', str(placed))
 ok(all(p <= 70_000.0 * 0.92 for _s, p, _q in placed),
@@ -488,44 +494,65 @@ ok(all(p <= 70_000.0 * 0.92 for _s, p, _q in placed),
 print('— the vantage window is FIVE sessions —')
 FIVE = [('2026-07-27', 120.0), ('2026-07-28', 104.0), ('2026-07-29', 103.0),
         ('2026-07-30', 102.0), ('2026-07-31', 101.0)]
-e, b, card = fresh(gear=3)
-settle(e, b, 115.0, date='2026-08-01', card=card, highs=FIVE)
+e, b = fresh(gear=3)
+settle(e, b, 115.0, date='2026-08-01', highs=FIVE)
 ok(near(e.vantage, 120.0),
    'with no bar for today the window is the last FIVE completed sessions, '
    "so 07/27's peak still counts", str(e.vantage))
-e2, b2, card2 = fresh(gear=3)
-settle(e2, b2, 99.0, date='2026-08-03', card=card2,
+e2, b2 = fresh(gear=3)
+settle(e2, b2, 99.0, date='2026-08-03',
        highs=FIVE + [('2026-08-03', 106.0)])
 ok(near(e2.vantage, 106.0),
    'with a live bar it is four completed + today, and the live high leads',
    str(e2.vantage))
 
 print('— the vantage can be pinned by hand —')
-e, b, card = fresh(gear=3)
-settle(e, b, 99.0, card=card, highs=[(D1, 100.0)])
+e, b = fresh(gear=3)
+settle(e, b, 99.0, highs=[(D1, 100.0)])
 ok(near(e.vantage, 100.0), 'it starts on the rolling high')
 ok(e.set_manual_vantage(140.0, '07/18 high'), 'a picked day pins it')
-settle(e, b, 135.0, date=D2, card=card, highs=[(D2, 100.0)])
+settle(e, b, 135.0, date=D2, highs=[(D2, 100.0)])
 ok(near(e.vantage, 140.0) and e.vantage_src == 'manual',
    'and it survives the day roll', f'{e.vantage} {e.vantage_src}')
 e.clear_manual_vantage()
-settle(e, b, 99.0, date=D2, card=card, highs=[(D2, 100.0)])
+settle(e, b, 99.0, date=D2, highs=[(D2, 100.0)])
 ok(near(e.vantage, 100.0), 'releasing hands it back to the rolling high')
 
 print('— persistence stays tiny —')
-e, b, card = fresh(gear=4)
-settle(e, b, 91.0, card=card)
+e, b = fresh(gear=4)
+settle(e, b, 91.0)
 saved = e.to_dict()
 ok(saved['strategy'] == 'V_COMMANDOS_GEARBOX',
    'the saved record names its strategy')
 ok(set(saved) - {'strategy', 'q', 'saved_at'} == {
-       'gear', 'exit_tiers', 'tier_done', 'vantage', 'vantage_manual',
+       'gear', 'auto', 'exit_tiers', 'tier_done', 'vantage', 'vantage_manual',
        'vantage_manual_label', 'trading_date', 'events'},
    'and carries only the handful of fields that cannot be re-read from the '
    'broker', str(sorted(saved)))
 e2 = CampaignEngine(T, trading_date=D1, saved=saved)
-settle(e2, b, 91.0, card=card)
+settle(e2, b, 91.0)
 ok(e2.gear == 4 and len(e2.events) == len(e.events),
    'a restart resumes on the same gear with the same log')
+ok(e2.auto is False and e2.exit_tiers == [False, True, False],
+   'the bot remembers its OWN gear settings — there is no card to read them '
+   'back from', f'auto={e2.auto} tiers={e2.exit_tiers}')
+
+print('— the bot keeps its own settings; a card only visits on request —')
+e, b = fresh(gear=2, tiers=(0, 1, 0))
+e.set_auto(True)
+e.apply_card_config({'gear': 5, 'exit_tiers': [True, False, True],
+                     'auto': False})
+ok(e.gear == 5 and e.auto is False and e.exit_tiers == [True, False, True],
+   'the sync button copies the card gear, tiers and AUTO flag across')
+e.apply_card_config(None)
+ok(e.gear == 5, 'and nothing at all changes nothing')
+e.set_gear(3)
+e.poll(snap(b, 95.0, vol5=40.0))
+ok(e.gear == 3,
+   'a hand-picked gear ignores V — picking one is a decision, not a hint')
+e.set_auto(True)
+e.poll(snap(b, 95.0, vol5=40.0))
+ok(e.gear == 5, 'while AUTO, the bot reads V itself: 40% → G5',
+   f'gear={e.gear}')
 
 print(f'\nALL {passed} CHECKS PASSED')

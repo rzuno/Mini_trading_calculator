@@ -1,17 +1,23 @@
-# Gearbox V-Commandos Autopilot Manual
+# Gearbox AUTOPILOT Manual
 
 **Version:** 0.1.1 — reconciled operational baseline
-**Strategy ID:** `V_COMMANDOS_GEARBOX`
+**Internal strategy ID:** `V_COMMANDOS_GEARBOX` (retained for compatibility)
 **Subtitle:** Fixed-Gear V-Campaign Trading System
-**Status:** Strategy-origin specification, reconciled with the current mixed manual/LIVE safety contract. The current as-built UI and implementation record is `Gearbox V-Commandos Autopilot Manual.md`.
+**Status:** Strategy-origin specification, reconciled with the current mixed manual/LIVE safety contract. The current as-built UI and implementation record is [Gearbox AUTOPILOT Manual](Gearbox%20V-Commandos%20Autopilot%20Manual.md).
 
-> **Operational precedence.** Broker quantity and average cost decide whether a campaign exists. Held shares are continued from broker truth. Zero shares plus a verified completed full SELL today arms the −3% reload from the actual fill. Zero shares without that evidence resets to Dynamic High5; no fill price is guessed. Card/app trading and LIVE automation use the same Gear, selected exit tiers, Vantage, and broker position. Opening a window records nothing.
+> **Operational precedence (2026-08-02).** Normal polling reads price, broker shares/average, OPEN orders, and buying power. Each observed share-quantity delta is accepted once with the current broker average. External, offline, mixed, or unknown full sells reset EMPTY/Dynamic High5 without reload; only an immediate proven bot full sell with its actual execution price may arm the −3% reload. Hand trading and LIVE automation share the broker position, not the settings: the autopilot keeps its own Gear, AUTO flag and exit tiers, and the card grid is a worksheet whose gear reaches the bot only through the card's `sync to autopilot` button. Opening a window records nothing.
+
+## Version History
+
+- **2026-08-02 — card/cockpit detachment:** the autopilot keeps its own Gear, AUTO flag and exit tiers, saved with its campaign; the cockpit writes to the engine and never to a card; the poll thread touches only the AUTOPILOT button's colour; the card's `sync to autopilot` button is the one crossing, and only when pressed. The card regained its big gear number and plain check-box exit tiers.
+- **2026-08-02 — reconciliation contract:** user-facing EMPTY/DEPLOYED and AUTOPILOT; DEPLOYED cards first by descending position gap in red/blue, EMPTY cards second by ascending LOAD gap in purple below LOAD/orange above; only the selected cockpit Gear colored; inline modeless LIVE confirmation; no manual-modification banner; four-input normal polling; each observed delta accepted once with no history rewrite or net-zero reconstruction; bot-only immediate full-sell reload; immediate no-pending WATCH close; automatic reserve-line reactivation.
+- **0.1.1 — historical baseline:** original fixed-Gear campaign specification. Legacy `FLAT` and `V_COMMANDOS_GEARBOX` wording below is retained only where explicitly identified as internal or historical.
 
 ---
 
 ## 1. Purpose
 
-Gearbox V-Commandos Autopilot is a campaign-based trading system designed to:
+Gearbox AUTOPILOT is a campaign-based trading system designed to:
 
 ```text
 wait for a meaningful pullback,
@@ -60,10 +66,10 @@ The bot does not need perfect knowledge of every historical Step to continue saf
 
 ## 3. Relationship to Other Strategy Modes
 
-The daily bidirectional grid remains a recoverable historical strategy, but it does not run alongside Gearbox V-Commandos in the current app.
+The daily bidirectional grid remains a recoverable historical strategy, but it does not run alongside Gearbox AUTOPILOT in the current app.
 
 ```text
-V_COMMANDOS_GEARBOX
+V_COMMANDOS_GEARBOX (internal identifier)
     Campaign-based
     BUY low → chase average → full SELL
     Designed for one V cycle
@@ -88,12 +94,12 @@ The broker/account concepts may be shared, but two engines must not trace or man
 A campaign begins when LOAD fills and ends only when actual broker holdings become zero.
 
 ```text
-FLAT
+EMPTY
 → ARMED
 → LOAD
 → CHASE as needed
 → full EXIT
-→ FLAT
+→ EMPTY
 ```
 
 ### 4.2 One Clean Exit by Default; Optional Tiered Exit
@@ -235,7 +241,7 @@ two/three    each selected tier has its own exit price
              actual shares are divided across the selected tiers
 ```
 
-Tier and Gear selections apply directly and may change while WATCH or LIVE is calculating. They are saved preferences, not trades, and do not write campaign-fill rows. Entering LIVE is the confirmation boundary.
+Tier and Gear selections apply directly and may change while WATCH or LIVE is calculating. They are saved preferences, not trades, and do not write campaign-fill rows. Entering LIVE uses an inline, modeless confirmation inside the cockpit.
 
 ---
 
@@ -251,7 +257,7 @@ order is not fundable   → keep the line visible, disable that buy,
                           and continue watching selected SELL lines
 ```
 
-Funding is checked again every poll, so a buy can become available when another campaign returns cash. The normalized 32-unit tables are reference comparisons, not an enforced ceiling.
+Funding is checked again every poll. An unfundable line stays visible in grey; as soon as a fresh snapshot shows enough buying power, the reserve becomes fundable and the line automatically returns to its armed color and behavior. The normalized 32-unit tables are reference comparisons, not an enforced ceiling.
 
 ### 8.2 Concurrency Is Commander's Discipline
 
@@ -263,7 +269,7 @@ The manual must not claim that maximum chase count, campaign caps, pre-funding, 
 
 ## 9. Vantage Point and LOAD
 
-### 9.1 Standard Flat-State Vantage
+### 9.1 Standard EMPTY-State Vantage
 
 Default:
 
@@ -272,7 +278,7 @@ watch_vantage = max(previous four completed-session highs,
                     current-session high so far)
 ```
 
-While FLAT, the bot updates this Dynamic High5. A candle high may be pinned explicitly while FLAT; the UI labels the state `Pinned` and offers `Return to Dynamic High5`. Pinning is not available while shares are deployed.
+While EMPTY, the bot updates this Dynamic High5. A candle high may be pinned explicitly while EMPTY; the UI labels the state `Pinned` and offers `Return to Dynamic High5`. Pinning is not available while shares are deployed.
 
 At LOAD fill:
 
@@ -292,18 +298,18 @@ load_size ≈ 1 unit
 
 ### 9.3 Same-Day Reload
 
-After a successful full EXIT:
+After an immediate, proven bot full EXIT with an actual execution price:
 
 ```text
 reload_anchor = actual final sell fill
 same_day_reload_price = reload_anchor × 0.97
 ```
 
-This is a special fast-reload rule and does not use the normal Gear LOAD drop.
+This is a special fast-reload rule and does not use the normal Gear LOAD drop. An external, offline, mixed, or unknown full sell resets EMPTY/Dynamic High5 and never enters this reload path.
 
 If the reload fills, a new campaign begins using the currently selected Gear and Exit Tier.
 
-If it does not fill by the end of the session, the order expires or is cancelled according to broker capability. The next trading day returns to the normal flat-state Vantage process.
+If it does not fill by the end of the session, the order expires or is cancelled according to broker capability. The next trading day returns to the normal EMPTY-state Vantage process.
 
 ---
 
@@ -378,15 +384,16 @@ The fixed-Gear architecture supports mixed app/bot operation better than the leg
 
 ### 12.1 Broker Data Is the Source of Truth
 
-At startup or resume, read:
+Each normal poll reads:
 
 ```text
-actual holdings
-actual average cost
+current price
+actual broker shares and average cost
+OPEN orders
 actual buying power
-open orders
-recent fills when available
 ```
+
+Normal polling does not query CLOSED history. Each newly observed share-quantity delta is accepted and logged exactly once with the current broker average. Immediate exact evidence for the current bot order may classify that observation and supply an actual execution price; delayed history never rewrites it, and the bot never reconstructs hidden or net-zero activity. One initial six-bar candle window supplies both completed-session Vantage metadata and the chart, including today's earlier high; later candle maintenance runs at five-minute boundaries, and failed/empty maintenance retries at most once per minute.
 
 ### 12.2 ADOPT_POSITION
 
@@ -414,7 +421,6 @@ If detected:
 ```text
 refresh broker state
 recalculate lines from the remaining position
-flag campaign as MANUALLY_MODIFIED
 record every definite quantity change; show an unavailable price as --
 ```
 
@@ -425,14 +431,14 @@ If broker holdings become zero:
 ```text
 cancel only bot-owned remaining orders
 
-if a completed full SELL fill from today is verified:
+if this bot's current full SELL is proven immediately with an actual price:
     complete and record the campaign at the actual fill
     arm same-day reload at actual fill × 0.97
 
-otherwise:
+if the full SELL is external, offline, mixed, or unknown:
     clear stale campaign assumptions
     do not guess a fill or reload anchor
-    resume Dynamic High5
+    reset EMPTY with Dynamic High5
 ```
 
 ### 12.6 Order Ownership
@@ -444,13 +450,15 @@ broker_order_id
 client_order_id or strategy tag, when supported
 ```
 
-A strategy-prefixed client id is atomically persisted and flushed before transmission; a failed persistence write sends no order. Definite rejection clears it; a timeout, server failure, or success response without an order id remains an outcome-ambiguous pending intent and is retried only with that same client id. Exact order detail is checked on every poll, including polls where holdings do not move. Client-id-only shutdown recovery also reuses that identity, and a recovered working order is cancelled before cleanup can finish. If no broker order id is recoverable, only the shutdown path may retire the identity: its 10-minute idempotency window must expire, three successful exhaustive OPEN reads must show no working order, and the retired state must save successfully.
+A strategy-prefixed client id is atomically persisted and flushed before transmission; a failed persistence write sends no order. Definite rejection clears it; a timeout, server failure, or success response without an order id remains an outcome-ambiguous pending intent and is retried only with that same client id. Exact order detail is checked for that known order identity; a recovered working order is cancelled before cleanup can finish.
 
 The bot must never cancel an order solely because it looks similar to its own order. Any foreign app/web order pauses bot placement for that ticker until it clears. A stale bot-owned order is replaced only after cancellation is confirmed; partial fills are reconciled first.
 
-If holdings move while a bot order remains unresolved, exact order detail is retried before the holdings watermark advances. In one interval containing both bot and manual fills, only broker-proven bot quantity is attributed to BOT and the residual delta is marked MIXED. After bounded evidence failure, the real quantity is accepted on a non-trading reconciliation poll and its source is marked UNKNOWN, but the accepted intent remains guarded; delayed exact detail repairs the row in place. Missing from OPEN is not proof of cancellation. Only exact terminal detail releases the identity for replacement, and no fill or reload price is guessed.
+If holdings move while a bot order remains unresolved, the new broker shares/average is accepted once. Immediate exact evidence attributes the proven matching quantity to BOT; a residual delta is MIXED, and unavailable ownership evidence remains UNKNOWN. Missing from OPEN is not proof of cancellation; exact WORKING detail still supplies the stable identity for a safe cancellation. An accepted identity is never overwritten, and even exact FILLED detail remains guarded until **proven bot quantity** reaches broker holdings. UNKNOWN/external/MIXED movement is tracked separately and never grants replacement permission; an inseparable overlap remains paused and cannot arm reload. Repeated identical working acknowledgements are no-ops that do not rewrite durable state. No fill or reload price is guessed.
 
-CLOSED evidence is scanned through a bounded overlapping time window and deduplicated. All cursor pages must complete before the interval is considered complete; a later-page failure, malformed cursor, or `closed-not-supported` result is never replayed as a partial set. Exact known-order detail remains independently usable. A complete set whose gross executions exactly reconciles the holding may record opposing bot/manual fills or a net-zero round trip. Stale same-side history outside the transition window is never reused as the current execution or reload anchor.
+The final LIVE/slot check, durable client-id binding, and state flush are atomic with respect to mode change and close. Closing before that gate prevents transmission; closing after it retains the cleanup slot for the accepted identity.
+
+Closing WATCH with no bot-owned pending or ambiguously submitted order stops immediately. Cleanup remains active only when such an order actually needs cancellation or resolution, and reopening the cockpit is never blocked by cleanup that has nothing to clean.
 
 Toss does not expose dormant app-side conditional/reserved orders in the OPEN-order feed before they trigger. Such an invisible instruction must not be armed on the same ticker while autopilot is LIVE. Once an app/web order is visible as OPEN, the bot safely pauses the whole ticker and never cancels that foreign order.
 
@@ -462,7 +470,7 @@ Toss does not expose dormant app-side conditional/reserved orders in the OPEN-or
 OFF
     no order actions
 
-FLAT
+EMPTY (internal state key: `FLAT`)
     no shares
     calculate Vantage and Gear recommendation
 
@@ -553,7 +561,7 @@ Vantage pin/reset
 WATCH/LIVE selection
 ```
 
-These may appear in the diagnostic application log but never in the cockpit's campaign fill list. Reopening a window must not append “N shares deployed.” The empty list is accompanied by current FLAT/DEPLOYED status so it does not conceal the real position.
+These may appear in the diagnostic application log but never in the cockpit's campaign fill list. Reopening a window must not append “N shares deployed.” The empty list is accompanied by current EMPTY/DEPLOYED status so it does not conceal the real position. No `MANUALLY_MODIFIED` banner is shown.
 
 ### 14.4 Completion Metrics
 
@@ -579,11 +587,11 @@ return_on_max_capital
 
 The cockpit shows the live stream chart and the 5-day candle chart by default; there is no separate 5-day chart button. Both show the same active BUY, average, selected SELL, projection, and Vantage lines used by the card and engine.
 
-While FLAT, the candle panel explicitly invites selection of a candle HIGH as a pinned Vantage and highlights the chosen candle/OHLC row. The state says `Dynamic High5`, `Pinned`, `Reload`, or `Campaign`; `Vantage` is written in full instead of `V.P.`. A pinned state alone exposes `Return to Dynamic High5`. Pinning is disabled while deployed.
+While EMPTY, the candle panel explicitly invites selection of a candle HIGH as a pinned Vantage and highlights the chosen candle/OHLC row. The state says `Dynamic High5`, `Pinned`, `Reload`, or `Campaign`; `Vantage` is written in full instead of `V.P.`. A pinned state alone exposes `Return to Dynamic High5`. Pinning is disabled while deployed.
 
-Gear buttons use G1 red, G2 orange, G3 yellow, G4 green, and G5 blue. Exit-tier buttons distinguish armed, unarmed, and spent states. Five-day OHLC text follows the historical convention: red for a rising or unchanged candle and blue for a falling candle. Long BUY/SELL annotations reserve or clamp to a label area so their quantity and WATCH/pseudo suffix are not clipped.
+Only the selected Gear button uses its identity color — G1 red, G2 orange, G3 yellow, G4 green, or G5 blue — while the other four stay neutral grey. Exit-tier buttons distinguish armed, unarmed, and spent states. Five-day OHLC text follows the historical convention: red for a rising or unchanged candle and blue for a falling candle. Long BUY/SELL annotations reserve or clamp to a label area so their quantity and WATCH/pseudo suffix are not clipped.
 
-Gear, tier, and Vantage choices apply without routine confirmation dialogs. Entering LIVE remains confirmed. The cockpit has no broad Cancel button; automatic cleanup touches only bot-owned orders. An unfundable buy remains visible and muted on the graph while sell watching continues, and the status banner selects one highest-priority condition rather than displaying contradictory messages.
+Gear, tier, and Vantage choices apply without routine confirmation dialogs. Entering LIVE uses an inline, modeless confirmation. The cockpit has no broad Cancel button; automatic cleanup touches only bot-owned orders. Closing WATCH without a bot order pending stops immediately and cannot block reopening. An unfundable buy remains visible and muted on the graph while sell watching continues; fresh fundable buying power reactivates it automatically. The status banner selects one highest-priority condition rather than displaying contradictory messages.
 
 The current implementation uses the live curve plus the always-visible 5-day panel and day-grouped fills. A future full campaign-spanning chart may add every historical fill, campaign low, and completion marker without changing the trading rules.
 
@@ -662,6 +670,9 @@ The user should be able to select a more conservative Gear when market condition
 11. **Use WATCH and the offline simulator before LIVE.**
 12. **Opening a window or changing a preference is not a campaign fill.**
 13. **Never arm a reload from an estimated or intended sell price.**
+14. **Accept each observed share-quantity delta once with the current broker average; do not rewrite it from delayed history or reconstruct net-zero activity.**
+15. **Only an immediate proven bot full SELL may reload; every external/offline/mixed/unknown full sell resets EMPTY/Dynamic High5.**
+16. **Closing WATCH with no bot order pending stops immediately.**
 
 ---
 
@@ -682,7 +693,7 @@ The same strategy engine calculates both modes. Offline path tests provide deter
 ## 20. Configuration Baseline
 
 ```yaml
-strategy_mode: V_COMMANDOS_GEARBOX
+strategy_mode: V_COMMANDOS_GEARBOX  # internal identifier
 
 ticker: null
 market: null
@@ -889,7 +900,7 @@ Maximum fully funded row under the 32-unit reference limit:
 
 # Part III — Campaign Card
 
-## Gearbox V-Commandos Campaign Card
+## Gearbox AUTOPILOT Campaign Card
 
 ```text
 Ticker:
@@ -926,7 +937,7 @@ Order status:
 Reconciliation status:
 ```
 
-The card is a display and audit surface. While FLAT its gap is `(LOAD − current) / current`; while DEPLOYED it is the raw position move `(current − broker average) / broker average`. Cards sort globally from the larger displayed gap to the smaller. Gap color uses one historical blue family with lightness contrast. The V-COMMANDOS action sits on a separately spaced row below the calculations.
+The card is a display and audit surface. Cards form two stable groups: **DEPLOYED first**, sorted by `(current − broker average) / broker average` descending and colored red/blue by sign; **EMPTY second**, sorted by `(current − LOAD) / LOAD` ascending and colored purple below LOAD or orange above LOAD. The AUTOPILOT action sits on a separately spaced row below the calculations.
 
 The bot must derive its live decisions from broker state and configuration, not from manually maintained card arithmetic.
 
@@ -1010,26 +1021,16 @@ one-battlefield enforcement for Gear 3–5
 
 # Part V — Broker Evidence and Remaining Verification
 
-The execution adapter uses these broker facts:
+The normal poll uses these broker facts:
 
 ```text
-real-time holdings
-actual average cost
+current price and regular-session/High5 data
+real-time shares and actual average cost
+OPEN orders
 buying power
-open orders
-order IDs
-client order IDs or tags
-fill timestamp
-fill quantity
-fill price
-partial-fill status
-order cancellation
-exact order detail for a known order ID
-optional completed-order history
-regular-session close and High5 data
 ```
 
-The bundled Toss contract exposes exact order detail for a known bot order in every lifecycle state. Its CLOSED-list filter may return `400 closed-not-supported`, so arbitrary app-side historical fills are optional evidence rather than an assumption. A real quantity change still enters the campaign log; a missing execution price stays `--` and can never arm a guessed reload.
+For a currently known bot order, exact order detail may additionally provide its identity, terminal state, executed quantity, and actual execution price. CLOSED history is not part of the normal poll. A real share-quantity change enters the campaign log once with the current broker average; a missing execution price stays `--` and can never arm a guessed reload. Delayed history does not rewrite the row or reconstruct hidden/net-zero trades. Accepted order identity remains guarded through **evidence-backed** holdings convergence, so temporary OPEN lag, position lag, or an interleaved app trade cannot trigger a replacement order.
 
 App-side conditional/reserved instructions also remain invisible to OPEN until they trigger. This is why they cannot safely share a ticker with LIVE even though ordinary visible app/web OPEN orders can.
 
@@ -1039,7 +1040,8 @@ The remaining rules are:
 do not infer broker capabilities
 do not cancel unidentified orders
 do not assume manual and bot fills can always be distinguished by price alone
-pause and retry exact evidence before finalizing an ambiguous bot transition
+use immediate exact evidence when available, otherwise accept the broker delta once
+never let external/offline/mixed/unknown full sells arm reload
 ```
 
 ---
@@ -1059,7 +1061,7 @@ pause and retry exact evidence before finalizing an ambiguous bot transition
 # Appendix A — Simplified LOAD Reset and Resume Protocol
 
 **Appendix status:** Operational baseline
-**Applies to:** `V_COMMANDOS_GEARBOX`
+**Applies to internal strategy ID:** `V_COMMANDOS_GEARBOX`
 **Purpose:** Define how the bot restores LOAD behavior after a campaign ends, after manual app trading, or after the bot has been offline.
 
 This appendix deliberately favors a simple and reproducible rule over exact reconstruction of an old campaign’s historical end timestamp.
@@ -1074,7 +1076,7 @@ actual shares > 0
 
 actual shares == 0
     → no campaign is active
-    → reset to FLAT
+    → reset to EMPTY (internal state key: `FLAT`)
 ```
 
 If the bot was offline while the user completed a campaign in the broker app, the bot does not need to reconstruct the exact historical campaign-end date before it can resume normal operation.
@@ -1109,19 +1111,21 @@ calculate the selected EXIT line or lines
 
 Historical Step reconstruction is not required.
 
-### Case 2 — No Shares, and a Full SELL Occurred Today
+### Case 2 — No Shares After an Immediate Proven Bot Full SELL
 
 ```text
 actual_qty == 0
 AND
-a completed SELL for the ticker is detected in the current session
+the currently pending bot SELL is proven FILLED in this reconciliation poll
+AND
+its actual execution price is available
 ```
 
 Action:
 
 ```text
-treat the campaign as completed today
-use the latest actual full-exit sell fill as reload_anchor
+treat the bot campaign as completed now
+use that exact bot execution price as reload_anchor
 arm SAME_DAY_RELOAD at reload_anchor × 0.97
 ```
 
@@ -1139,54 +1143,54 @@ Never both at the same time.
 
 If the reload does not fill before the session ends, it expires. The following trading day returns to normal Dynamic High5 LOAD.
 
-### Case 3 — No Shares, and No Full SELL Occurred Today
+### Case 3 — No Shares Without Immediate Bot Proof
 
 ```text
 actual_qty == 0
 AND
-no qualifying completed SELL is detected today
+the full SELL is external, offline, mixed, unknown, or lacks an actual price
 ```
 
 Action:
 
 ```text
 discard stale active-campaign assumptions
-reset the strategy to FLAT
+reset the strategy to EMPTY
 use the normal Dynamic High5 LOAD process
 ```
 
 The bot does not need to determine whether the previous campaign ended two days ago, five days ago, or earlier.
 
-## A.3 Meaning of “Full SELL Occurred Today”
+## A.3 Meaning of “Immediate Proven Bot Full SELL”
 
 The preferred evidence is:
 
 ```text
 current actual quantity == 0
 +
-the latest completed SELL fill for the ticker occurred today
+the bot already owns the exact pending SELL identity
 +
-that SELL completed the remaining position
+exact terminal detail in the current reconciliation proves it FILLED
++
+the actual execution price is available
 ```
 
-When detailed position-transition reconstruction is available, use it.
-
-When the broker API provides completed SELL fills but not a perfect position replay, a same-day SELL alone is insufficient. The evidence must still identify the transition being reconciled and show enough executed quantity to complete the previously held position. An older same-side fill must not be reused merely because its ticker, side, or trading date matches.
+No historical search is used to qualify reload. A same-day manual, external, offline, mixed, or unknown sell is not enough, even when its completed fill later becomes visible. Each share-quantity delta is accepted once with the current broker average and never rewritten into bot ownership later.
 
 If the sell price cannot be recovered reliably:
 
 ```text
 do not guess
 do not arm an estimated reload
+reset EMPTY
 return to NORMAL_DYNAMIC_HIGH5_LOAD
-or request a manual reload anchor
 ```
 
-Historical full-exit recovery from earlier sessions is optional, not required for the first implementation.
+Historical full-exit recovery is deliberately excluded from automatic reload. The commander may still pin a candle Vantage explicitly.
 
 ## A.4 Dynamic High5 Vantage
 
-When the strategy is FLAT and no same-day reload is active, the bot uses a real-time trailing High5 Vantage.
+When the strategy is EMPTY and no same-day reload is active, the bot uses a real-time trailing High5 Vantage.
 
 ### Completed Sessions
 
@@ -1275,7 +1279,7 @@ new rolling high
 
 ## A.6 Intraday Update Rule
 
-While FLAT:
+While EMPTY:
 
 ```python
 today_high_so_far = max(today_high_so_far, current_price)
@@ -1346,8 +1350,9 @@ The bot does not need to know which historical Step the manual BUY represented.
 ```text
 actual quantity becomes zero
 archive campaign as externally completed
-detect today’s final SELL fill
-arm SAME_DAY_RELOAD at actual sell fill × 0.97
+reset EMPTY
+use current Dynamic High5
+do not arm SAME_DAY_RELOAD
 ```
 
 ### Manual Full SELL While Bot Is Offline
@@ -1355,15 +1360,12 @@ arm SAME_DAY_RELOAD at actual sell fill × 0.97
 On the next startup:
 
 ```text
-if today’s full SELL is visible:
-    arm SAME_DAY_RELOAD
-
-if the SELL occurred on an earlier day:
-    reset to FLAT
-    use current Dynamic High5
+reset to EMPTY
+use current Dynamic High5
+do not search history or arm SAME_DAY_RELOAD
 ```
 
-The bot does not backdate a missed reload and does not submit a historical order retroactively.
+The bot does not backdate a missed reload, rewrite the observed position change, or submit a historical order retroactively. Only an immediately proven bot full SELL from the bot's own pending identity qualifies for reload.
 
 ## A.9 Simplified Campaign Reset
 
@@ -1418,32 +1420,32 @@ bot last ran on Day +7
 user sold all shares on Day +10
 bot restarts on Day +12
 actual quantity == 0
-no full SELL occurred today
+the full SELL was external/offline
 ```
 
 Result:
 
 ```text
-reset to FLAT
+reset to EMPTY
 do not reconstruct Day +10 precisely
 do not use a historical same-day reload
 calculate current Dynamic High5
 arm normal Gear LOAD
 ```
 
-### Example C — Campaign Was Sold Today
+### Example C — Bot Full SELL Is Proven Immediately
 
 ```text
-user sells all shares in the app today
-bot starts later in the same session
+bot submits the campaign's full SELL
+the same reconciliation poll receives exact FILLED detail
 actual quantity == 0
-today’s completed full SELL is visible
+actual bot execution price is available
 ```
 
 Result:
 
 ```text
-reload_anchor = latest actual full SELL fill
+reload_anchor = immediate actual bot full-SELL fill
 arm reload_anchor × 0.97
 ```
 
@@ -1475,22 +1477,25 @@ current-session High or enough live quotes to track it
 previous completed-session High values
 actual holdings
 actual average cost
+OPEN orders
 buying power
 ```
 
 Same-day reload additionally requires:
 
 ```text
-today’s completed SELL fill price
+the current pending order is this bot's full SELL
+immediate exact FILLED detail
+its actual execution price
 ```
 
-Useful but not mandatory for the simplified first implementation:
+Explicitly unnecessary for the current implementation:
 
 ```text
 exact historical campaign-end timestamp
 full replay of old position transitions
-historical external-fill classification
-post-exit partial-session High reconstruction
+delayed historical external-fill reclassification
+net-zero round-trip reconstruction
 ```
 
 ## A.12 Final Decision Tree
@@ -1505,17 +1510,18 @@ START OR RESUME
     │
     └─ actual_qty == 0
            │
-           ├─ qualifying full SELL occurred today
+           ├─ current bot full SELL proven immediately + actual price
            │      └─ SAME_DAY_RELOAD at final sell fill −3%
            │
-           └─ no qualifying full SELL today
-                  └─ FLAT RESET
+           └─ external / offline / mixed / unknown full SELL
+                  └─ EMPTY RESET
                          └─ NORMAL_DYNAMIC_HIGH5_LOAD
 ```
 
 ## A.13 Implementation Rule
 
 > Current broker holdings determine whether a campaign exists.
-> Today’s completed full SELL determines whether same-day reload is available.
+> Only an immediate proven bot full SELL with its actual price enables same-day reload.
+> Every external, offline, mixed, or unknown full sell resets EMPTY/Dynamic High5.
 > Otherwise, normal LOAD is rebuilt from the current rolling Dynamic High5.
-> Exact reconstruction of an older campaign-end timestamp is not required.
+> Accepted observations are never rewritten from delayed history.

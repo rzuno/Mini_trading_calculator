@@ -9,8 +9,18 @@ because every poll did one obvious sequence:
 
 One background thread polls each watched stock every POLL_SECONDS, touching
 ONLY that ticker: price, holdings(symbol), open orders(symbol), buying power.
-The main panel stays refresh-button driven; only the cockpit and the card's
-button colour follow ticks.
+
+**The card grid is not touched by this thread at all.** The cards are a
+worksheet for hand trading: they refresh when Save & Refresh is pressed, and
+otherwise sit still, holding whatever the commander last set. The autopilot
+keeps its own gear and exit tiers, and the only bridge is the card's
+`sync to autopilot` button. The one exception is the card's AUTOPILOT button
+colour, which reports WATCH/LIVE — reading a badge is not the same as
+rewriting the sheet underneath it.
+
+That separation is deliberate: driving Tk widgets from the poll thread on
+every tick is what made the window feel heavy, and it stopped the commander
+from trying a different gear on a card without disturbing what was trading.
 
 Modes per stock:
     WATCH — lines, ticks and fill detection. Nothing is ever sent.
@@ -61,7 +71,6 @@ _TICKS_KEPT = 7200              # ~10h of 5s ticks for the live chart
 _FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one alert
 _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
 _DAILY_RETRY_S = 60             # throttle completed-bars retries
-_REBUILD_MIN_S = 15             # never restructure the card grid faster
 
 # Every order this controller creates carries this clientOrderId prefix, so
 # ownership survives an application restart instead of living only in the set
@@ -216,20 +225,18 @@ class AutopilotController:
             if ticker in self._slots:
                 return True, 'already watching'
             self._slots[ticker] = {
-                'engine': None, 'mode': 'WATCH', 'card': None,
+                'engine': None, 'mode': 'WATCH',
                 'backoff_until': 0.0,
                 'prev_close': None, 'high5': None, 'vol5': None,
                 'bars': [], 'daily_date': None, 'daily_retry_after': 0.0,
                 'ohlc': None, 'ohlc_ts': 0.0, 'ohlc_view': None,
                 'ticks': [], 'my_ids': set(),
-                'deployed': None, 'rebuilt_at': 0.0,
                 'fail_n': 0, 'insuff_warned': False, 'alert': None,
                 'ui': {'ticker': ticker, 'state': 'ARMING',
                        'status': 'arming…', 'mode': 'WATCH', 'lines': {},
                        'price': None, 'phase': market_phase(ticker)},
             }
         self.refresh_units()
-        self._pull_card_config(ticker)      # UI thread: read the card now
         self._log(ticker, 'WATCH started')
         self._ensure_thread()
         self._wake.set()
@@ -274,50 +281,41 @@ class AutopilotController:
         slot = self._slots.get(ticker)
         return dict(slot['ui']) if slot else None
 
-    # ── The card IS the strategy (UI thread) ─────────────────────────────────
+    # ── The bot's own settings (UI thread, from the cockpit) ─────────────────
 
-    def set_card_config(self, ticker, cfg):
-        """The card pushes {'gear','exit_tiers','auto'} on every compute."""
+    def set_gear(self, ticker, gear=None, tiers=None, auto=None):
+        """The cockpit's controls change the BOT's settings. They do not
+        touch the card: the card is the commander's own worksheet, and a gear
+        tried there should not disturb what is trading."""
         slot = self._slots.get(ticker)
-        if slot is None or not cfg:
-            return
-        with self._lock:
-            slot['card'] = dict(cfg)
+        engine = slot and slot.get('engine')
+        if engine is None:
+            return False, 'still arming — try again in a moment'
+        if tiers is not None:
+            engine.set_tiers(tiers)
+        if auto is not None:
+            engine.set_auto(auto)
+        if gear is not None:
+            engine.set_gear(gear)
+        self._persist(ticker, engine)
+        self._wake.set()
+        return True, 'updated'
 
-    def _pull_card_config(self, ticker):
-        row = self._find_row(ticker)
-        if row is not None and hasattr(row, 'line_config'):
-            try:
-                self.set_card_config(ticker, row.line_config())
-            except Exception:
-                pass
+    def sync_from_card(self, ticker, cfg):
+        """The card's `sync to autopilot` button — the ONE place a card
+        setting reaches the bot, and only because it was asked for."""
+        slot = self._slots.get(ticker)
+        engine = slot and slot.get('engine')
+        if engine is None:
+            return False, 'the autopilot is not watching this stock'
+        engine.apply_card_config(cfg)
+        self._persist(ticker, engine)
+        self._wake.set()
+        return True, 'the autopilot now uses the card settings'
 
-    def set_card_gear(self, ticker, gear=None, tiers=None, auto=None):
-        """The cockpit's gear/tier controls write to the CARD — the single
-        source of truth — and the change is read straight back, so the very
-        next poll uses it. Picking a gear is a manual choice, so it also drops
-        AUTO; `auto` on its own just toggles the mode."""
-        def apply():
-            row = self._find_row(ticker)
-            if row is None:
-                return
-            try:
-                if auto is not None:
-                    row.auto_var.set(bool(auto))
-                if gear is not None:
-                    row.auto_var.set(False)
-                    row.gear_var.set(clamp_gear(gear))
-                if tiers is not None:
-                    for var, on in zip(row.tier_vars, tiers):
-                        var.set(bool(on))
-            except (tk.TclError, AttributeError):
-                return
-            self._pull_card_config(ticker)
-            self._wake.set()
-        try:
-            self.root.after(0, apply)
-        except (RuntimeError, tk.TclError):
-            pass
+    def _persist(self, ticker, engine):
+        if getattr(engine, 'dirty', False) and self._save_state(ticker, engine):
+            engine.dirty = False
 
     def set_vantage(self, ticker, price=None, label=''):
         """Pin the LOAD's vantage to a day picked off the 5-day chart, or
@@ -328,9 +326,8 @@ class AutopilotController:
             return False, 'still arming — try again in a moment'
         ok = (engine.set_manual_vantage(price, label) if price
               else engine.clear_manual_vantage())
-        if ok and getattr(engine, 'dirty', False):
-            if self._save_state(ticker, engine):
-                engine.dirty = False
+        if ok:
+            self._persist(ticker, engine)
         self._wake.set()
         return ok, ('vantage pinned' if price else 'vantage released')
 
@@ -391,9 +388,9 @@ class AutopilotController:
             'unsubscribe': lambda fn: self.unsubscribe(ticker, fn),
             'cancel_all': lambda: self.cancel_all(ticker),
             'ohlc': lambda: self._ohlc_for(ticker),
-            'set_gear': lambda g: self.set_card_gear(ticker, gear=g),
-            'set_tiers': lambda t: self.set_card_gear(ticker, tiers=t),
-            'set_auto': lambda a: self.set_card_gear(ticker, auto=a),
+            'set_gear': lambda g: self.set_gear(ticker, gear=g),
+            'set_tiers': lambda t: self.set_gear(ticker, tiers=t),
+            'set_auto': lambda a: self.set_gear(ticker, auto=a),
             'set_vantage': lambda p, l='': self.set_vantage(ticker, p, l),
         }
 
@@ -417,73 +414,13 @@ class AutopilotController:
         if row is not None:
             row.set_autopilot(badge_key)
 
-    def _sync_card(self, ticker, slot, ui):
-        """Put broker truth on the card, then read its controls back.
-
-        Runs on the Tk thread only. Quantity and average are copied straight
-        in. When the position crosses between empty and deployed the card's
-        whole structure is wrong — it would show a chase ladder for a stock
-        that is flat — so the grid is rebuilt, throttled, because rebuilding
-        while the commander is typing is its own kind of rude."""
-        row = self._find_row(ticker)
-        if row is None:
-            return
-        # Feed the card the same V the cockpit shows, so an AUTO card
-        # reselects its gear on this poll rather than waiting for the next
-        # Save & Refresh. The card owns that rule; the controller only
-        # supplies the number.
-        if ui.get('price') or ui.get('vol5') is not None:
-            row.update_live(price=ui.get('price'), volatility=ui.get('vol5'))
-
-        shares, avg = ui.get('shares'), ui.get('avg_cost')
-        if shares is not None:
-            deployed = bool(shares) and bool(avg)
-            if slot.get('deployed') is not None and deployed != row.deployed:
-                now = time.time()
-                if now - slot.get('rebuilt_at', 0.0) >= _REBUILD_MIN_S:
-                    slot['rebuilt_at'] = now
-                    slot['deployed'] = deployed
-                    self._restructure(ticker, shares, avg, deployed)
-                    return
-            slot['deployed'] = deployed
-            try:
-                row.shares_var.set(str(int(shares)) if shares else '')
-                row.avg_cost_var.set(row._fmt_init(avg))
-            except (tk.TclError, AttributeError, ValueError):
-                pass
-        try:
-            row.compute()
-            if hasattr(row, 'line_config'):
-                self.set_card_config(ticker, row.line_config())
-        except Exception:
-            pass
-
-    def _restructure(self, ticker, shares, avg, deployed):
-        """The stock crossed between empty and deployed — rebuild the grid so
-        its card shows the right ladder."""
-        for pos in self.app.positions:
-            if pos['ticker'] == ticker:
-                pos['shares'] = int(shares)
-                pos['avg_cost'] = float(avg or 0)
-                pos['cost_basis'] = pos['shares'] * pos['avg_cost']
-                pos['is_deployed'] = deployed
-                break
-        self._log(ticker,
-                  f'card restructured: now '
-                  f'{"deployed" if deployed else "empty"}')
-        try:
-            self.app._rebuild_sections()
-            self.app._reapply()
-        except Exception as e:
-            self._log(ticker, f'card rebuild failed: {e}')
-
     def on_rows_rebuilt(self):
-        """Cards are recreated on every refresh — re-apply badges and units,
-        and re-read the new cards' gear configs."""
+        """Cards are recreated on every Save & Refresh — re-apply the badge
+        colours and the cached units. Nothing else: the new cards carry the
+        commander's own settings, which are none of the bot's business."""
         self.refresh_units()
         for ticker, slot in list(self._slots.items()):
             self._apply_row_badge(ticker, slot['ui'].get('mode', 'WATCH'))
-            self._pull_card_config(ticker)
 
     # ── Poll thread ──────────────────────────────────────────────────────────
 
@@ -672,7 +609,7 @@ class AutopilotController:
         snap['prev_close'], _high5 = self._daily_vantage(prov, ticker, slot)
         snap['can_trade'] = (slot['mode'] == 'LIVE')
         snap['phase'] = market_phase(ticker)
-        snap['card'] = dict(slot['card']) if slot['card'] else None
+        snap['vol5'] = slot.get('vol5')
         self._refresh_ohlc(prov, ticker, slot, snap)
         snap['highs'] = self._session_highs(slot, snap)
 
@@ -804,7 +741,7 @@ class AutopilotController:
             'vol5': slot.get('vol5'),
             'alert': slot.get('alert'),
             'bars': list(slot.get('ohlc_view') or slot.get('bars') or []),
-            'card_auto': bool((slot.get('card') or {}).get('auto', True)),
+            'auto': bool(getattr(engine, 'auto', True)),
             'mode': slot['mode'],
             'badge_key': badge_key,
             'phase': market_phase(ticker),
@@ -820,10 +757,12 @@ class AutopilotController:
         slot['ui'] = ui
 
         def apply():
+            # The ONLY thing the poll thread touches on the main window is the
+            # card's autopilot badge colour. The cards themselves are left
+            # alone; they are refreshed by Save & Refresh, not by ticks.
             if self._slots.get(ticker) is not slot:
                 return
             self._apply_row_badge(ticker, badge_key)
-            self._sync_card(ticker, slot, ui)
             self._notify(ticker, ui)
         try:
             self.root.after(0, apply)

@@ -1,10 +1,10 @@
 # AI Seesaw Mini-Calculator
-## Project Manual v0.9
+## Project Manual v1.0
 
 **Sister project of:** AI Seesaw Trading (main program)
 **Goal:** Single-window, reactive calculator, bookkeeper, and autopilot cockpit for an AI-sector portfolio.
 **Strategy:** Gearbox AUTOPILOT campaigns — see [Gearbox AUTOPILOT Manual](Gearbox%20V-Commandos%20Autopilot%20Manual.md) for the full specification. This manual covers the app around it.
-**Automation level:** The commander picks the battlefield and the gear; the bot sends the order itself when the curve touches a line. Every card can also be traded by hand in the broker app using the same numbers — the bot reconciles those trades into the same campaign.
+**Automation level:** The commander picks the battlefield and the gear; the bot sends the order itself when the curve touches a line. Every card can also be traded by hand in the broker app — the bot reconciles those trades into the same campaign, because the broker position is the one thing they share.
 **Interface:** Single tkinter window with a scrollable card grid, plus a per-stock autopilot cockpit window.
 
 ---
@@ -18,7 +18,7 @@ The Mini-Calculator is a **field tool**, not a command center. It reads the posi
 3. Where does the position come out (one-shot EXIT by default, or optional tiers)?
 4. Is the FX rate far enough from its 3-month average to switch some won/dollar?
 
-**The card and the bot are one system.** Whatever a card shows is exactly what the autopilot watches: the card pushes `{gear, exit_tiers, auto}` to the engine on every recompute. The same numbers can be entered in the broker app by hand — hand trades and bot trades reconcile into the same campaign.
+**The card and the bot are two instruments (§3.2).** A card is the commander's worksheet for trading by hand: it refreshes when **Save & Refresh** is pressed and holds its own gear and tiers. The autopilot keeps its **own** gear and tiers, changed in the cockpit and remembered across restarts. They meet in exactly two places — the broker position they both read, and the card's **`sync to autopilot`** button, which copies that card's settings into the bot when it is pressed.
 
 It deliberately omits the main program's perk engine, anchor tracking, regime detection, and idle flags.
 
@@ -122,9 +122,31 @@ V = 100 × (High5 − Low5) / High5
 - **AUTO** tracks V continuously, deployed or not — a stock that turns violent mid-campaign gets a deeper ladder without being touched. On an EMPTY card the heavy-unit rule (§3.1) floors it.
 - **MANUAL** holds whatever the commander picked.
 - Either way a gear or tier change is saved as configuration and may enter the diagnostic application log, never `RECORDED FILLS`. Nothing has to be unwound: only the average cost is history, and the watched lines are recomputed from it on the spot.
-- Gear identity uses red/orange/yellow/green/blue for G1–G5. In the cockpit, **only the selected Gear** uses its identity color; the other four remain neutral grey.
+- Gear identity uses red/orange/yellow/green/blue for G1–G5. In the cockpit, **only the selected Gear** uses its identity color; the other four remain neutral grey. The card carries a **big gear number** in that colour under its picker — across sixteen cards it is the mark that reads at a glance, which is why the cockpit does not need one.
+- A card's exit tiers are plain **check boxes**; the cockpit's are coloured buttons. That difference is deliberate: the cockpit's tiers trade, the card's do not.
 
 Bounds are inclusive: exactly 15.0% is gear 2, 15.1% is gear 3. G5's ×1.0 add size arms only above a 25% range.
+
+### 3.2 The card's gear is not the bot's gear
+
+They are separate numbers, and each means something different.
+
+```text
+CARD GRID                          AUTOPILOT
+a worksheet for hand trading       the thing that actually trades
+refreshes on Save & Refresh        refreshes every poll
+its own gear and exit tiers        its OWN gear, AUTO flag, exit tiers
+saved in positions.csv             saved with the campaign state
+never moves a live line            moves every line
+
+                 [sync to autopilot]  →  one way, on the button only
+```
+
+The autopilot's poll thread touches exactly **one** thing on the main window: the `AUTOPILOT` button's colour, which reports WATCH/LIVE. It never rewrites a card. **Save & Refresh** re-reads price, shares and average cost from the provider and re-sorts the grid; it sends nothing to the bot. The cockpit's Gear, AUTO and tier controls write to the engine; no card changes.
+
+The reason is that a card should be usable for thinking. Trying a deeper gear on a card to see what the ladder would look like used to change what the bot was about to do — a question became an instruction. It also made the grid heavy, because every tick drove sixteen Tk cards, and at its worst left them unclickable behind the cockpit.
+
+The cost is that the two can now disagree. That is the point, but it means the **cockpit** is the only place to read what the bot will actually do. The card's gear is a plan; the cockpit's gear is the order.
 
 ### 3.1 Heavy-unit entry floor
 
@@ -207,7 +229,7 @@ Every card carries one button:
 
 There are no manual Buy/Sell buttons: the reason to run a bot is that the offer goes out when the curve touches the line. Trading by hand in the broker app stays fully supported — the bot detects it and folds it into the campaign.
 
-The cockpit also carries a **gearbox strip** — AUTO, G1–G5, T1/T2/T3 — so the Gear and exit tiers can be changed where the campaign is being watched. It writes to the card, which stays the source of truth, and the engine picks it up on the next poll. Only the selected Gear uses its red/orange/yellow/green/blue identity color; the other Gear buttons remain neutral. Exit buttons vary by their actual percentage.
+The cockpit also carries a **gearbox strip** — AUTO, G1–G5, T1/T2/T3 — so the Gear and exit tiers can be changed where the campaign is being watched. It writes to the **bot's own** settings, which the engine picks up on the next poll and remembers across restarts. The card grid does not change with it: the cards are a worksheet for hand trading, and the only way a card setting reaches the bot is the card's **`sync to autopilot`** button. Only the selected Gear uses its red/orange/yellow/green/blue identity color; the other Gear buttons remain neutral. Exit buttons vary by their actual percentage.
 
 Nothing rests in advance — an order goes out only when a line is actually crossed. An order that then rests unfilled is **re-priced by the bot itself** every poll, so a Gear shift never strands one. There is no broad Cancel control: WATCH and self-healing clean up only durably identified bot orders; visible app/web orders pause the ticker and are never cancelled by the bot.
 
@@ -392,6 +414,8 @@ Mini_trading_calculator/
 | 0.8 | 2026-08-01 | Mixed manual/LIVE reconciliation made broker-authoritative: durable bot ownership, foreign-order pause, exact-fill retries, MIXED attribution, actual-fill-only reload, and no guessed offline sell. Removed broad Cancel and routine strategy confirmations. Made the 5-day Vantage picker permanent and explicit, restored blue FLAT-gap contrast, added Gear/exit color contrast, current empty/deployed log status, unclipped chart labels, and trade-only fill rows. |
 
 | 0.9 | 2026-08-02 | User-facing states are **EMPTY / DEPLOYED** and the sole action is **AUTOPILOT**. DEPLOYED cards sort first by position gap (descending, red/blue); EMPTY cards follow by LOAD gap (ascending, purple below LOAD/orange above). Only the selected cockpit Gear is colored. LIVE confirmation is inline and modeless, and no `MANUALLY_MODIFIED` banner is shown. Normal polling reads price, holdings/average, OPEN orders, and buying power; one raw candle window feeds both Dynamic High5 and the chart, and a card state transition no longer fetches the whole catalogue. Each observed delta is accepted once with no delayed-history rewrite or net-zero reconstruction. Accepted identities survive OPEN/holdings lag and close-during-submit; UNKNOWN/MIXED movement never proves bot convergence or reload eligibility. External/offline/mixed/unknown full sells reset EMPTY/Dynamic High5 without reload; only an immediate proven bot full sell with an actual price may reload. WATCH closes immediately when no bot order is pending, and newly fundable reserve lines reactivate automatically. |
+
+| 1.0 | 2026-08-02 | **The card grid and the autopilot are detached** (§3.2). The bot keeps its own Gear, AUTO flag and exit tiers, saved with its campaign; the cockpit writes to the engine, not to a card. The poll thread touches only the `AUTOPILOT` button's colour, so ticks no longer drive sixteen Tk cards — the freezing and the unclickable grid behind the cockpit go with it. Save & Refresh sends nothing to the bot. The new **`sync to autopilot`** button on each card is the one crossing, and only when pressed. The card's **big gear number** is back, and its exit tiers returned to plain **check boxes** to read differently from the cockpit's trading buttons. |
 
 ---
 

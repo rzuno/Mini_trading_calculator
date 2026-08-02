@@ -36,6 +36,12 @@ WHAT IT DELIBERATELY DOES NOT DO
       average, so the lines move. A hand sell to zero empties the position, so
       it goes back to the LOAD rule. Both fall out of "read the broker" free.
 
+SETTINGS ARE THE BOT'S OWN
+    Gear, exit tiers and AUTO live here and persist here. The stock card keeps
+    its own copy for hand trading, and the two are NOT kept in step — the card
+    is a worksheet, this is what trades. The card's `sync to autopilot` button
+    copies its settings across when the commander means it.
+
 VANTAGE
     Needed only by the LOAD, and only while EMPTY. Automatic is the Dynamic
     High5 — the highest of five sessions with today's live high included, so a
@@ -52,19 +58,16 @@ from datetime import datetime
 from core.calc import (DEFAULT_EXIT_TIER, DEFAULT_GEAR, calc_chase_price,
                        calc_chase_shares, calc_load_price, calc_sell_tiers,
                        chase_drop, clamp_gear, gear_params, load_drop,
-                       round_half_up, tier_pcts, trim_buy_price,
-                       trim_sell_price)
+                       round_half_up, select_auto_gear, tier_pcts,
+                       trim_buy_price, trim_sell_price)
 
 POLL_SECONDS = 5
 STRATEGY_ID = 'V_COMMANDOS_GEARBOX'
 PROJECTED_CHASES = 2       # extra buy lines drawn ahead; never ordered
 
-_SAVE_FIELDS = ('gear', 'exit_tiers', 'tier_done', 'vantage', 'vantage_manual',
-                'vantage_manual_label', 'trading_date', 'events')
-
-
-def default_card_config() -> dict:
-    return {'gear': DEFAULT_GEAR, 'exit_tiers': [False, True, False]}
+_SAVE_FIELDS = ('gear', 'auto', 'exit_tiers', 'tier_done', 'vantage',
+                'vantage_manual', 'vantage_manual_label', 'trading_date',
+                'events')
 
 
 def norm_tiers(value):
@@ -95,7 +98,7 @@ class CampaignEngine:
         'prev_close':   float|None,
         'can_trade':    bool,         False in WATCH — lines are drawn, but
                                       nothing is sent
-        'card':         {'gear', 'exit_tiers'},
+        'vol5':         float|None,   the 5-day range, for AUTO gear
     }
 
     actions:
@@ -110,6 +113,11 @@ class CampaignEngine:
         self.strategy = STRATEGY_ID
 
         # -- persisted --------------------------------------------------------
+        # The bot's OWN settings. The card has its own, and they are not
+        # synced: the card is a worksheet for hand trading, this is what
+        # actually trades. `sync to autopilot` on the card copies one into
+        # the other, deliberately, when the commander asks for it.
+        self.auto = True                 # gear follows V while EMPTY
         self.gear = DEFAULT_GEAR
         self.exit_tiers = norm_tiers(DEFAULT_EXIT_TIER)
         self.tier_done = [False, False, False]
@@ -282,20 +290,60 @@ class CampaignEngine:
         if v != self.vantage:
             self.vantage, self.dirty = v, True
 
-    # ── The card owns gear and tiers ─────────────────────────────────────────
+    # ── The bot's own settings ───────────────────────────────────────────────
 
-    def _apply_card(self, snap):
-        card = dict(snap.get('card') or default_card_config())
-        gear = clamp_gear(card.get('gear', self.gear))
-        tiers = norm_tiers(card.get('exit_tiers', self.exit_tiers))
+    def set_gear(self, gear):
+        """Pick a gear by hand. That is a decision, so AUTO steps aside."""
+        gear = clamp_gear(gear)
+        self.auto = False
         if gear != self.gear:
-            self._log(f'gear G{self.gear} → G{gear}')
-            self.gear, self.dirty = gear, True
+            self._log(f'gear G{self.gear} → G{gear} (manual)')
+            self.gear = gear
+        self.dirty = True
+        return True
+
+    def set_auto(self, on=True):
+        self.auto = bool(on)
+        self._log(f'gear selection → {"AUTO" if self.auto else "MANUAL"}')
+        self.dirty = True
+        return True
+
+    def set_tiers(self, tiers):
+        tiers = norm_tiers(tiers)
         if tiers != self.exit_tiers:
             self._log(f'exits {self._tier_text()} → {self._tier_text(tiers)}')
             # A newly armed tier starts unspent; the ladder re-splits below.
             self.tier_done = [d and a for d, a in zip(self.tier_done, tiers)]
-            self.exit_tiers, self.dirty = tiers, True
+            self.exit_tiers = tiers
+            self.dirty = True
+        return True
+
+    def apply_card_config(self, cfg):
+        """The card's `sync to autopilot` button, and nothing else. The two
+        sides are otherwise independent on purpose."""
+        cfg = dict(cfg or {})
+        if 'exit_tiers' in cfg:
+            self.set_tiers(cfg['exit_tiers'])
+        if cfg.get('auto'):
+            self.set_auto(True)
+        elif 'gear' in cfg:
+            self.set_gear(cfg['gear'])
+        self._log(f'synced from the card: G{self.gear} {self._tier_text()} '
+                  f'({"AUTO" if self.auto else "MANUAL"})')
+        return True
+
+    def _apply_auto(self, snap):
+        """While AUTO is on the gear follows the 5-day range — the bot's own
+        copy of the rule, so it holds whether or not a card exists."""
+        if not self.auto:
+            return
+        v = snap.get('vol5')
+        if v is None:
+            return
+        gear = select_auto_gear(v)
+        if gear != self.gear:
+            self._log(f'gear G{self.gear} → G{gear} (AUTO, V {v:.1f}%)')
+            self.gear, self.dirty = gear, True
 
     # ── Fills, read straight off the broker's share count ────────────────────
 
@@ -450,7 +498,7 @@ class CampaignEngine:
 
         shares = int(snap.get('shares') or 0)
         avg = float(snap.get('avg_cost') or 0)
-        self._apply_card(snap)
+        self._apply_auto(snap)
 
         acts = []
         closed = self._detect_fills(snap, shares, avg)
@@ -616,6 +664,7 @@ class CampaignEngine:
             'vantage_src': self.vantage_src,
             'vantage_manual': self.vantage_manual,
             'vantage_manual_label': self.vantage_manual_label,
+            'auto': self.auto,
             'campaign_id': self.campaign_id,
             'campaign_start': self.campaign_start,
             'chase_count': self.chase_count,
