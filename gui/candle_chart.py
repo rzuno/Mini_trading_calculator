@@ -208,7 +208,7 @@ class CandlePanel(tk.Frame):
         v = self.vol5
         if v is None:
             v = bar_range_v(self.ohlc)
-        v_txt = (f'V {v:.1f}% → G{select_auto_gear(v)}' if v is not None
+        v_txt = (f'V {v:.2f}% → G{select_auto_gear(v)}' if v is not None
                  else 'V --')
         self._stat.config(
             text=f'5D  High {fmt_price(hi, self.ccy)}   '

@@ -11,7 +11,16 @@ consumes from ``core.data_feed.fetch_all`` so providers are drop-in:
         '5d_ohlc':    list[dict],     # [{date, open, high, low, close}, ...]
         'prev_close': float | None,   # last COMPLETED session close (the
                                       # vantage point the load hangs off)
+        'v5_high':    float | None,   # high over the 5 COMPLETED sessions —
+        'v5_low':     float | None,   # the gearbox V window (today excluded),
+                                      # the same one the autopilot reads
     }
+
+`5d_high/low` span the DISPLAY window (four completed sessions plus today's
+partial bar, stretched by the live price) and feed the vantage. `v5_high/low`
+span the five completed sessions only and feed V = the gear recommendation;
+mixing the two windows is how the card and the cockpit once disagreed on the
+gear.
 """
 
 from typing import Optional
@@ -19,7 +28,8 @@ from typing import Optional
 
 def empty_stock_data() -> dict:
     return {'price': None, '5d_high': None, '5d_low': None,
-            '5d_closes': [], '5d_ohlc': [], 'prev_close': None}
+            '5d_closes': [], '5d_ohlc': [], 'prev_close': None,
+            'v5_high': None, 'v5_low': None}
 
 
 class MarketDataProvider:

@@ -13,7 +13,8 @@ def _fetch_ticker_data(ticker: str) -> dict:
     live regularMarketPrice from ticker.info.
     """
     result = {'price': None, '5d_high': None, '5d_low': None,
-              '5d_closes': [], '5d_ohlc': [], 'prev_close': None}
+              '5d_closes': [], '5d_ohlc': [], 'prev_close': None,
+              'v5_high': None, 'v5_low': None}
     try:
         t = yf.Ticker(ticker)
 
@@ -41,7 +42,27 @@ def _fetch_ticker_data(ticker: str) -> dict:
         # ── Historical OHLC ─────────────────────────────────────────────────
         hist = t.history(period='1mo')
         if not hist.empty:
-            hist = hist.tail(5)
+            hist6 = hist.tail(6)
+
+            # Completed-session subset (drop the in-progress bar when the
+            # latest row is today, market-local). Its last close is the
+            # vantage fallback; its 5-session span is the gearbox V window —
+            # the same window the autopilot's controller reads, so the card
+            # and the cockpit recommend the same gear.
+            try:
+                tzoff = 9 if ticker.endswith('.KS') else -5
+                tz = timezone(timedelta(hours=tzoff))
+                today = datetime.now(tz).strftime('%Y-%m-%d')
+                comp = hist6[[idx.strftime('%Y-%m-%d') != today
+                              for idx in hist6.index]].tail(5)
+                if len(comp):
+                    result['prev_close'] = float(comp['Close'].iloc[-1])
+                    result['v5_high'] = float(comp['High'].max())
+                    result['v5_low'] = float(comp['Low'].min())
+            except Exception:
+                pass
+
+            hist = hist6.tail(5).copy()
 
             # Patch the last bar's close with live price if available
             if live_price is not None and len(hist) > 0:
@@ -51,19 +72,6 @@ def _fetch_ticker_data(ticker: str) -> dict:
             result['5d_high'] = float(hist['High'].max())
             result['5d_low'] = float(hist['Low'].min())
             result['5d_closes'] = [float(c) for c in hist['Close'].tolist()]
-
-            # Vantage point: the last COMPLETED session's close (drop the
-            # in-progress bar when the latest row is today, market-local).
-            try:
-                tzoff = 9 if ticker.endswith('.KS') else -5
-                tz = timezone(timedelta(hours=tzoff))
-                today = datetime.now(tz).strftime('%Y-%m-%d')
-                comp = [float(c) for idx, c in zip(hist.index, hist['Close'])
-                        if idx.strftime('%Y-%m-%d') != today]
-                if comp:
-                    result['prev_close'] = comp[-1]
-            except Exception:
-                pass
             for idx, row in hist.iterrows():
                 result['5d_ohlc'].append({
                     'date': idx.strftime('%m/%d'),

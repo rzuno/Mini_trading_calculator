@@ -286,6 +286,12 @@ class TossMarketProvider(MarketDataProvider):
             completed = [b for b in bars if b['ts'][:10] != today]
             if completed:
                 d['prev_close'] = completed[-1]['close']
+                # The gearbox V window: five COMPLETED sessions, today's
+                # partial bar excluded — the same window the autopilot's
+                # controller reads, so card and cockpit pick the same gear.
+                completed5 = completed[-5:]
+                d['v5_high'] = max(b['high'] for b in completed5)
+                d['v5_low']  = min(b['low'] for b in completed5)
             d['5d_high']   = max(b['high'] for b in five)
             d['5d_low']    = min(b['low'] for b in five)
             d['5d_closes'] = [b['close'] for b in five]

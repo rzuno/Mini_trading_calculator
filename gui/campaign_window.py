@@ -47,9 +47,9 @@ from datetime import datetime as _dt
 import tkinter as tk
 import tkinter.font as tkfont
 
-from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, exit_pct, fmt_price,
-                       gear_button_color, gear_button_fg, gear_params,
-                       select_auto_gear, sell_pct_color,
+from core.calc import (EXIT_TIERS, GEARS, STOCK_NAMES, effective_entry_gear,
+                       exit_pct, fmt_price, gear_button_color, gear_button_fg,
+                       gear_params, select_auto_gear, sell_pct_color,
                        sell_pct_foreground)
 from gui.candle_chart import (CandlePanel, bounded_label_layout,
                               required_label_pad)
@@ -229,7 +229,9 @@ def campaign_age_line(ui, currency):
     if c.get('campaign_low'):
         bits.append(f"low {fmt_price(c['campaign_low'], currency)}")
     if c.get('max_cost'):
-        bits.append(f"peak {fmt_price(c['max_cost'], currency)}")
+        # The engine reports the CURRENT shares × average (nothing persisted
+        # can drift from the account) — label it as cost, not "peak".
+        bits.append(f"cost {fmt_price(c['max_cost'], currency)}")
     return '   ·   '.join(bits)
 
 
@@ -628,16 +630,22 @@ class CampaignWindow:
         if v is None:
             self._vol_lbl.config(text='V --')
         else:
-            rec = select_auto_gear(v)
+            # The same rule the engine's AUTO runs: pure V once deployed, the
+            # heavy-unit entry floor on top of it while EMPTY (manual §6.2).
+            base = select_auto_gear(v)
+            if int(ui.get('shares') or 0) > 0:
+                rec, heavy = base, ''
+            else:
+                rec = effective_entry_gear(v, ui.get('price'),
+                                           ui.get('unit_cash'))
+                heavy = ' ▲heavy' if rec > base else ''
             tail = '' if (auto or rec == gear) else f' (AUTO would pick G{rec})'
-            self._vol_lbl.config(text=f'V {v:.1f}% → G{rec}{tail}')
+            self._vol_lbl.config(text=f'V {v:.2f}% → G{rec}{heavy}{tail}')
 
         vantage = vantage_presentation(c, self.ccy)
         selectable = can_pin_vantage(ui)
-        suffix = (f"  · last exit {c['last_exit_date']}"
-                  if c.get('last_exit_date') else '')
         self._vantage_lbl.config(
-            text=vantage['text'] + suffix,
+            text=vantage['text'],
             fg=('#CC0000' if vantage['pinned'] else '#E08000'))
         self._vantage_hint_lbl.config(
             text=('Choose a candle or OHLC row below to pin that day\'s high.'

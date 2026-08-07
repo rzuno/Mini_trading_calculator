@@ -161,8 +161,11 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    with open(CONFIG_PATH, 'w') as f:
+    # Write-then-replace so a crash mid-write can never truncate the file.
+    tmp = CONFIG_PATH + '.tmp'
+    with open(tmp, 'w') as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def load_positions() -> list:
@@ -180,9 +183,13 @@ def load_positions() -> list:
 
 
 def save_positions(positions: list) -> None:
+    # positions.csv is gitignored and has no backup: write to a sibling temp
+    # file and atomically replace, so a crash mid-write can never leave the
+    # only copy truncated.
     os.makedirs(os.path.dirname(POSITIONS_PATH), exist_ok=True)
     today = str(date.today())
-    with open(POSITIONS_PATH, 'w', newline='', encoding='utf-8') as f:
+    tmp = POSITIONS_PATH + '.tmp'
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         for pos in positions:
@@ -212,3 +219,4 @@ def save_positions(positions: list) -> None:
                 'auto_mode':    int(bool(pos.get('auto_mode', True))),
                 'last_updated': today,
             })
+    os.replace(tmp, POSITIONS_PATH)

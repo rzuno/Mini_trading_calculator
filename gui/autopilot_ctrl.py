@@ -31,10 +31,12 @@ Modes per stock:
 
 Two rules keep this safe around hand trading:
 
-    * **Only our own orders are ever cancelled.** Ownership is the
-      clientOrderId prefix (which survives a restart) or an order id placed
-      during this run. An order from the app or the web is left strictly
-      alone.
+    * **Only our own orders are ever cancelled.** Ownership is an order id
+      placed during this run, or the clientOrderId prefix when the broker
+      echoes it (per Toss_api.json the OPEN list does NOT — so after a
+      restart a resting bot order reads as foreign: never cancelled, never
+      duplicated, blocking its side until it fills or the DAY order expires).
+      An order from the app or the web is left strictly alone.
     * **The broker is the authority.** Nothing here second-guesses it. The
       engine derives everything from the snapshot, so a hand trade needs no
       special case anywhere in this file.
@@ -72,9 +74,11 @@ _FAIL_ANNOUNCE = 6              # consecutive bad polls (~30s) → one alert
 _OHLC_REFRESH_S = 300           # refetch the 5-day candles every 5 minutes
 _DAILY_RETRY_S = 60             # throttle completed-bars retries
 
-# Every order this controller creates carries this clientOrderId prefix, so
-# ownership survives an application restart instead of living only in the set
-# of order ids collected during this run.
+# Every order this controller creates carries this clientOrderId prefix. It
+# is the idempotency key Toss deduplicates on, and best-effort recognition:
+# per Toss_api.json the OPEN-orders list omits clientOrderId, so a restart
+# orphan is treated as foreign (blocked side, never cancelled) rather than
+# recognized — the safe direction.
 _BOT_CLIENT_ID_PREFIX = 'vcg-ap-'
 
 
@@ -245,7 +249,7 @@ class AutopilotController:
     def disable(self, ticker):
         """Stop watching. Resting orders are LEFT AS THEY ARE — closing a
         window is not an instruction to trade, and that order may well be one
-        you want filled. Use Cancel resting first if it is not."""
+        you want filled. Remove one you do not want in the Toss app."""
         with self._lock:
             slot = self._slots.pop(ticker, None)
         if slot:

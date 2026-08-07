@@ -57,9 +57,10 @@ from datetime import datetime
 
 from core.calc import (DEFAULT_EXIT_TIER, DEFAULT_GEAR, calc_chase_price,
                        calc_chase_shares, calc_load_price, calc_sell_tiers,
-                       chase_drop, clamp_gear, gear_params, load_drop,
-                       round_half_up, select_auto_gear, tier_pcts,
-                       trim_buy_price, trim_sell_price)
+                       chase_drop, clamp_gear, effective_entry_gear,
+                       gear_params, load_drop, round_half_up,
+                       select_auto_gear, tier_pcts, trim_buy_price,
+                       trim_sell_price)
 
 POLL_SECONDS = 5
 STRATEGY_ID = 'V_COMMANDOS_GEARBOX'
@@ -189,10 +190,6 @@ class CampaignEngine:
         return (f'{self.ticker} · {len(self.events)} fills'
                 if self.events else None)
 
-    @property
-    def manually_modified(self):
-        return False
-
     # ── Small helpers ────────────────────────────────────────────────────────
 
     def _fp(self, p):
@@ -232,19 +229,11 @@ class CampaignEngine:
 
     # ── Order-outcome hooks (the controller calls these) ─────────────────────
 
-    def note_order_submitted(self, side, price, qty, client_id=None):
-        self._pending = {'side': side, 'price': price, 'qty': int(qty),
-                         'tiers': list(self._pending_tiers)}
-        return True
-
     def note_order_accepted(self, side, price, qty, order_id=None,
                             client_id=None):
         return True
 
     def note_order_failed(self, side, price, qty):
-        self._pending = None
-
-    def note_order_unresolved(self, side, price, qty):
         self._pending = None
 
     # ── Vantage: used by the LOAD line, and nothing else ─────────────────────
@@ -334,15 +323,26 @@ class CampaignEngine:
 
     def _apply_auto(self, snap):
         """While AUTO is on the gear follows the 5-day range — the bot's own
-        copy of the rule, so it holds whether or not a card exists."""
+        copy of the rule, so it holds whether or not a card exists. While
+        EMPTY the heavy-unit entry floor applies too (manual §6.2): a stock
+        whose one share eats a big bite of a unit cannot open on a shallow
+        ladder — exactly the rule the card's ▲heavy tag shows. Deployed, the
+        floor drops away and V alone drives."""
         if not self.auto:
             return
         v = snap.get('vol5')
         if v is None:
             return
-        gear = select_auto_gear(v)
+        base = select_auto_gear(v)
+        if int(snap.get('shares') or 0) > 0:
+            gear, heavy = base, ''
+        else:
+            gear = effective_entry_gear(v, snap.get('price'),
+                                        snap.get('unit_cash'))
+            heavy = ' ▲heavy' if gear > base else ''
         if gear != self.gear:
-            self._log(f'gear G{self.gear} → G{gear} (AUTO, V {v:.1f}%)')
+            self._log(f'gear G{self.gear} → G{gear} '
+                      f'(AUTO, V {v:.2f}%{heavy})')
             self.gear, self.dirty = gear, True
 
     # ── Fills, read straight off the broker's share count ────────────────────
@@ -670,6 +670,5 @@ class CampaignEngine:
             'chase_count': self.chase_count,
             'campaign_low': self.campaign_low,
             'max_cost': (shares * avg) or None,
-            'last_exit_date': None,
             'gross_target': target or None,
         }

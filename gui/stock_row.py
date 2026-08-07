@@ -93,7 +93,6 @@ class StockRow:
         self._gap           = None    # actionable gap %, for global ordering
         self._computing     = False
         self._syncing_gear  = False
-        self._syncing_position = False
         self._order_side    = None
         self._base_gear = None        # pure volatility gear
         self._eff_gear  = None        # after the heavy-unit rule
@@ -431,18 +430,18 @@ class StockRow:
                                  selectcolor='#E6B800')
 
     def _update_vol_label(self):
+        # Two decimals so a 20.04% read never looks like the 20.0% cut point
+        # while selecting the gear above it.
         vol = self.volatility
         if vol is None:
             self.vol_var.set('V --')
         elif not self.auto_var.get():
-            self.vol_var.set(f'V {vol:.1f}%')
-        elif self.vantage_src == 'reload' and not self.deployed:
-            self.vol_var.set(f'V {vol:.1f}% → reload -3%')
+            self.vol_var.set(f'V {vol:.2f}%')
         else:
             base = select_auto_gear(vol)
             eff = self._eff_gear or base
             heavy = ' ▲heavy' if eff > base else ''
-            self.vol_var.set(f'V {vol:.1f}% → G{eff}{heavy}')
+            self.vol_var.set(f'V {vol:.2f}% → G{eff}{heavy}')
 
     def _apply_auto(self):
         """AUTO tracks the 5-day range, deployed or not — the gear is not
@@ -540,8 +539,7 @@ class StockRow:
     # ── Compute ───────────────────────────────────────────────────────────────
 
     def _on_input_change(self):
-        if (not self._computing and not self._syncing_gear
-                and not self._syncing_position):
+        if not self._computing and not self._syncing_gear:
             self.compute()
             if self._on_compute_cb:
                 self._on_compute_cb()
@@ -732,40 +730,6 @@ class StockRow:
             self.vantage_src = vantage_src
         if volatility is not None:
             self.volatility = volatility
-
-    def update_broker_position(self, qty, avg_price):
-        """Reconcile the card with the broker position used by the cockpit.
-
-        The controller can call this before its normal live-price update so
-        both views calculate from the same shares and average. The main account
-        refresh still rebuilds the card when it crosses between FLAT and
-        DEPLOYED, because that changes the card's structural layout.
-        """
-        try:
-            shares = max(0, int(round(float(qty or 0))))
-        except (TypeError, ValueError):
-            shares = 0
-        try:
-            avg = max(0.0, float(avg_price or 0.0))
-        except (TypeError, ValueError):
-            avg = 0.0
-
-        shares_text = str(shares) if shares else ''
-        avg_text = self._fmt_init(avg) if shares and avg else ''
-        if (self.shares_var.get() == shares_text
-                and self.avg_cost_var.get() == avg_text):
-            return False
-
-        self._syncing_position = True
-        try:
-            self.shares_var.set(shares_text)
-            self.avg_cost_var.set(avg_text)
-        finally:
-            self._syncing_position = False
-        self.compute()
-        if self._on_compute_cb:
-            self._on_compute_cb()
-        return True
 
     def get_state(self) -> dict:
         try:

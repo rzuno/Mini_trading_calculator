@@ -49,6 +49,18 @@ def strategy_preferences(state):
     return {k: state[k] for k in _STRATEGY_PREF_KEYS if k in state}
 
 
+def card_volatility(d):
+    """V for the gearbox: the span of the five COMPLETED sessions (manual
+    §17.1) — the same window the autopilot's controller reads, so the card and
+    the cockpit recommend the same gear. The display window (`5d_high/low`,
+    which includes today's partial bar and the live price) is the vantage's
+    business, not V's; it is only a fallback when a provider does not supply
+    the completed window."""
+    if d.get('v5_high'):
+        return calc_volatility(d['v5_high'], d.get('v5_low'))
+    return calc_volatility(d.get('5d_high'), d.get('5d_low'))
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -790,68 +802,6 @@ class App:
                 pos['avg_cost'] = 0.0
                 pos['cost_basis'] = 0.0
 
-    def _apply_autopilot_position(self, ticker, shares, avg_cost):
-        """Apply one watcher position transition without a network refresh.
-
-        The autopilot poll already read this ticker's holdings. When that
-        changes the structural card type, update only its portfolio record and
-        cached account item, rebuild the local card widgets, and paint them
-        from the market data already in memory. Passing ``account=None`` is
-        intentional: an older full-account snapshot must not undo this fresher
-        per-ticker observation.
-        """
-        try:
-            qty = max(0, int(round(float(shares or 0))))
-        except (TypeError, ValueError):
-            return False
-        try:
-            avg = max(0.0, float(avg_cost or 0.0))
-        except (TypeError, ValueError):
-            avg = 0.0
-
-        pos = next((p for p in self.positions
-                    if p.get('ticker') == ticker), None)
-        if pos is None:
-            return False
-        deployed = qty > 0
-        was_deployed = bool(pos.get('is_deployed'))
-        if deployed == was_deployed:
-            return False
-
-        pos['is_deployed'] = deployed
-        pos['shares'] = qty if deployed else 0
-        pos['avg_cost'] = avg if deployed else 0.0
-        pos['cost_basis'] = qty * avg if deployed else 0.0
-        if deployed:
-            pos['exit_tier'] = DEFAULT_EXIT_TIER
-
-        # Keep later cached re-application and the army banner aligned with
-        # this fresher per-ticker broker observation while preserving cash and
-        # every unrelated holding from the last full account snapshot.
-        if isinstance(self._last_account, dict):
-            account = dict(self._last_account)
-            items = [dict(item) for item in
-                     (self._last_account.get('items') or [])]
-            found = next((item for item in items
-                          if item.get('ticker') == ticker), None)
-            if deployed:
-                if found is None:
-                    found = {'ticker': ticker}
-                    items.append(found)
-                found['shares'] = qty
-                found['avg'] = avg
-            else:
-                items = [item for item in items
-                         if item.get('ticker') != ticker]
-            account['items'] = items
-            self._last_account = account
-
-        self._rebuild_sections()
-        self._apply_live(
-            dict(self._last_data or {}), self._fx_rate, self._fx_avg_3m,
-            account=None, open_orders=None, quiet=True)
-        return True
-
     def _apply_live(self, data, fx_rate, fx_avg=None, account=None,
                     open_orders=None, quiet=False):
         self._last_data = data
@@ -867,7 +817,7 @@ class App:
             if d.get('5d_high'):    self._current_peaks[t]  = d['5d_high']
             if d.get('5d_ohlc'):    self._ohlc_data[t]      = d['5d_ohlc']
             if d.get('5d_closes'):  self._closes_data[t]    = d['5d_closes']
-            vol = calc_volatility(d.get('5d_high'), d.get('5d_low'))
+            vol = card_volatility(d)
             if vol is not None:     self._volatility[t]     = vol
 
         # Toss mode: derive deployment/shares/avg from the account, then rebuild.
@@ -891,7 +841,7 @@ class App:
                 d.get('price'),
                 vantage=high5 or d.get('prev_close'),
                 vantage_src='high5' if high5 else 'close',
-                volatility=calc_volatility(d.get('5d_high'), d.get('5d_low')))
+                volatility=card_volatility(d))
 
         for row in self.deployed_rows + self.empty_rows:
             row.compute()

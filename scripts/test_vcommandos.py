@@ -9,7 +9,7 @@ ladders — final average, capital used, and rebound-to-tier).
 Part 2 runs whole price paths through the real engine behind a FakeBroker
 that fills resting limit orders when the simulated price crosses them, so
 the campaign lifecycle is exercised exactly as the live watcher would see
-it: LOAD → CHASE → full EXIT → same-day reload, plus manual app trades,
+it: LOAD → CHASE → full EXIT → stand-down, plus manual app trades,
 adopted positions, the army wall, gear shifts and KR tick trimming.
 """
 
@@ -553,6 +553,21 @@ ok(e.gear == 3,
 e.set_auto(True)
 e.poll(snap(b, 95.0, vol5=40.0))
 ok(e.gear == 5, 'while AUTO, the bot reads V itself: 40% → G5',
+   f'gear={e.gear}')
+
+print('— AUTO honors the heavy-unit entry floor while EMPTY (manual §6.2) —')
+e, b = fresh()                        # EMPTY; one share = 2.6 units
+e.set_auto(True)
+e.poll(snap(b, 2600.0, vol5=12.0))
+ok(e.gear == 5,
+   'EMPTY + heavy single share: the entry floor lifts AUTO over V (12% → G5)',
+   f'gear={e.gear}')
+
+e, b = fresh(shares=4, avg=2600.0)    # same stock, already DEPLOYED
+e.set_auto(True)
+e.poll(snap(b, 2600.0, vol5=12.0))
+ok(e.gear == 2,
+   'deployed, AUTO follows V alone — the heavy floor is an entry rule',
    f'gear={e.gear}')
 
 print(f'\nALL {passed} CHECKS PASSED')
