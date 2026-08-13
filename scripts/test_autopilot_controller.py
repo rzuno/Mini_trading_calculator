@@ -1,12 +1,12 @@
-"""Headless checks for the autopilot controller.
+"""Headless checks for the autopilot controller (Daily v^ grid edition).
 
 Run:  python scripts/test_autopilot_controller.py
 
-The controller is deliberately thin: read the broker, hand the snapshot to the
-engine, execute what it returns, save, push. These checks cover the parts that
-are its own responsibility rather than the engine's — order ownership, mode
-handling, what a poll actually emits, and the two rules that protect a
-commander who also trades by hand.
+The controller is deliberately thin: read the broker, hand the snapshot to
+the grid engine, execute what it returns, save, push. These checks cover the
+parts that are its own responsibility rather than the engine's — order
+ownership, mode handling, the grid-scale gate, what a poll actually emits,
+and the rules that protect a commander who also trades by hand.
 
 A withdrawn Tk root is created so the real AutopilotController can be driven
 end to end against a fake Toss provider.
@@ -24,7 +24,8 @@ import tkinter as tk
 
 import gui.autopilot_ctrl as ctrl_mod
 from gui.autopilot_ctrl import (AutopilotController, _BOT_CLIENT_ID_PREFIX,
-                                is_bot_owned_order, market_phase)
+                                avg_completed_day_v, is_bot_owned_order,
+                                market_phase)
 
 passed = 0
 
@@ -41,7 +42,7 @@ def ok(cond, name, info=''):
 class FakeProvider:
     """Just enough Toss surface for a poll cycle."""
 
-    def __init__(self, price=91.2, shares=31, avg=92.0, bp=4200.0):
+    def __init__(self, price=95.0, shares=31, avg=92.0, bp=1_000_000.0):
         self.price, self.shares, self.avg, self.bp = price, shares, avg, bp
         self.orders = []
         self.placed = []
@@ -62,9 +63,9 @@ class FakeProvider:
         return self.bp
 
     def get_completed_daily_bars(self, ticker, count):
-        # high5 = 104, low5 = 86
+        # 5 completed sessions ending at close 95; ranges vary per day.
         return [{'ts': f'2026-07-2{i}T00:00:00', 'date': f'07/2{i}',
-                 'open': 100.0, 'high': 100.0 + i, 'low': 90.0 - i,
+                 'open': 95.0, 'high': 95.0 + i, 'low': 92.0 - i,
                  'close': 95.0} for i in range(5)]
 
     def get_candles(self, ticker, count=6):
@@ -84,31 +85,18 @@ class FakeProvider:
 class StubRow:
     def __init__(self, ticker):
         self.ticker = ticker
-        self.gear_var = tk.IntVar(value=3)
-        self.tier_vars = [tk.BooleanVar(value=(i == 2)) for i in (1, 2, 3)]
-        self.auto_var = tk.BooleanVar(value=True)
-        self.shares_var = tk.StringVar()
-        self.avg_cost_var = tk.StringVar()
-        self.deployed = True
         self.badges = []
         self.volatility = None
-
-    def _fmt_init(self, v):
-        return f'{v:,.2f}' if v else ''
-
-    def line_config(self):
-        return {'gear': self.gear_var.get(),
-                'exit_tiers': [v.get() for v in self.tier_vars],
-                'auto': self.auto_var.get()}
+        self.touched = 0
 
     def set_autopilot(self, key):
         self.badges.append(key)
 
     def update_live(self, price=None, volatility=None, **kw):
-        self.volatility = volatility
+        self.touched += 1
 
     def compute(self):
-        pass
+        self.touched += 1
 
 
 class StubApp:
@@ -119,9 +107,6 @@ class StubApp:
         self.deployed_rows = [StubRow('NVDA')]
         self.empty_rows = []
         self._ohlc_data = {}
-        self.positions = [{'ticker': 'NVDA', 'shares': 31, 'avg_cost': 92.0,
-                           'cost_basis': 2852.0, 'is_deployed': True}]
-        self.rebuilt = 0
 
     def _get_unit_cash(self, ccy):
         return 1000.0
@@ -131,12 +116,6 @@ class StubApp:
 
     def _account_seq(self, prov):
         return 1
-
-    def _rebuild_sections(self):
-        self.rebuilt += 1
-
-    def _reapply(self):
-        pass
 
 
 def fresh(**kw):
@@ -151,73 +130,111 @@ def fresh(**kw):
     return root, prov, app, c
 
 
+# The grid builds its adventure only during REGULAR hours — pretend the
+# market is open for the whole suite, and restore the clock at the end.
+_real_phase = ctrl_mod.market_phase
+ctrl_mod.market_phase = lambda *a, **k: 'REGULAR'
+
 # ── Order ownership: the rule that protects hand trading ────────────────────
 print('— order ownership —')
 ok(is_bot_owned_order({'clientOrderId': _BOT_CLIENT_ID_PREFIX + 'x'}),
-   'our clientOrderId prefix proves ownership, and survives a restart')
+   'our clientOrderId prefix proves ownership when the broker echoes it')
 ok(is_bot_owned_order({'orderId': 'a1'}, ('a1',)),
    'so does an order id placed during this run')
 ok(not is_bot_owned_order({'orderId': 'zzz', 'clientOrderId': 'app-made'}),
    'an order from the app or the web is NEVER ours')
 ok(not is_bot_owned_order({}, ()), 'and nothing at all is not ours either')
 
+# ── The daily volatility indicator ───────────────────────────────────────────
+print('— daily volatility (the grid’s own number) —')
+bars = [{'ts': f'2026-07-2{i}T00:00:00', 'date': f'07/2{i}',
+         'high': 103.0, 'low': 100.0, 'close': 101.0} for i in range(5)]
+v = avg_completed_day_v(bars, '2026-07-30')
+ok(v is not None and abs(v - 3.0) < 0.01,
+   'avg day V is the mean of completed (H−L)/L ranges — 3% here', f'{v}')
+bars_today = bars + [{'ts': '2026-07-30T00:00:00', 'date': '07/30',
+                      'high': 200.0, 'low': 100.0, 'close': 150.0}]
+v2 = avg_completed_day_v(bars_today, '2026-07-30')
+ok(abs(v2 - 3.0) < 0.01,
+   "today's still-growing bar is excluded — its range is not done yet")
+
 # ── A poll, end to end ──────────────────────────────────────────────────────
 print('— one poll, end to end —')
 root, prov, app, ctrl = fresh()
 ok(ctrl.watch('NVDA')[0], 'watching arms a slot')
-ok(ctrl._slots['NVDA']['engine'].gear == 3,
-   'on the gear the bot itself remembers — the card is not consulted')
-
 slot = ctrl._slots['NVDA']
 ctrl._cycle('NVDA', slot)
 root.update()
 ui = ctrl.ui_state('NVDA')
-ok(ui and ui['state'] == 'DEPLOYED' and ui['shares'] == 31,
-   'a poll reconciles the broker position into the payload')
-ok(ui['lines'].get('chase') and ui['lines'].get('exit2'),
-   'and carries the watched lines', str(list(ui['lines'])))
-ok(ui['vol5'] is not None and ui['campaign']['gear'] == 3,
-   'plus V and the campaign summary')
+ok(ui and ui['grid_ready'] and ui['anchor'] == 95.0
+   and ui['anchor_level'] == 0,
+   'a poll builds the adventure: anchor = prev close at L+0',
+   f"anchor={ui and ui.get('anchor')}")
+ok(len(ui['grid']) == 11 and ui['level'] == 0,
+   'eleven levels from +5 to -5, starting at L+0')
+ok(ui['unit_qty'] == 11 and ui['base_inventory'] == 31,
+   'unit sized from unit_cash/anchor, base = actual broker shares',
+   f"unit={ui['unit_qty']} base={ui['base_inventory']}")
+ok(ui['day_v_avg'] is not None, 'the daily-V scale hint rides the payload')
 ok(not prov.placed, 'WATCH sent nothing')
 _row = app.deployed_rows[0]
-ok(_row.volatility is None,
+ok(_row.touched == 0,
    'and the poll left the card alone — no live price, no recompute')
 
-# ── LIVE actually sends, and stamps ownership ───────────────────────────────
-# LIVE is refused, and self-disarms, outside regular hours — correct, but it
-# makes the suite depend on the clock. Pretend the market is open.
-_real_phase = ctrl_mod.market_phase
-ctrl_mod.market_phase = lambda *a, **k: 'REGULAR'
+# ── The grid scale gate ──────────────────────────────────────────────────────
+print('— the grid scale —')
+okd, msg = ctrl.set_scale('NVDA', 0.02)
+ok(okd, 'the scale changes while nothing has traded', msg)
+ctrl._cycle('NVDA', slot)
+ui = ctrl.ui_state('NVDA')
+ok(abs(ui['step'] - 0.02) < 1e-9 and ui['grid_ready'],
+   'and the adventure re-initializes on the new spacing', f"step={ui['step']}")
+ok(not ctrl.set_scale('NVDA', 0.05)[0], 'an unoffered scale is refused')
+slot['mode'] = 'LIVE'
+ok(not ctrl.set_scale('NVDA', 0.03)[0], 'and LIVE locks the selector')
+slot['mode'] = 'WATCH'
 
+# ── LIVE actually sends, and stamps ownership ───────────────────────────────
 print('— LIVE sends, and stamps every order as ours —')
-root2, prov2, app2, ctrl2 = fresh(price=200.0)   # far above the exit
+root2, prov2, app2, ctrl2 = fresh()
 ctrl2.watch('NVDA')
 slot2 = ctrl2._slots['NVDA']
+ctrl2._cycle('NVDA', slot2)          # builds the adventure at 95
+prov2.price = 98.0                   # crosses L+1 = 97.85
 slot2['mode'] = 'LIVE'
 ctrl2._cycle('NVDA', slot2)
 root2.update()
-ok(prov2.placed, 'a crossed line in LIVE sends the order', str(prov2.placed))
+ok(prov2.placed, 'a crossed level in LIVE sends the order', str(prov2.placed))
 side, price, qty, coid = prov2.placed[0]
-ok(side == 'SELL' and qty == 31,
-   'the whole holding leaves at the armed tier', f'{side} {qty}')
+ok(side == 'SELL' and qty == 11,
+   'one unit leaves at L+1 (target = base − W(1)·unit)', f'{side} {qty}')
 ok(coid.startswith(_BOT_CLIENT_ID_PREFIX),
-   'and it carries our clientOrderId, so we can recognise it later', coid)
+   'and it carries our clientOrderId', coid)
 ok('o1' in slot2['my_ids'], 'the returned order id is remembered too')
+ok(ctrl2.ui_state('NVDA')['scale_locked'],
+   'an unresolved grid order locks the scale — one grid per day')
 
-# ── Selling out stands the bot down ─────────────────────────────────────────
-print('— selling out drops LIVE —')
-prov2.shares, prov2.avg = 0, 0.0
-ctrl2._cycle('NVDA', slot2)
-root2.update()
-ok(slot2['mode'] == 'WATCH',
-   'the position closed, so LIVE goes off — starting a campaign is a '
-   'deliberate act')
-ok(slot2['alert'], 'and the reason is on the alert line', str(slot2['alert']))
+# ── A foreign order pauses the adventure ────────────────────────────────────
+print('— a foreign order pauses, and is never claimed —')
+root3, prov3, app3, ctrl3 = fresh()
+ctrl3.watch('NVDA')
+slot3 = ctrl3._slots['NVDA']
+ctrl3._cycle('NVDA', slot3)
+prov3.orders = [{'orderId': 'theirs', 'side': 'SELL', 'price': 999.0,
+                 'quantity': 3, 'clientOrderId': 'typed-in-the-app'}]
+prov3.price = 98.0                   # L+1 crossed, but a foreign order rests
+slot3['mode'] = 'LIVE'
+ctrl3._cycle('NVDA', slot3)
+root3.update()
+ui3 = ctrl3.ui_state('NVDA')
+ok(not prov3.placed, 'no transition is taken while a foreign order rests')
+ok('not' in ui3['status'] and 'mine' in ui3['status'],
+   'and the status says why', ui3['status'])
+ok(len(ui3['orders']) == 1 and ui3['orders'][0]['mine'] is False,
+   "someone else's resting order reaches the payload marked not-ours")
 
 # ── Cancel touches only our orders ──────────────────────────────────────────
 print('— cancel_all spares orders the commander placed —')
-root3, prov3, app3, ctrl3 = fresh()
-ctrl3.watch('NVDA')
 prov3.orders = [
     {'orderId': 'mine', 'side': 'BUY', 'price': 80.0, 'quantity': 5,
      'clientOrderId': _BOT_CLIENT_ID_PREFIX + 'abc'},
@@ -227,18 +244,6 @@ prov3.orders = [
 okmsg = ctrl3.cancel_all('NVDA')
 ok(okmsg[0] and prov3.cancelled == ['mine'],
    'only the bot-owned order is cancelled', str(prov3.cancelled))
-
-# ── A foreign order is visible but not ours ─────────────────────────────────
-print('— a foreign order is reported, never claimed —')
-prov3.orders = [{'orderId': 'theirs', 'side': 'SELL', 'price': 999.0,
-                 'quantity': 3, 'clientOrderId': 'typed-in-the-app'}]
-slot3 = ctrl3._slots['NVDA']
-ctrl3._cycle('NVDA', slot3)
-root3.update()
-orders = ctrl3.ui_state('NVDA')['orders']
-ok(len(orders) == 1 and orders[0]['mine'] is False,
-   "someone else's resting order reaches the payload marked not-ours",
-   str(orders))
 
 # ── Modes ───────────────────────────────────────────────────────────────────
 print('— modes —')
@@ -285,15 +290,20 @@ ctrl4._data_recovered('NVDA', slot4)
 ok(slot4['alert'] is None and slot4['fail_n'] == 0,
    'and a good poll clears it')
 
-# ── State keys ──────────────────────────────────────────────────────────────
+# ── Saved state: the grid owns the bare key, campaigns keep theirs ──────────
 print('— saved state —')
-ok(ctrl4._store_key('NVDA') == 'NVDA#VCG',
-   'campaigns save under their own key, leaving any v^ grid state alone')
-ctrl4._store = {'NVDA': {'anchor': 100.0}}
+ok(ctrl4._store_key('NVDA') == 'NVDA',
+   'the grid saves under the bare ticker — where it always did')
+ctrl4._store = {'NVDA': {'anchor': 100.0, 'step': 0.03}}
+ok(ctrl4._saved_for('NVDA')['anchor'] == 100.0,
+   'a pre-removal adventure record restores as its own')
+ctrl4._store = {'NVDA#GRID': {'anchor': 101.0, 'grid_ready': False}}
+ok(ctrl4._saved_for('NVDA')['anchor'] == 101.0,
+   'the short-lived ticker#GRID key of the two-strategy era still reads')
+ctrl4._store = {'NVDA': {'strategy': 'V_COMMANDOS_GEARBOX', 'gear': 4},
+                'NVDA#VCG': {'strategy': 'V_COMMANDOS_GEARBOX', 'gear': 4}}
 ok(ctrl4._saved_for('NVDA') is None,
-   'a leftover grid record is never restored as a campaign')
-ctrl4._store = {'NVDA#VCG': {'strategy': 'V_COMMANDOS_GEARBOX', 'gear': 4}}
-ok(ctrl4._saved_for('NVDA')['gear'] == 4, 'and its own record is')
+   'a campaign record is never restored as a grid adventure')
 
 ctrl_mod.market_phase = _real_phase
 for r in (root, root2, root3, root4):

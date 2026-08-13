@@ -515,8 +515,7 @@ class App:
             get_unit_cash=lambda c=ccy: self._get_unit_cash(c),
             on_compute=self._on_row_compute,
             editable=not self._auto,
-            on_autopilot=self._open_autopilot,
-            on_sync=self._sync_card_to_autopilot)
+            on_autopilot=self._open_autopilot)
 
     def _grid_all_cards(self, rows=None):
         """Place and renumber the supplied global card sequence."""
@@ -546,16 +545,9 @@ class App:
 
     # ── Autopilot window (big card button) ────────────────────────────────────
 
-    def _sync_card_to_autopilot(self, ticker, cfg):
-        """The card's `sync to autopilot` button: copy this card's gear and
-        exit tiers into the bot. The only crossing between the two."""
-        ok, msg = self.autopilot.sync_from_card(ticker, cfg)
-        self.status_var.set(f'{ticker}: {msg}')
-        return ok, msg
-
     def _open_autopilot(self, ticker):
         """The card's AUTOPILOT button: start watching the stock (bare WATCH
-        mode — polling only, no orders) and pop its campaign cockpit.
+        mode — polling only, no orders) and pop its Daily v^ grid cockpit.
         Reuses an already-open window instead of stacking duplicates."""
         if not self._auto:
             self.status_var.set('Autopilot needs Toss (auto) mode.')
@@ -575,9 +567,9 @@ class App:
         if not ok:
             self.status_var.set(f'Autopilot: {msg}')
             return
-        from gui.campaign_window import CampaignWindow
+        from gui.autopilot_window import AutopilotWindow
         ccy = 'KRW' if ticker.endswith('.KS') else 'USD'
-        self._ap_windows[ticker] = CampaignWindow(
+        self._ap_windows[ticker] = AutopilotWindow(
             self.root, ticker, ccy, self.autopilot.graph_context(ticker))
 
     def _account_seq(self, prov):

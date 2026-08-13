@@ -1,41 +1,54 @@
 # Daily v^ Linear Weighted Grid — the Daily Adventure Autopilot
 
-**Version:** 0.2.1 (system edition)
+**Version:** 0.3.0 (system edition) — *as built, live again*
 **Adapted from:** strategy manual `DAILY_V_HAT_LINEAR_WEIGHTED_GRID_MANUAL` v0.1.0
-**Was implemented in:** `core/autopilot.py` (`GridEngine`), `gui/autopilot_window.py`, and a strategy branch in `gui/autopilot_ctrl.py`
-**Status since 2026-08-01:** **code removed — specification kept, fully recoverable**
+**Implemented in:** `core/autopilot.py` (`GridEngine`), `gui/autopilot_window.py`, `gui/autopilot_ctrl.py`
+**Status since 2026-08-13:** **THE app's autopilot — restored from `e148da6`, engine byte-for-byte**
 
-> ### This strategy is not running
+> ### v0.3.0 — the grid is the bot again (2026-08-13)
 >
-> The grid worked. It was removed anyway, on 2026-08-01, so that
-> `V_COMMANDOS_GEARBOX` — which had just been rolled back in and was crashing
-> on every poll — could be stabilised as the app's only bot without a second
-> engine sharing the controller, the state file and the UI push.
+> The commander's ruling: the autopilot's real advantage is exactly this
+> system — chasing the curve in real time inside a fixed daily ladder,
+> buying the lower bar, selling the upper bar, making the tooth cycle pay
+> inside one day. The V-Commandos campaign work moved to where it is more
+> convenient: the CARD is the worksheet, and its numbers are typed into the
+> broker app by hand. The campaign engine and cockpit were retired on
+> 2026-08-13 (recoverable from commit `f011d8f`); the two never share the
+> bot again.
 >
-> **To restore it**, from commit `e148da6`:
+> What the restoration kept and what it changed:
 >
 > ```text
-> core/autopilot.py            the GridEngine
-> gui/autopilot_window.py      the grid cockpit + ScaleSelector
-> scripts/test_grid.py         86 checks + fuzz
-> gui/autopilot_ctrl.py        the STRATEGIES map, watch(ticker, strategy),
->                              set_scale, per-strategy state keys, and the
->                              grid fields in _push_ui
-> gui/stock_row.py             the small "v^ grid" button
-> gui/main_window.py           the strategy branch in _open_autopilot
+> kept    core/autopilot.py — the GridEngine, byte-for-byte from e148da6,
+>         with its 86-check suite (scripts/test_grid.py) passing unchanged.
+>         Anchor rules, target inventory, gap days, scale lock, base
+>         folding, restart attribution: all exactly as specified below.
+> kept    saved adventures at the BARE ticker key in autopilot_state.json —
+>         records from before the 08-01 removal restore as their own
+>         (the daily rebase absorbs their age at the next open).
+> new     the controller is the post-rewrite one: no messagebox anywhere
+>         (an alert prints red on the cockpit status line — a modal from
+>         the poll thread was THE window-freeze bug), the poll thread
+>         touches nothing on the main window but the AUTOPILOT badge, and
+>         the LIVE decision is an inline modeless confirmation in the
+>         cockpit, not a dialog.
+> new     manual fire is gone (WATCH looks, LIVE trades — same as the
+>         campaign bot's rule); cancel_all exists as an API but cancels
+>         only bot-owned orders, and no button calls it.
+> new     ownership is runtime + clientOrderId prefix. Per Toss_api.json
+>         the OPEN list does not echo clientOrderId, so after a restart a
+>         resting bot order reads as foreign — which for THIS engine is
+>         simply the one-order-at-a-time pause it already lives by.
+> gone    the card's small "v^ grid" button and the STRATEGIES map — one
+>         bot, one big AUTOPILOT button, no strategy switch. The card's
+>         `sync to autopilot` button went with the campaign bot: the grid
+>         has its own scale picker and reads nothing from a card.
 > ```
 >
-> Saved grid state was never overwritten: campaigns write to `ticker#VCG`, and
-> the campaign engine refuses to restore a record that is not its own, so any
-> grid history at the bare ticker key in `data/autopilot_state.json` is intact.
->
-> Two statements in the original text below are out of date. *"The old
-> card-line follower is retired as a BOT strategy"* — it was brought back as
-> the Gearbox campaign bot and is now the only one. *"The autopilot no longer
-> reads the cards"* — the campaign bot reads them by design; that was true of
-> this strategy only.
->
-> Current bot: [`Gearbox V-Commandos Autopilot Manual.md`](Gearbox%20V-Commandos%20Autopilot%20Manual.md)
+> One statement in the original text below has flipped back to true:
+> *"the autopilot no longer reads the cards"* — correct again, and now the
+> whole design (§12.7 of the Gearbox manual survives as the detachment).
+> The card system's spec: [`Gearbox V-Commandos Autopilot Manual.md`](Gearbox%20V-Commandos%20Autopilot%20Manual.md)
 
 ---
 

@@ -1,11 +1,39 @@
-# Gearbox AUTOPILOT Manual
+# Gearbox V-Commandos Manual
 
-**Version:** 0.9.0 — *as built*
+**Version:** 0.10.0 — *the card system's spec; the bot role returned to the v^ grid*
 **Internal strategy ID:** `V_COMMANDOS_GEARBOX` — retained for state-file compatibility
 **Subtitle:** Fixed-Gear V-Campaign Trading System
-**Status:** Implemented in `core/calc.py`, `core/vcommandos.py`, `gui/stock_row.py`, `gui/campaign_window.py`, `gui/autopilot_ctrl.py`. Covered by the offline engine and UI regression suites. Not yet run live.
+**Status since 2026-08-13:** **the CARD system, live** (`core/calc.py`, `gui/stock_row.py`, `scripts/test_calc.py`) — **the campaign BOT, retired** (engine + cockpit recoverable from commit `f011d8f`; never run LIVE).
 
-> **v0.9.0 records the v^-shaped rewrite as the specification.** The engine and controller were rewritten on the old v^ grid's discipline (2,116 → 626 and 1,869 → 831 lines) because the previous build had grown safeguard on safeguard until its behavior could not be anticipated. This manual now describes what the small bot actually does: there is **no same-day reload** (§9.3 — selling out stands the bot down; arming a campaign is the commander's act), the state machine is **three states** (§13), and order ownership is **runtime plus a client-id prefix, with no durable store** (§12.6). Two behaviors are stated the way they work because they are *wanted*: **off is off** — stopping WATCH, leaving LIVE, or closing the cockpit never cancels a resting order, which stands at the broker like any hand order (§15.2); and the campaign log's hand-trade prices are honest estimates while every trading line derives from the broker average alone (§14.2). v0.9.0 also unifies **V**: the card once read it from four completed sessions plus today's partial bar and could sit a whole gear below the cockpit — both now read the five completed sessions (§17.1) — and the engine's AUTO honors the heavy-unit entry floor while EMPTY, exactly as the card always showed (§6.2).
+> ### v0.10.0 — the campaign is the commander's hand, not the bot's (2026-08-13)
+>
+> The commander's ruling: the autopilot's real advantage lies in the v^
+> system — chasing the curve in real time inside a fixed daily ladder,
+> harvesting the tooth cycle. The V-Commandos campaign is better done the
+> convenient way: **read the numbers off the card, type them into the Toss
+> app.** So the bot role rolled back to the Daily v^ grid
+> (`Daily v^ Grid Autopilot Manual.md`), and this manual's campaign ENGINE
+> (§§10–13, the cockpit of §15, the runtime rules of §§18–19) was retired
+> on 2026-08-13 — code deleted, recoverable from `f011d8f`, exactly the
+> courtesy the grid received on 2026-08-01.
+>
+> **What stays live from this manual — the card system:**
+>
+> ```text
+> §5–§7    unit sizing, the five-speed gearbox, the exit-tier split law
+> §6.1     the 10/15/20/25 volatility ladder (V = 5-day span, §17.1)
+> §6.2     the heavy-unit entry floor (▲heavy)
+> §9.1     the Dynamic High5 vantage the EMPTY card's LOAD hangs off
+> §17      the card as the gear dashboard
+> Appendix A/B — the normalized ladders and the campaign card
+> ```
+>
+> `scripts/test_calc.py` keeps checking all of it against these tables.
+> Campaign state saved at `ticker#VCG` in `data/autopilot_state.json` is
+> left untouched by the grid, so a future restoration finds its history
+> intact — the same promise §3 once made in the other direction.
+>
+> Historical v0.9.0: **records the v^-shaped rewrite as the specification.** The engine and controller were rewritten on the old v^ grid's discipline (2,116 → 626 and 1,869 → 831 lines) because the previous build had grown safeguard on safeguard until its behavior could not be anticipated. This manual now describes what the small bot actually does: there is **no same-day reload** (§9.3 — selling out stands the bot down; arming a campaign is the commander's act), the state machine is **three states** (§13), and order ownership is **runtime plus a client-id prefix, with no durable store** (§12.6). Two behaviors are stated the way they work because they are *wanted*: **off is off** — stopping WATCH, leaving LIVE, or closing the cockpit never cancels a resting order, which stands at the broker like any hand order (§15.2); and the campaign log's hand-trade prices are honest estimates while every trading line derives from the broker average alone (§14.2). v0.9.0 also unifies **V**: the card once read it from four completed sessions plus today's partial bar and could sit a whole gear below the cockpit — both now read the five completed sessions (§17.1) — and the engine's AUTO honors the heavy-unit entry floor while EMPTY, exactly as the card always showed (§6.2).
 >
 > Historical v0.8.0: the card grid detaches from the bot (§12.7). The autopilot keeps its **own** Gear, AUTO flag and exit tiers, saved with its campaign and remembered across restarts. The card grid is the commander's worksheet for trading by hand: it refreshes only when **Save & Refresh** is pressed, the poll thread never writes to it, and changing a card cannot move a live line. The single crossing is the card's **`sync to autopilot`** button, which copies that card's Gear and tiers into the bot when it is pressed and at no other time. The card regained its **big Gear number** and its exit tiers went back to plain **check boxes**; the cockpit needs neither, because the cockpit is not a worksheet.
 >
@@ -67,19 +95,34 @@ The bot does not need perfect knowledge of every historical Step to continue saf
 
 ---
 
-## 3. The Only Strategy
+## 3. Whose Strategy This Is — as of 2026-08-13, the commander's
 
-The internally named `V_COMMANDOS_GEARBOX` engine is the app's only bot. Each card carries one user-facing button:
+*(v0.10.0 inverts this section. From 2026-08-01 to 2026-08-13 the
+`V_COMMANDOS_GEARBOX` engine was the app's only bot and the grid was the
+removed one; the paragraphs below record the layout as it stands now.)*
+
+The V-Commandos campaign is executed BY HAND: the card computes the LOAD,
+CHASE and EXIT lines, and the commander places them in the Toss app. The
+card's one bot button:
 
 ```text
-[ AUTOPILOT ]   arms WATCH on that stock and opens its cockpit
+[ AUTOPILOT ]   arms WATCH on that stock and opens the Daily v^ grid cockpit
 ```
 
-The separate `DAILY_V_HAT_LINEAR_GRID` (the daily v^ adventure) was **removed on 2026-08-01** so this strategy could be stabilised on its own. It was working, and it is not repudiated — its engine, cockpit and 86-check test suite are recoverable from commit `e148da6`, and its specification is kept in `Daily v^ Grid Autopilot Manual.md`. Restoring it means bringing back `core/autopilot.py`, `gui/autopilot_window.py` and `scripts/test_grid.py`, and re-adding the strategy branch in `gui/autopilot_ctrl.py`.
+The campaign ENGINE this manual specified (§§10–13) was **retired on
+2026-08-13** so the bot role could return to the grid. It was working and it
+is not repudiated — engine, cockpit and offline suite are recoverable from
+commit `f011d8f`. Restoring it means bringing back `core/vcommandos.py`,
+`gui/campaign_window.py` and the engine half of its test suite, and giving
+`gui/autopilot_ctrl.py` a strategy switch again.
 
-Campaign state is saved under `ticker#VCG` in `data/autopilot_state.json`. Any v^ grid record already saved under the bare ticker key is left untouched, and the engine refuses to restore it as a campaign — so a future restoration finds its own history intact.
+Campaign state is saved under `ticker#VCG` in `data/autopilot_state.json`.
+The grid saves under the bare ticker key and never touches `#VCG` — so a
+future campaign restoration finds its own history intact, exactly the
+courtesy this section once promised in the other direction.
 
-The two trading logics must never share a holding. That is why only one runs.
+The two trading logics must never share a holding. That is why only one runs
+as the bot — and today the other one runs through the commander's hands.
 
 ---
 
@@ -979,6 +1022,11 @@ Higher Gears can tolerate a lower right-side endpoint because they lower average
 ---
 
 ## 22. What is built, and what is not
+
+*(Statuses below are frozen at v0.9.0, the engine's last live day. As of
+v0.10.0 every ENGINE row describes the retired bot — recoverable from
+`f011d8f` — while the calc/card rows remain live and tested by
+`scripts/test_calc.py`.)*
 
 | Manual section | Status |
 |---|---|

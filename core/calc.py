@@ -1,17 +1,20 @@
 """Gearbox V-Commandos — catalogue, the five-speed gearbox, and every line
-the cards and the campaign bot draw.
+the cards draw.
 
-ONE gearbox drives the card AND the autopilot (`core/vcommandos.py`). AUTO may
-track the five-day range or the commander may pick a gear; changing it moves
-the watched lines immediately without rewriting already-filled trades:
+The gearbox is the CARD's system: the commander reads these numbers off the
+worksheet and types them into the broker app by hand. AUTO may track the
+five-day range or the commander may pick a gear; changing it moves the
+computed lines immediately:
 
     LOAD   vantage (High5) × (1 - gear.load%)      ~1 unit of cash
     CHASE  actual avg cost × (1 - gear.chase%)     actual shares × gear.ratio
     EXIT   actual avg cost × (1 + tier%)           armed share of position
 
 One exit tier can take the whole position, or two/three armed tiers can split
-it. The legacy daily v^ grid is retained only in Git history; the running app
-has one card and one V-Commandos Gearbox engine per ticker.
+it. The autopilot is a different instrument: the Daily v^ grid
+(`core/autopilot.py`), which only borrows the tick-trim and rounding helpers
+at the bottom of this file. The retired campaign bot is in Git history
+(`f011d8f`).
 """
 
 import math

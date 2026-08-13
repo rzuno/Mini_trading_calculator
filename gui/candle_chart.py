@@ -130,7 +130,8 @@ class CandlePanel(tk.Frame):
         self.ohlc = []
         self.ref_lines = []     # [{'label','price','color','dash','width'}]
         self.current = None
-        self.vol5 = None        # 5-day range V from the watcher
+        self.vol5 = None        # 5-day range V (the card world's gear number)
+        self.day_v_avg = None   # mean completed-day range (the grid's number)
         self.on_pick_day = on_pick_day
         self._day_bands = []    # [(x0, x1, bar, display_label)]
         self.selection_enabled = False
@@ -179,7 +180,7 @@ class CandlePanel(tk.Frame):
     # ── Data in ───────────────────────────────────────────────────────────────
 
     def update(self, ohlc=None, ref_lines=None, current=None, vol5=None,
-               selection_enabled=False, selected_price=None,
+               day_v_avg=None, selection_enabled=False, selected_price=None,
                selected_label=''):
         if ohlc is not None:
             self.ohlc = list(ohlc)
@@ -187,6 +188,7 @@ class CandlePanel(tk.Frame):
             self.ref_lines = [r for r in ref_lines if r.get('price')]
         self.current = current
         self.vol5 = vol5
+        self.day_v_avg = day_v_avg
         self.selection_enabled = bool(selection_enabled)
         self.selected_price = selected_price
         self.selected_label = selected_label or ''
@@ -202,14 +204,20 @@ class CandlePanel(tk.Frame):
             return
         hi = max(d['high'] for d in self.ohlc)
         lo = min(d['low'] for d in self.ohlc)
-        # V is the strategy's own volatility: the span of the whole 5-day
-        # window as a percent of its high — the number the automatic gear is
-        # read off, not a per-day average.
-        v = self.vol5
-        if v is None:
-            v = bar_range_v(self.ohlc)
-        v_txt = (f'V {v:.2f}% → G{select_auto_gear(v)}' if v is not None
-                 else 'V --')
+        # Two volatilities, two owners. The GRID cockpit passes day_v_avg —
+        # the mean of the last five completed days' ranges, whose /3 is the
+        # grid-scale hint (this is DAILY volatility, deliberately). The card
+        # world's V is the 5-day span that picks the gear; it shows when no
+        # day_v_avg is supplied.
+        day_v = getattr(self, 'day_v_avg', None)
+        if day_v is not None:
+            v_txt = f'avg day V {day_v:.2f}% → /3 = {day_v / 3:.2f}% grid'
+        else:
+            v = self.vol5
+            if v is None:
+                v = bar_range_v(self.ohlc)
+            v_txt = (f'V {v:.2f}% → G{select_auto_gear(v)}' if v is not None
+                     else 'V --')
         self._stat.config(
             text=f'5D  High {fmt_price(hi, self.ccy)}   '
                  f'Low {fmt_price(lo, self.ccy)}   {v_txt}')

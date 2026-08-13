@@ -23,7 +23,6 @@ _F_OUT  = ('Segoe UI', 13, 'bold')
 _F_SM   = ('Segoe UI', 10)
 _F_SM_B = ('Segoe UI', 10, 'bold')
 _F_BTN  = ('Segoe UI', 11, 'bold')
-_F_TINY = ('Segoe UI', 9)
 _F_STATUS = ('Segoe UI', 12, 'bold')
 _F_GEAR_BADGE = ('Segoe UI', 18, 'bold')
 
@@ -75,7 +74,7 @@ class StockRow:
 
     def __init__(self, parent, row_num: int, pos: dict, deployed: bool,
                  get_unit_cash, on_compute=None, editable=True,
-                 on_autopilot=None, on_sync=None):
+                 on_autopilot=None):
         self.deployed       = deployed
         self.editable       = editable
         self.ticker         = pos['ticker']
@@ -83,7 +82,6 @@ class StockRow:
         self.currency       = 'KRW' if self.ticker.endswith('.KS') else 'USD'
         self.get_unit_cash  = get_unit_cash
         self.on_autopilot   = on_autopilot
-        self.on_sync        = on_sync
         self._on_compute_cb = on_compute
         self.current_price  = None
         self.vantage        = None    # High5 / prev close / same-day sell fill
@@ -341,15 +339,10 @@ class StockRow:
                 command=lambda: self.on_autopilot(self.ticker))
             self._ap_btn_default_bg = self.ap_btn.cget('bg')
             self.ap_btn.pack(side='top')
-            # The one bridge between this sheet and the bot, and it only ever
-            # runs when it is pressed. Nothing here leaks into a live campaign
-            # by itself.
-            if self.on_sync:
-                self.sync_btn = tk.Button(
-                    ap, text='sync to autopilot', font=_F_TINY, width=17,
-                    height=1, bd=1, takefocus=0,
-                    command=self._on_sync_click)
-                self.sync_btn.pack(side='top', pady=(2, 0))
+            # No sync button: the bot runs the Daily v^ grid with its own
+            # scale picker, and this card is the V-Commandos worksheet whose
+            # numbers the commander types into the broker app by hand. The
+            # two share nothing but the stock.
 
     # ── Formatting ────────────────────────────────────────────────────────────
 
@@ -403,17 +396,6 @@ class StockRow:
             self.gear_var.set(gear)
         finally:
             self._syncing_gear = False
-
-    def _on_sync_click(self):
-        """Hand this card's gear and exit tiers to the autopilot."""
-        if not self.on_sync:
-            return
-        ok, msg = self.on_sync(self.ticker, self.line_config())
-        self.sync_btn.config(
-            text=('synced ✓' if ok else 'not watching'),
-            fg=('#007700' if ok else '#CC0000'))
-        self.sync_btn.after(2500, lambda: self.sync_btn.config(
-            text='sync to autopilot', fg='black'))
 
     def _on_gear_select(self, gear):
         self._set_gear(gear)
@@ -701,13 +683,6 @@ class StockRow:
         bg = bg or self._ap_btn_default_bg
         btn.config(text=text, bg=bg, fg=fg,
                    activebackground=bg, activeforeground=fg)
-
-    def line_config(self) -> dict:
-        """The campaign parameters the bot must follow — exactly what this card
-        shows right now. One gearbox, one source. `auto` rides along so the
-        cockpit's controls can mirror the card's AUTO/MANUAL state."""
-        return {'gear': self._get_gear(), 'exit_tiers': self._get_tiers(),
-                'auto': self.auto_var.get()}
 
     def current_shares(self) -> int:
         try:
